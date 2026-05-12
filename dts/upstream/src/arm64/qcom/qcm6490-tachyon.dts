@@ -113,8 +113,6 @@
 			linux,default-trigger = "activity";
 			gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
 			default-state = "on";
-			status = "ok";
-			regulators = <&vreg_l7c_3p0>;
 		};
 	};
 
@@ -287,6 +285,7 @@
 
 		dfps_data_memory: dfps@e3300000 {
 			reg = <0x00 0xe3300000 0x00 0x100000>;
+			no-map;
 		};
 
 		neuron_block@1 {
