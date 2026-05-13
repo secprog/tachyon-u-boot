@@ -163,6 +163,17 @@ config VIDEO_MIPI_DSI
 	  The MIPI Display Serial Interface (MIPI DSI) defines a high-speed
 	  serial interface between a host processor and a display module.
 
+config VIDEO_QCOM_TACHYON_DP
+	bool "Qualcomm QCM6490 Tachyon DisplayPort bring-up"
+	depends on VIDEO && ARCH_SNAPDRAGON
+	select VIDEO_BPP32
+	help
+	  Enable a minimal Qualcomm MSM DisplayPort bring-up path for the
+	  Particle Tachyon QCM6490 board. The driver consumes the existing
+	  PMIC-GLINK/Type-C/USB-DP PHY device-tree graph, configures the
+	  Tachyon SBU mux, performs AUX/DPCD probing and link training, and
+	  exposes a framebuffer through the U-Boot video uclass.
+
 config CONSOLE_NORMAL
 	bool "Support a simple text console"
 	default y
