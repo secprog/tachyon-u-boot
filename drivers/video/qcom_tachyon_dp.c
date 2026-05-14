@@ -23,6 +23,7 @@
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
+#include <soc/qcom/pmic_glink.h>
 #include <video.h>
 
 #define TACHYON_DP_DEFAULT_XRES		1920
@@ -182,22 +183,24 @@ static u32 tachyon_dp_env_u32(const char *name, u32 fallback)
 
 static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
 {
-	const char *altmode = env_get("tachyon_dp_altmode");
+	struct qcom_pmic_glink_altmode glink_altmode;
+	int ret;
 
-	/*
-	 * U-Boot does not yet have a QRTR/PMIC-GLINK transport, so the policy
-	 * source is an explicit board handoff/env flag. Keep the gate hard:
-	 * without confirmed DP mode, do not touch the DP controller.
-	 */
-	if (!altmode || strcmp(altmode, "dp"))
-		return false;
+	ret = qcom_pmic_glink_get_altmode(&glink_altmode);
+	if (!ret && glink_altmode.dp && glink_altmode.hpd) {
+		priv->orientation =
+			glink_altmode.orientation ==
+			QCOM_PMIC_GLINK_ORIENTATION_REVERSE ?
+			TACHYON_DP_ORIENTATION_REVERSE :
+			TACHYON_DP_ORIENTATION_NORMAL;
+		priv->pin_assignment = glink_altmode.pin_assignment;
+		log_info("DP Alt-Mode confirmed via PMIC-GLINK: orientation=%u pin=%u\n",
+			 priv->orientation, priv->pin_assignment);
+		return true;
+	}
 
-	priv->orientation = tachyon_dp_env_u32("tachyon_dp_orientation", 0) ?
-			    TACHYON_DP_ORIENTATION_REVERSE :
-			    TACHYON_DP_ORIENTATION_NORMAL;
-	priv->pin_assignment = tachyon_dp_env_u32("tachyon_dp_pin_assignment", 2);
-
-	return true;
+	log_warning("DP Alt-Mode not confirmed by PMIC-GLINK: %d\n", ret);
+	return false;
 }
 
 static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
@@ -737,7 +740,6 @@ static int tachyon_dp_probe(struct udevice *dev)
 		return ret;
 
 	if (!tachyon_dp_altmode_ready(priv)) {
-		log_warning("DP Alt-Mode not confirmed; set tachyon_dp_altmode=dp\n");
 		return -ENODEV;
 	}
 

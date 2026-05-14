@@ -24,4 +24,12 @@ config QCOM_RPMH
 	  Say y here to support the Qualcomm RPMh (resource peripheral manager)
 	  if you need to control regulators on Qualcomm platforms, say y here.
 
+config QCOM_PMIC_GLINK
+	bool "Qualcomm PMIC GLINK transport"
+	depends on MSM_SMEM
+	help
+	  Enable a small Qualcomm PMIC-GLINK transport over the LPASS/ADSP
+	  GLINK-SMEM edge. This is used during early boot to query USB-C
+	  DisplayPort Alt Mode policy before initializing the display path.
+
 endif # SOC_QCOM
