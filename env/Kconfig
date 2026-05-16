@@ -69,7 +69,8 @@ config ENV_MAX_ENTRIES
 	  to tune behaviour; see lib/hashtable.c for details.
 
 config ENV_IS_DEFAULT
-	def_bool y if !ENV_IS_IN_EEPROM && !ENV_IS_IN_EXT4 && \
+	def_bool y if !ENV_IS_IN_EEPROM && !ENV_IS_IN_EFI && \
+		     !ENV_IS_IN_EXT4 && \
 		     !ENV_IS_IN_FAT && !ENV_IS_IN_FLASH && \
 		     !ENV_IS_IN_MMC && !ENV_IS_IN_NAND && \
 		     !ENV_IS_IN_NVRAM && !ENV_IS_IN_ONENAND && \
@@ -85,6 +86,15 @@ config ENV_IS_NOWHERE
 	  while U-Boot is running, but once U-Boot exits it may not be
 	  stored. If no other ENV_IS_IN_ is defined, U-Boot will always start
 	  up with the default environment.
+
+config ENV_IS_IN_EFI
+	bool "Environment in UEFI variable store"
+	depends on EFI_LOADER
+	depends on !CHAIN_OF_TRUST
+	help
+	  Store the U-Boot environment as a non-volatile UEFI variable. With
+	  CONFIG_EFI_VARIABLE_FILE_STORE this is persisted in the UEFI variable
+	  file store, typically /ubootefi.var on the EFI system partition.
 
 config ENV_IS_IN_EEPROM
 	bool "Environment in EEPROM"

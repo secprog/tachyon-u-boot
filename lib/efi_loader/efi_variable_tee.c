@@ -991,7 +991,11 @@ void efi_variables_boot_exit_notify(void)
  */
 efi_status_t efi_init_variables(void)
 {
+	static bool initialized;
 	efi_status_t ret;
+
+	if (initialized)
+		return EFI_SUCCESS;
 
 	/* Create a cached copy of the variables that will be enabled on ExitBootServices() */
 	ret = efi_var_mem_init();
@@ -1009,6 +1013,8 @@ efi_status_t efi_init_variables(void)
 	ret = efi_init_secure_state();
 	if (ret != EFI_SUCCESS)
 		return ret;
+
+	initialized = true;
 
 	return EFI_SUCCESS;
 }

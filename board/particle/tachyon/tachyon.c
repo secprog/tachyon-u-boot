@@ -14,6 +14,8 @@
 #include <stdbool.h>
 #include <dm/util.h>
 #include <blk.h>
+#include <command.h>
+#include <env.h>
 #include <part.h>
 #include <scsi.h>
 #include <dm/uclass.h>
@@ -23,6 +25,8 @@
 #include <fs.h>
 #include <power/pmic.h>
 #include <dm/ofnode.h>
+#include <video.h>
+#include <video_console.h>
 
 #include "efs.h"
 
@@ -53,6 +57,16 @@ typedef struct fs_context {
 
 #define TACHYON_OS_TYPE_DT_NODE "sdam-os-type"
 #define TACHYON_OS_TYPE_HLOS (0x01)
+#define TACHYON_DP_DEFAULT_XRES 1920
+#define TACHYON_DP_DEFAULT_YRES 1080
+#define TACHYON_DP_MIN_XRES 640
+#define TACHYON_DP_MIN_YRES 480
+#define TACHYON_DP_MAX_XRES 3840
+#define TACHYON_DP_MAX_YRES 2160
+#define TACHYON_RESOLUTION_MENU_FIRST 1
+#define TACHYON_RESOLUTION_MENU_MAX 8
+#define TACHYON_BOOTMENU_FASTBOOT "Enable fastboot mode=run fastboot"
+#define TACHYON_BOOTMENU_RESET "Reset device=reset"
 
 // #define DEBUG
 
@@ -155,6 +169,337 @@ int tachyon_find_partition(const char* name, struct blk_desc** block, struct dis
 
 	return -ENOENT;
 }
+
+static int tachyon_parse_resolution(const char* value, u32* width, u32* height) {
+	char* end = NULL;
+	ulong parsed_width;
+	ulong parsed_height;
+
+	if (!value || !width || !height) {
+		return -EINVAL;
+	}
+
+	parsed_width = simple_strtoul(value, &end, 10);
+	if (end == value || (*end != 'x' && *end != 'X')) {
+		return -EINVAL;
+	}
+
+	value = end + 1;
+	parsed_height = simple_strtoul(value, &end, 10);
+	if (end == value) {
+		return -EINVAL;
+	}
+
+	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') {
+		end++;
+	}
+
+	if (*end != '\0') {
+		return -EINVAL;
+	}
+
+	if (parsed_width < TACHYON_DP_MIN_XRES ||
+	    parsed_height < TACHYON_DP_MIN_YRES ||
+	    parsed_width > TACHYON_DP_MAX_XRES ||
+	    parsed_height > TACHYON_DP_MAX_YRES) {
+		return -ERANGE;
+	}
+
+	*width = parsed_width;
+	*height = parsed_height;
+	return 0;
+}
+
+static int tachyon_set_resolution_env(u32 width, u32 height) {
+	int ret;
+
+	ret = env_set_ulong("tachyon_dp_xres", width);
+	if (ret) {
+		return ret;
+	}
+
+	return env_set_ulong("tachyon_dp_yres", height);
+}
+
+static bool tachyon_resolution_token(const char** modes, char* token,
+				     size_t token_size) {
+	const char* pos = *modes;
+	size_t len = 0;
+
+	while (*pos == ' ') {
+		pos++;
+	}
+
+	if (!*pos) {
+		*modes = pos;
+		return false;
+	}
+
+	while (pos[len] && pos[len] != ' ') {
+		len++;
+	}
+
+	if (!len || len >= token_size) {
+		*modes = pos + len;
+		return false;
+	}
+
+	memcpy(token, pos, len);
+	token[len] = '\0';
+	*modes = pos + len;
+	return true;
+}
+
+static const char* tachyon_resolution_modes(void) {
+	const char* modes = env_get("tachyon_dp_edid_modes");
+
+	if (modes && *modes) {
+		return modes;
+	}
+
+	return "1920x1080";
+}
+
+static int tachyon_resolution_build_menu(void) {
+	const char* modes;
+	struct udevice* vid = NULL;
+	int idx = TACHYON_RESOLUTION_MENU_FIRST;
+	int old;
+
+	uclass_first_device_err(UCLASS_VIDEO, &vid);
+	modes = tachyon_resolution_modes();
+
+	while (*modes && idx < TACHYON_RESOLUTION_MENU_FIRST +
+	       TACHYON_RESOLUTION_MENU_MAX) {
+		char token[16];
+		char name[16];
+		char value[96];
+		u32 width, height;
+
+		if (!tachyon_resolution_token(&modes, token, sizeof(token))) {
+			continue;
+		}
+		if (tachyon_parse_resolution(token, &width, &height)) {
+			continue;
+		}
+
+		snprintf(name, sizeof(name), "bootmenu_%d", idx);
+		snprintf(value, sizeof(value),
+			 "Display: %s=tachyon resolution set %s save; bootmenu",
+			 token, token);
+		env_set(name, value);
+		idx++;
+	}
+
+	{
+		char name[16];
+
+		snprintf(name, sizeof(name), "bootmenu_%d", idx++);
+		env_set(name, TACHYON_BOOTMENU_FASTBOOT);
+		snprintf(name, sizeof(name), "bootmenu_%d", idx++);
+		env_set(name, TACHYON_BOOTMENU_RESET);
+	}
+
+	for (old = idx; old <= TACHYON_RESOLUTION_MENU_FIRST +
+	     TACHYON_RESOLUTION_MENU_MAX + 3; old++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "bootmenu_%d", old);
+		env_set(name, NULL);
+	}
+
+	return 0;
+}
+
+static int tachyon_apply_resolution(u32 width, u32 height) {
+	struct udevice* vid = NULL;
+	struct udevice* con = NULL;
+	struct video_uc_plat* plat;
+	struct video_priv* vid_priv;
+	int ret;
+
+	ret = uclass_first_device_err(UCLASS_VIDEO, &vid);
+	if (ret) {
+		return ret;
+	}
+
+	plat = dev_get_uclass_plat(vid);
+	vid_priv = dev_get_uclass_priv(vid);
+	if (width * height * VNBYTES(vid_priv->bpix) > plat->size) {
+		return -ENOSPC;
+	}
+
+	vid_priv->xsize = width;
+	vid_priv->ysize = height;
+	vid_priv->line_length = width * VNBYTES(vid_priv->bpix);
+	vid_priv->fb_size = vid_priv->line_length * height;
+
+	uclass_foreach_dev_probe(UCLASS_VIDEO_CONSOLE, con) {
+		struct vidconsole_priv* vc_priv;
+
+		if (con->parent != vid) {
+			continue;
+		}
+
+		vc_priv = dev_get_uclass_priv(con);
+		if (!vc_priv->x_charsize || !vc_priv->y_charsize) {
+			continue;
+		}
+
+		if (vid_priv->rot % 2) {
+			vc_priv->cols = height / vc_priv->x_charsize;
+			vc_priv->rows = width / vc_priv->y_charsize;
+			vc_priv->xsize_frac = VID_TO_POS(height);
+		} else {
+			vc_priv->cols = width / vc_priv->x_charsize;
+			vc_priv->rows = height / vc_priv->y_charsize;
+			vc_priv->xsize_frac = VID_TO_POS(width);
+		}
+		vc_priv->xcur_frac = vc_priv->xstart_frac;
+		vc_priv->ycur = 0;
+	}
+
+	ret = video_clear(vid);
+	if (ret) {
+		return ret;
+	}
+
+	return video_sync(vid, true);
+}
+
+static int tachyon_set_resolution(u32 width, u32 height, bool save) {
+	int ret;
+
+	ret = tachyon_set_resolution_env(width, height);
+	if (ret) {
+		return ret;
+	}
+
+	ret = tachyon_apply_resolution(width, height);
+	if (ret && ret != -ENODEV) {
+		printf("Failed to apply display resolution: %d\n", ret);
+		return ret;
+	}
+
+	if (save) {
+		ret = env_save();
+		if (ret) {
+			printf("Failed to save display resolution: %d\n", ret);
+			return ret;
+		}
+	}
+
+	printf("Display resolution set to %ux%u%s\n", width, height,
+	       save ? " and saved" : "");
+	return 0;
+}
+
+static int do_tachyon_resolution(struct cmd_tbl* cmdtp, int flag, int argc,
+				 char* const argv[]) {
+	u32 width = env_get_ulong("tachyon_dp_xres", 10,
+				  TACHYON_DP_DEFAULT_XRES);
+	u32 height = env_get_ulong("tachyon_dp_yres", 10,
+				   TACHYON_DP_DEFAULT_YRES);
+	int ret;
+
+	if (argc < 2) {
+		return CMD_RET_USAGE;
+	}
+
+	if (!strcmp(argv[1], "get")) {
+		printf("%ux%u\n", width, height);
+		return CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[1], "list")) {
+		const char* modes = tachyon_resolution_modes();
+
+		while (*modes) {
+			char token[16];
+
+			if (tachyon_resolution_token(&modes, token,
+						     sizeof(token)))
+				printf("%s\n", token);
+		}
+		return CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[1], "menu")) {
+		ret = tachyon_resolution_build_menu();
+		if (ret) {
+			printf("Failed to build display menu: %d\n", ret);
+			return CMD_RET_FAILURE;
+		}
+		return CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[1], "load")) {
+		ret = env_reload();
+		if (ret) {
+			printf("Failed to load display resolution: %d\n", ret);
+			return CMD_RET_FAILURE;
+		}
+		width = env_get_ulong("tachyon_dp_xres", 10,
+				      TACHYON_DP_DEFAULT_XRES);
+		height = env_get_ulong("tachyon_dp_yres", 10,
+				       TACHYON_DP_DEFAULT_YRES);
+		return tachyon_set_resolution(width, height, false) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[1], "save")) {
+		ret = env_save();
+		if (ret) {
+			printf("Failed to save display resolution: %d\n", ret);
+			return CMD_RET_FAILURE;
+		}
+		printf("Display resolution saved as %ux%u\n", width, height);
+		return CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[1], "set")) {
+		bool save = argc >= 4 && !strcmp(argv[3], "save");
+
+		if (argc < 3) {
+			return CMD_RET_USAGE;
+		}
+
+		ret = tachyon_parse_resolution(argv[2], &width, &height);
+		if (ret) {
+			printf("Invalid display resolution '%s'\n", argv[2]);
+			return CMD_RET_FAILURE;
+		}
+
+		return tachyon_set_resolution(width, height, save) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	return CMD_RET_USAGE;
+}
+
+static int do_tachyon(struct cmd_tbl* cmdtp, int flag, int argc,
+		      char* const argv[]) {
+	if (argc < 2) {
+		return CMD_RET_USAGE;
+	}
+
+	if (!strcmp(argv[1], "resolution")) {
+		return do_tachyon_resolution(cmdtp, flag, argc - 1, argv + 1);
+	}
+
+	return CMD_RET_USAGE;
+}
+
+U_BOOT_CMD(
+	tachyon, 5, 1, do_tachyon,
+	"Tachyon board utilities",
+	"resolution get\n"
+	"resolution list\n"
+	"resolution load\n"
+	"resolution menu\n"
+	"resolution save\n"
+	"resolution set <width>x<height> [save]"
+);
 
 static int tachyon_setup_efs(void) {
 	bool mounted = s_efs_blk.mounted;

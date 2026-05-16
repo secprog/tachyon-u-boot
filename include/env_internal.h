@@ -104,6 +104,7 @@ extern const char default_environment[];
 enum env_location {
 	ENVL_UNKNOWN,
 	ENVL_EEPROM,
+	ENVL_EFI,
 	ENVL_EXT4,
 	ENVL_FAT,
 	ENVL_FLASH,

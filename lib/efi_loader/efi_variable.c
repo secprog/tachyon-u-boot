@@ -588,7 +588,11 @@ void efi_variables_boot_exit_notify(void)
  */
 efi_status_t efi_init_variables(void)
 {
+	static bool initialized;
 	efi_status_t ret;
+
+	if (initialized)
+		return EFI_SUCCESS;
 
 	ret = efi_var_mem_init();
 	if (ret != EFI_SUCCESS)
@@ -604,5 +608,9 @@ efi_status_t efi_init_variables(void)
 			log_err("Invalid EFI variable seed\n");
 	}
 
-	return efi_init_secure_state();
+	ret = efi_init_secure_state();
+	if (ret == EFI_SUCCESS)
+		initialized = true;
+
+	return ret;
 }

@@ -11,10 +11,13 @@
 
 #include <asm/gpio.h>
 #include <asm/io.h>
+#include <clk.h>
 #include <dm.h>
 #include <dm/read.h>
 #include <dm/ofnode.h>
+#include <edid.h>
 #include <env.h>
+#include <fdtdec.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/kernel.h>
@@ -28,7 +31,15 @@
 
 #define TACHYON_DP_DEFAULT_XRES		1920
 #define TACHYON_DP_DEFAULT_YRES		1080
+#define TACHYON_DP_MIN_XRES		640
+#define TACHYON_DP_MIN_YRES		480
+#define TACHYON_DP_MAX_XRES		3840
+#define TACHYON_DP_MAX_YRES		2160
 #define TACHYON_DP_FB_ALIGN		SZ_1M
+#define TACHYON_DP_MAX_EDID_MODES	12
+#define TACHYON_DP_EDID_MODE_STR_SIZE	160
+#define TACHYON_DP_DDC_ADDR		0x50
+#define TACHYON_DP_DDC_SEGMENT_ADDR	0x30
 
 #define DP_LINK_RATE_RBR		162000
 #define DP_LINK_RATE_HBR		270000
@@ -82,6 +93,8 @@
 
 #define REG_DP_MAINLINK_CTRL		0x000
 #define DP_MAINLINK_CTRL_ENABLE		BIT(0)
+#define DP_MAINLINK_CTRL_RESET		BIT(1)
+#define DP_MAINLINK_FB_BOUNDARY_SEL	BIT(25)
 #define REG_DP_STATE_CTRL		0x004
 #define DP_STATE_CTRL_LINK_TRAINING_PATTERN1 BIT(0)
 #define DP_STATE_CTRL_LINK_TRAINING_PATTERN2 BIT(1)
@@ -94,9 +107,120 @@
 #define DP_CONFIGURATION_CTRL_ENHANCED_FRAMING BIT(6)
 #define DP_CONFIGURATION_CTRL_BPC_SHIFT	8
 #define DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT 13
+#define REG_DP_SOFTWARE_MVID		0x010
+#define REG_DP_SOFTWARE_NVID		0x018
+#define REG_DP_TOTAL_HOR_VER		0x01c
+#define REG_DP_START_HOR_VER_FROM_SYNC	0x020
+#define REG_DP_HSYNC_VSYNC_WIDTH_POLARITY 0x024
+#define REG_DP_ACTIVE_HOR_VER		0x028
+#define REG_DP_MISC1_MISC0		0x02c
+#define DP_MISC0_SYNCHRONOUS_CLK	BIT(0)
+#define DP_MISC0_TEST_BITS_DEPTH_SHIFT	5
+#define REG_DP_VALID_BOUNDARY		0x030
+#define REG_DP_VALID_BOUNDARY_2		0x034
 #define REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING 0x038
 #define REG_DP_MAINLINK_READY		0x040
 #define DP_MAINLINK_READY_FOR_VIDEO	BIT(0)
+#define REG_DP_TU			0x04c
+
+#define MMSS_DP_TIMING_ENGINE_EN	0x010
+#define DP_TIMING_ENGINE_EN_EN		BIT(0)
+#define MMSS_DP_INTF_CONFIG		0x014
+#define MMSS_DP_INTF_HSYNC_CTL		0x018
+#define MMSS_DP_INTF_VSYNC_PERIOD_F0	0x01c
+#define MMSS_DP_INTF_VSYNC_PERIOD_F1	0x020
+#define MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F0 0x024
+#define MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F1 0x028
+#define MMSS_INTF_DISPLAY_V_START_F0	0x02c
+#define MMSS_INTF_DISPLAY_V_START_F1	0x030
+#define MMSS_DP_INTF_DISPLAY_V_END_F0	0x034
+#define MMSS_DP_INTF_DISPLAY_V_END_F1	0x038
+#define MMSS_DP_INTF_ACTIVE_V_START_F0	0x03c
+#define MMSS_DP_INTF_ACTIVE_V_START_F1	0x040
+#define MMSS_DP_INTF_ACTIVE_V_END_F0	0x044
+#define MMSS_DP_INTF_ACTIVE_V_END_F1	0x048
+#define MMSS_DP_INTF_DISPLAY_HCTL	0x04c
+#define MMSS_DP_INTF_ACTIVE_HCTL	0x050
+#define MMSS_DP_INTF_POLARITY_CTL	0x058
+
+#define DPU_TOP_BASE			0x00000
+#define DPU_CTL_0_BASE			0x15000
+#define DPU_SSPP_DMA0_BASE		0x24000
+#define DPU_LM_0_BASE			0x44000
+#define DPU_INTF_0_BASE			0x34000
+
+#define DPU_CLK_CTRL			0x2ac
+#define DPU_CLK_CTRL_DMA0		BIT(8)
+
+#define DPU_SSPP_SRC_SIZE		0x000
+#define DPU_SSPP_SRC_XY		0x008
+#define DPU_SSPP_OUT_SIZE		0x00c
+#define DPU_SSPP_OUT_XY		0x010
+#define DPU_SSPP_SRC0_ADDR		0x014
+#define DPU_SSPP_SRC1_ADDR		0x018
+#define DPU_SSPP_SRC2_ADDR		0x01c
+#define DPU_SSPP_SRC3_ADDR		0x020
+#define DPU_SSPP_SRC_YSTRIDE0		0x024
+#define DPU_SSPP_SRC_YSTRIDE1		0x028
+#define DPU_SSPP_SRC_FORMAT		0x030
+#define DPU_SSPP_SRC_UNPACK_PATTERN	0x034
+#define DPU_SSPP_SRC_OP_MODE		0x038
+#define DPU_SSPP_FETCH_CONFIG		0x048
+#define DPU_SSPP_DANGER_LUT		0x060
+#define DPU_SSPP_SAFE_LUT		0x064
+#define DPU_SSPP_CREQ_LUT		0x068
+#define DPU_SSPP_QOS_CTRL		0x06c
+#define DPU_SSPP_CLK_CTRL		0x330
+#define DPU_SSPP_PE_OVERRIDE		BIT(31)
+#define DPU_FORMAT_XRGB8888		0x000236a8
+#define DPU_UNPACK_XRGB8888		0x03020001
+
+#define DPU_LM_OP_MODE			0x000
+#define DPU_LM_OUT_SIZE		0x004
+
+#define DPU_CTL_LAYER_0		0x000
+#define DPU_CTL_LAYER_EXT_0		0x040
+#define DPU_CTL_LAYER_EXT2_0		0x0a0
+#define DPU_CTL_LAYER_EXT3_0		0x0c0
+#define DPU_CTL_TOP			0x014
+#define DPU_CTL_FLUSH			0x018
+#define DPU_CTL_START			0x01c
+#define DPU_CTL_SW_RESET		0x030
+#define DPU_CTL_INTF_ACTIVE		0x0f4
+#define DPU_CTL_FETCH_PIPE_ACTIVE	0x0fc
+#define DPU_CTL_INTF_FLUSH		0x110
+#define DPU_CTL_PERIPH_FLUSH		0x128
+#define DPU_CTL_LAYER_BORDER_OUT	BIT(24)
+#define DPU_CTL_LAYER_DMA0_STAGE0	(1 << 18)
+#define DPU_CTL_FLUSH_DMA0		BIT(11)
+#define DPU_CTL_FLUSH_LM0		BIT(6)
+#define DPU_CTL_FLUSH_CTL		BIT(17)
+#define DPU_CTL_FLUSH_INTF		BIT(31)
+#define DPU_CTL_FLUSH_PERIPH		BIT(30)
+
+#define DPU_INTF_TIMING_ENGINE_EN	0x000
+#define DPU_INTF_CONFIG		0x004
+#define DPU_INTF_HSYNC_CTL		0x008
+#define DPU_INTF_VSYNC_PERIOD_F0	0x00c
+#define DPU_INTF_VSYNC_PULSE_WIDTH_F0	0x014
+#define DPU_INTF_DISPLAY_V_START_F0	0x01c
+#define DPU_INTF_DISPLAY_V_END_F0	0x024
+#define DPU_INTF_ACTIVE_V_START_F0	0x02c
+#define DPU_INTF_ACTIVE_V_END_F0	0x034
+#define DPU_INTF_DISPLAY_HCTL		0x03c
+#define DPU_INTF_ACTIVE_HCTL		0x040
+#define DPU_INTF_BORDER_COLOR		0x044
+#define DPU_INTF_UNDERFLOW_COLOR	0x048
+#define DPU_INTF_HSYNC_SKEW		0x04c
+#define DPU_INTF_POLARITY_CTL		0x050
+#define DPU_INTF_CONFIG2		0x060
+#define DPU_INTF_DISPLAY_DATA_HCTL	0x064
+#define DPU_INTF_ACTIVE_DATA_HCTL	0x068
+#define DPU_INTF_PANEL_FORMAT		0x090
+#define DPU_INTF_FRAME_LINE_COUNT_EN	0x0a8
+#define DPU_INTF_MUX			0x25c
+#define DPU_INTF_CONFIG2_DATA_HCTL_EN	BIT(4)
+#define DPU_INTF_FORMAT_XRGB8888	0x000021a8
 
 #define QMP_V3_DP_COM_PHY_MODE_CTRL	0x000
 #define QMP_V3_DP_COM_TYPEC_CTRL	0x010
@@ -105,7 +229,15 @@
 #define QMP_DP_COM_SW_PORTSELECT_VAL	BIT(0)
 #define QMP_DP_COM_SW_PORTSELECT_MUX	BIT(1)
 
+#define QMP_OFF_DP_TX0			0x2200
+#define QMP_OFF_DP_TX1			0x2600
 #define QMP_OFF_DP_PHY			0x2a00
+#define QMP_V3_TX_TX_EMP_POST1_LVL	0x00c
+#define QMP_V3_TX_TX_DRV_LVL		0x01c
+#define QMP_V3_TX_TRANSCEIVER_BIAS_EN	0x05c
+#define QMP_V3_TX_HIGHZ_DRVR_EN	0x060
+#define QMP_DP_TX_DRV_LVL_MUX_EN	BIT(5)
+#define QMP_DP_TX_EMP_POST1_LVL_MUX_EN	BIT(5)
 #define QMP_DP_PHY_CFG			0x010
 #define QMP_V4_DP_PHY_CFG_1		0x014
 #define QMP_DP_PHY_PD_CTL		0x018
@@ -127,11 +259,14 @@
 #define QMP_DP_PHY_PD_CTL_PWRDN		BIT(0)
 #define QMP_DP_PHY_PD_CTL_PSR_PWRDN	BIT(1)
 #define QMP_DP_PHY_PD_CTL_AUX_PWRDN	BIT(2)
+#define QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN BIT(3)
 #define QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN BIT(4)
 #define QMP_DP_PHY_PD_CTL_PLL_PWRDN	BIT(5)
 #define QMP_DP_PHY_PD_CTL_DP_CLAMP_EN	BIT(6)
 
 #define TACHYON_DP_AUX_DEBOUNCE_TRIES	20
+#define TACHYON_DP_CORE_CLK_COUNT	4
+#define TACHYON_DPU_CLK_COUNT		6
 
 enum tachyon_dp_orientation {
 	TACHYON_DP_ORIENTATION_NORMAL,
@@ -145,25 +280,174 @@ struct tachyon_dp_caps {
 	bool enhanced;
 };
 
+struct tachyon_dp_mode {
+	u16 width;
+	u16 height;
+	struct display_timing timing;
+	bool has_timing;
+};
+
 struct tachyon_dp_priv {
 	void __iomem *ctrl;
 	void __iomem *aux;
 	void __iomem *link;
+	void __iomem *p0;
 	void __iomem *phy;
 	void __iomem *phy_dp;
+	void __iomem *dpu;
+	void __iomem *vbif;
+	struct clk pixel_clk;
+	struct clk dp_clks[TACHYON_DP_CORE_CLK_COUNT];
+	struct clk dpu_clks[TACHYON_DPU_CLK_COUNT];
+	bool has_pixel_clk;
+	bool dp_clk_valid[TACHYON_DP_CORE_CLK_COUNT];
+	bool dpu_clk_valid[TACHYON_DPU_CLK_COUNT];
 	struct gpio_desc sbu_enable;
 	struct gpio_desc sbu_select;
 	struct tachyon_dp_caps caps;
 	enum tachyon_dp_orientation orientation;
 	u8 pin_assignment;
 	u32 rate;
+	u32 max_rate;
+	u32 lane_map;
 	u8 lanes;
+	u8 max_lanes;
+	struct tachyon_dp_mode modes[TACHYON_DP_MAX_EDID_MODES];
+	int mode_count;
+	struct display_timing timing;
 	u8 swing[4];
 	u8 pre[4];
 	u32 aux_timeouts;
 	u32 aux_nacks;
 	u32 aux_retries;
 };
+
+static bool tachyon_dp_valid_resolution(u32 width, u32 height)
+{
+	return width >= TACHYON_DP_MIN_XRES &&
+	       height >= TACHYON_DP_MIN_YRES &&
+	       width <= TACHYON_DP_MAX_XRES &&
+	       height <= TACHYON_DP_MAX_YRES;
+}
+
+static int tachyon_dp_request_core_clocks(struct udevice *dev,
+					  struct tachyon_dp_priv *priv)
+{
+	static const char * const names[TACHYON_DP_CORE_CLK_COUNT] = {
+		"core_iface", "core_aux", "ctrl_link", "ctrl_link_iface",
+	};
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = clk_get_by_name(dev, names[i], &priv->dp_clks[i]);
+		if (ret) {
+			log_warning("DP clock %s unavailable: %d\n", names[i],
+				    ret);
+			continue;
+		}
+		priv->dp_clk_valid[i] = true;
+	}
+
+	return 0;
+}
+
+static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
+{
+	int i, ret;
+
+	for (i = 0; i < TACHYON_DP_CORE_CLK_COUNT; i++) {
+		if (!priv->dp_clk_valid[i])
+			continue;
+		ret = clk_enable(&priv->dp_clks[i]);
+		if (ret && ret != -ENOSYS) {
+			log_warning("Failed to enable DP core clock %d: %d\n",
+				    i, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static ofnode tachyon_dp_find_endpoint(ofnode node, u32 port_id)
+{
+	ofnode ports, port, ep;
+
+	ports = ofnode_find_subnode(node, "ports");
+	if (!ofnode_valid(ports))
+		ports = node;
+
+	ofnode_for_each_subnode(port, ports) {
+		u32 reg;
+
+		if (ofnode_read_u32(port, "reg", &reg) || reg != port_id)
+			continue;
+
+		ofnode_for_each_subnode(ep, port) {
+			if (!strncmp(ofnode_get_name(ep), "endpoint", 8))
+				return ep;
+		}
+	}
+
+	return ofnode_null();
+}
+
+static void tachyon_dp_parse_graph(struct udevice *dev,
+				   struct tachyon_dp_priv *priv)
+{
+	ofnode dp = dev_ofnode(dev);
+	ofnode out_ep, in_ep, remote;
+	u32 lane, count = 0, lane_map = 0;
+
+	priv->max_lanes = 4;
+	priv->lane_map = 0xe4;
+
+	out_ep = tachyon_dp_find_endpoint(dp, 1);
+	if (ofnode_valid(out_ep)) {
+		while (count < 4 &&
+		       !ofnode_read_u32_index(out_ep, "data-lanes", count,
+					      &lane)) {
+			lane_map |= (lane & 0x3) << (count * 2);
+			count++;
+		}
+		if (count) {
+			priv->max_lanes = count;
+			priv->lane_map = lane_map;
+		}
+
+		remote = ofnode_parse_phandle(out_ep, "remote-endpoint", 0);
+		if (!ofnode_valid(remote))
+			log_warning("DP output endpoint has no remote endpoint\n");
+	} else {
+		log_warning("DP output endpoint missing; using default lane map\n");
+	}
+
+	in_ep = tachyon_dp_find_endpoint(dp, 0);
+	if (ofnode_valid(in_ep)) {
+		remote = ofnode_parse_phandle(in_ep, "remote-endpoint", 0);
+		if (!ofnode_valid(remote))
+			log_warning("DP input endpoint has no DPU remote endpoint\n");
+	} else {
+		log_warning("DP input endpoint missing; DPU path is not described\n");
+	}
+
+	log_info("DP graph lane map=0x%x max_lanes=%u\n",
+		 priv->lane_map, priv->max_lanes);
+}
+
+static int tachyon_dp_pin_assignment_lanes(struct tachyon_dp_priv *priv)
+{
+	switch (priv->pin_assignment) {
+	case 2: /* DP pin assignment C */
+	case 4: /* DP pin assignment E */
+		return 4;
+	case 3: /* DP pin assignment D */
+	case 5: /* DP pin assignment F */
+		return 2;
+	default:
+		return 2;
+	}
+}
 
 static u32 tachyon_dp_env_u32(const char *name, u32 fallback)
 {
@@ -179,6 +463,166 @@ static u32 tachyon_dp_env_u32(const char *name, u32 fallback)
 		return fallback;
 
 	return parsed;
+}
+
+static bool tachyon_dp_env_has_u32(const char *name)
+{
+	const char *val = env_get(name);
+
+	return val && *val;
+}
+
+static bool tachyon_dp_edid_mode_supported(u32 width, u32 height)
+{
+	const char *modes = env_get("tachyon_dp_edid_modes");
+	char token[16];
+	int len;
+
+	if (!modes || !*modes)
+		return true;
+
+	len = snprintf(token, sizeof(token), "%ux%u", width, height);
+	if (len <= 0 || len >= sizeof(token))
+		return false;
+
+	while (*modes) {
+		while (*modes == ' ')
+			modes++;
+		if (!strncmp(modes, token, len) &&
+		    (modes[len] == '\0' || modes[len] == ' '))
+			return true;
+		while (*modes && *modes != ' ')
+			modes++;
+	}
+
+	return false;
+}
+
+static void tachyon_dp_env_mode(u32 *width, u32 *height)
+{
+	u32 pref_width = tachyon_dp_env_u32("tachyon_dp_pref_xres",
+					    TACHYON_DP_DEFAULT_XRES);
+	u32 pref_height = tachyon_dp_env_u32("tachyon_dp_pref_yres",
+					     TACHYON_DP_DEFAULT_YRES);
+	bool have_saved = tachyon_dp_env_has_u32("tachyon_dp_xres") &&
+			  tachyon_dp_env_has_u32("tachyon_dp_yres");
+
+	if (!tachyon_dp_valid_resolution(pref_width, pref_height)) {
+		pref_width = TACHYON_DP_DEFAULT_XRES;
+		pref_height = TACHYON_DP_DEFAULT_YRES;
+	}
+
+	if (have_saved) {
+		*width = tachyon_dp_env_u32("tachyon_dp_xres", pref_width);
+		*height = tachyon_dp_env_u32("tachyon_dp_yres", pref_height);
+	} else {
+		*width = pref_width;
+		*height = pref_height;
+	}
+
+	if (!tachyon_dp_valid_resolution(*width, *height) ||
+	    !tachyon_dp_edid_mode_supported(*width, *height)) {
+		log_warning("Invalid DP resolution %ux%u; using %ux%u\n",
+			    *width, *height, pref_width, pref_height);
+		*width = pref_width;
+		*height = pref_height;
+	}
+}
+
+static void tachyon_dp_timing_entry(struct timing_entry *entry, u32 value)
+{
+	entry->min = value;
+	entry->typ = value;
+	entry->max = value;
+}
+
+static void tachyon_dp_fill_timing(struct display_timing *timing,
+				   u32 pixelclock, u32 hactive, u32 hfp,
+				   u32 hsync, u32 hbp, u32 vactive,
+				   u32 vfp, u32 vsync, u32 vbp,
+				   enum display_flags flags)
+{
+	memset(timing, 0, sizeof(*timing));
+	tachyon_dp_timing_entry(&timing->pixelclock, pixelclock);
+	tachyon_dp_timing_entry(&timing->hactive, hactive);
+	tachyon_dp_timing_entry(&timing->hfront_porch, hfp);
+	tachyon_dp_timing_entry(&timing->hsync_len, hsync);
+	tachyon_dp_timing_entry(&timing->hback_porch, hbp);
+	tachyon_dp_timing_entry(&timing->vactive, vactive);
+	tachyon_dp_timing_entry(&timing->vfront_porch, vfp);
+	tachyon_dp_timing_entry(&timing->vsync_len, vsync);
+	tachyon_dp_timing_entry(&timing->vback_porch, vbp);
+	timing->flags = flags;
+}
+
+static void tachyon_dp_default_timing(struct display_timing *timing)
+{
+	tachyon_dp_fill_timing(timing, 148500000, 1920, 88, 44, 148,
+			       1080, 4, 5, 36,
+			       DISPLAY_FLAGS_HSYNC_HIGH |
+			       DISPLAY_FLAGS_VSYNC_HIGH);
+}
+
+static bool tachyon_dp_known_timing(u32 width, u32 height,
+				    struct display_timing *timing)
+{
+	switch (width) {
+	case 640:
+		if (height != 480)
+			return false;
+		tachyon_dp_fill_timing(timing, 25175000, 640, 16, 96, 48,
+				       480, 10, 2, 33,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		return true;
+	case 800:
+		if (height != 600)
+			return false;
+		tachyon_dp_fill_timing(timing, 40000000, 800, 40, 128, 88,
+				       600, 1, 4, 23,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		return true;
+	case 1024:
+		if (height != 768)
+			return false;
+		tachyon_dp_fill_timing(timing, 65000000, 1024, 24, 136, 160,
+				       768, 3, 6, 29,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		return true;
+	case 1280:
+		if (height == 720) {
+			tachyon_dp_fill_timing(timing, 74250000, 1280, 110,
+					       40, 220, 720, 5, 5, 20,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true;
+		}
+		if (height == 1024) {
+			tachyon_dp_fill_timing(timing, 108000000, 1280, 48,
+					       112, 248, 1024, 1, 3, 38,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true;
+		}
+		return false;
+	case 1920:
+		if (height != 1080)
+			return false;
+		tachyon_dp_default_timing(timing);
+		return true;
+	case 3840:
+		if (height != 2160)
+			return false;
+		tachyon_dp_fill_timing(timing, 297000000, 3840, 176, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		return true;
+	default:
+		return false;
+	}
 }
 
 static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
@@ -205,11 +649,31 @@ static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
 
 static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 {
-	ofnode mux = ofnode_path("/usb1-sbu-mux");
+	ofnode mux, ep, remote;
 	int ret;
 
+	for (mux = ofnode_by_compatible(ofnode_null(), "gpio-sbu-mux");
+	     ofnode_valid(mux);
+	     mux = ofnode_by_compatible(mux, "gpio-sbu-mux")) {
+		if (!ofnode_is_enabled(mux))
+			continue;
+		if (ofnode_read_bool(mux, "orientation-switch") &&
+		    ofnode_read_bool(mux, "mode-switch"))
+			break;
+	}
+	if (!ofnode_valid(mux))
+		mux = ofnode_path("/usb1-sbu-mux");
 	if (!ofnode_valid(mux))
 		return -ENOENT;
+
+	ep = tachyon_dp_find_endpoint(mux, 0);
+	if (ofnode_valid(ep)) {
+		remote = ofnode_parse_phandle(ep, "remote-endpoint", 0);
+		if (!ofnode_valid(remote))
+			log_warning("SBU mux endpoint has no PMIC-GLINK remote endpoint\n");
+	} else {
+		log_warning("SBU mux has no graph endpoint\n");
+	}
 
 	ret = gpio_request_by_name_nodev(mux, "enable-gpios", 0,
 					 &priv->sbu_enable, GPIOD_IS_OUT);
@@ -273,6 +737,94 @@ static int tachyon_dp_read_poll(void __iomem *base, u32 reg, u32 mask,
 	return -ETIMEDOUT;
 }
 
+static const u8 qmp_dp_v3_pre_hbr3_hbr2[4][4] = {
+	{ 0x00, 0x0c, 0x15, 0x1a },
+	{ 0x02, 0x0e, 0x16, 0xff },
+	{ 0x02, 0x11, 0xff, 0xff },
+	{ 0x04, 0xff, 0xff, 0xff },
+};
+
+static const u8 qmp_dp_v3_swing_hbr3_hbr2[4][4] = {
+	{ 0x02, 0x12, 0x16, 0x1a },
+	{ 0x09, 0x19, 0x1f, 0xff },
+	{ 0x10, 0x1f, 0xff, 0xff },
+	{ 0x1f, 0xff, 0xff, 0xff },
+};
+
+static const u8 qmp_dp_v3_pre_hbr_rbr[4][4] = {
+	{ 0x00, 0x0c, 0x14, 0x19 },
+	{ 0x00, 0x0b, 0x12, 0xff },
+	{ 0x00, 0x0b, 0xff, 0xff },
+	{ 0x04, 0xff, 0xff, 0xff },
+};
+
+static const u8 qmp_dp_v3_swing_hbr_rbr[4][4] = {
+	{ 0x08, 0x0f, 0x16, 0x1f },
+	{ 0x11, 0x1e, 0x1f, 0xff },
+	{ 0x19, 0x1f, 0xff, 0xff },
+	{ 0x1f, 0xff, 0xff, 0xff },
+};
+
+static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
+{
+	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
+	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	const u8 (*swing_tbl)[4];
+	const u8 (*pre_tbl)[4];
+	u8 swing = 0, pre = 0;
+	u8 swing_cfg, pre_cfg;
+	u32 bias_en, drvr_en;
+	int i;
+
+	for (i = 0; i < priv->lanes; i++) {
+		swing = max(swing, priv->swing[i]);
+		pre = max(pre, priv->pre[i]);
+	}
+	swing = min_t(u8, swing, 3);
+	pre = min_t(u8, pre, 3);
+
+	if (priv->rate <= DP_LINK_RATE_HBR) {
+		swing_tbl = qmp_dp_v3_swing_hbr_rbr;
+		pre_tbl = qmp_dp_v3_pre_hbr_rbr;
+	} else {
+		swing_tbl = qmp_dp_v3_swing_hbr3_hbr2;
+		pre_tbl = qmp_dp_v3_pre_hbr3_hbr2;
+	}
+
+	while ((swing_tbl[swing][pre] == 0xff ||
+		pre_tbl[swing][pre] == 0xff) && pre)
+		pre--;
+	while ((swing_tbl[swing][pre] == 0xff ||
+		pre_tbl[swing][pre] == 0xff) && swing)
+		swing--;
+
+	if (swing_tbl[swing][pre] == 0xff || pre_tbl[swing][pre] == 0xff)
+		return -EINVAL;
+
+	swing_cfg = swing_tbl[swing][pre] | QMP_DP_TX_DRV_LVL_MUX_EN;
+	pre_cfg = pre_tbl[swing][pre] | QMP_DP_TX_EMP_POST1_LVL_MUX_EN;
+
+	writel(swing_cfg, tx0 + QMP_V3_TX_TX_DRV_LVL);
+	writel(pre_cfg, tx0 + QMP_V3_TX_TX_EMP_POST1_LVL);
+	writel(swing_cfg, tx1 + QMP_V3_TX_TX_DRV_LVL);
+	writel(pre_cfg, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
+
+	if (priv->lanes == 1) {
+		bias_en = 0x3e;
+		drvr_en = 0x13;
+	} else {
+		bias_en = 0x3f;
+		drvr_en = 0x10;
+	}
+
+	writel(drvr_en, tx0 + QMP_V3_TX_HIGHZ_DRVR_EN);
+	writel(bias_en, tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+	writel(drvr_en, tx1 + QMP_V3_TX_HIGHZ_DRVR_EN);
+	writel(bias_en, tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+
+	return 0;
+}
+
 static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
 {
 	writel(QMP_DP_PHY_PD_CTL_PWRDN | QMP_DP_PHY_PD_CTL_PSR_PWRDN |
@@ -296,8 +848,16 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 {
 	u32 mode = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
 		   0x4c : 0x5c;
+	u32 pd_ctl;
 	u32 vco_div;
-	int ret;
+	long ret;
+
+	if (priv->dp_clk_valid[2]) {
+		ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
+		if (ret < 0)
+			log_warning("Failed to set DP link clock %u kHz: %ld\n",
+				    priv->rate, ret);
+	}
 
 	setbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_DP_MODE);
 	clrbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_USB3_MODE);
@@ -309,6 +869,21 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 			 QMP_DP_COM_SW_PORTSELECT_VAL : 0));
 
 	tachyon_dp_qmp_aux_init(priv);
+
+	pd_ctl = QMP_DP_PHY_PD_CTL_PWRDN | QMP_DP_PHY_PD_CTL_PSR_PWRDN |
+		 QMP_DP_PHY_PD_CTL_AUX_PWRDN | QMP_DP_PHY_PD_CTL_PLL_PWRDN |
+		 QMP_DP_PHY_PD_CTL_DP_CLAMP_EN;
+	if (priv->lanes == 4 ||
+	    priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
+		pd_ctl |= QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN;
+	if (priv->lanes == 4 ||
+	    priv->orientation == TACHYON_DP_ORIENTATION_NORMAL)
+		pd_ctl |= QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN;
+	writel(pd_ctl, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+
+	ret = tachyon_dp_qmp_program_tx(priv);
+	if (ret)
+		return ret;
 
 	writel(0x0f, priv->phy_dp + QMP_V4_DP_PHY_CFG_1);
 	writel(mode, priv->phy_dp + QMP_DP_PHY_MODE);
@@ -440,6 +1015,462 @@ static int tachyon_dp_aux_retry(struct tachyon_dp_priv *priv, bool i2c,
 	return ret;
 }
 
+static int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
+				      u8 *buf)
+{
+	u8 segment = block / 2;
+	u8 offset = (block & 1) ? EDID_SIZE : 0;
+	size_t done = 0;
+	int ret;
+
+	if (segment) {
+		ret = tachyon_dp_aux_retry(priv, true, false,
+					   TACHYON_DP_DDC_SEGMENT_ADDR,
+					   &segment, 1);
+		if (ret)
+			return ret;
+	}
+
+	ret = tachyon_dp_aux_retry(priv, true, false, TACHYON_DP_DDC_ADDR,
+				   &offset, 1);
+	if (ret)
+		return ret;
+
+	while (done < EDID_SIZE) {
+		size_t len = min_t(size_t, 16, EDID_SIZE - done);
+
+		ret = tachyon_dp_aux_retry(priv, true, true,
+					   TACHYON_DP_DDC_ADDR, buf + done,
+					   len);
+		if (ret)
+			return ret;
+		done += len;
+	}
+
+	return 0;
+}
+
+static bool tachyon_dp_edid_checksum_ok(const u8 *buf)
+{
+	u8 checksum = 0;
+	int i;
+
+	for (i = 0; i < EDID_SIZE; i++)
+		checksum += buf[i];
+
+	return !checksum;
+}
+
+static bool tachyon_dp_edid_header_ok(const u8 *buf)
+{
+	static const u8 header[] = {
+		0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+	};
+
+	return !memcmp(buf, header, sizeof(header));
+}
+
+static void tachyon_dp_add_mode_timing(struct tachyon_dp_mode *modes,
+				       int *count, u32 width, u32 height,
+				       const struct display_timing *timing)
+{
+	int i;
+
+	if (!tachyon_dp_valid_resolution(width, height))
+		return;
+
+	for (i = 0; i < *count; i++) {
+		if (modes[i].width != width || modes[i].height != height)
+			continue;
+		if (timing && !modes[i].has_timing) {
+			modes[i].timing = *timing;
+			modes[i].has_timing = true;
+		}
+		return;
+	}
+
+	if (*count >= TACHYON_DP_MAX_EDID_MODES)
+		return;
+
+	modes[*count].width = width;
+	modes[*count].height = height;
+	if (timing) {
+		modes[*count].timing = *timing;
+		modes[*count].has_timing = true;
+	}
+	(*count)++;
+}
+
+static void tachyon_dp_add_mode(struct tachyon_dp_mode *modes, int *count,
+				u32 width, u32 height)
+{
+	tachyon_dp_add_mode_timing(modes, count, width, height, NULL);
+}
+
+static void tachyon_dp_parse_dtd(struct tachyon_dp_mode *modes, int *count,
+				 const u8 *buf)
+{
+	const struct edid_detailed_timing *t =
+		(const struct edid_detailed_timing *)buf;
+	struct display_timing timing;
+	u32 width, height, hblank, vblank, hfp, hsync, vfp, vsync;
+	enum display_flags flags = 0;
+
+	if (!EDID_DETAILED_TIMING_PIXEL_CLOCK(*t))
+		return;
+	if (EDID_DETAILED_TIMING_FLAG_INTERLACED(*t))
+		return;
+
+	width = EDID_DETAILED_TIMING_HORIZONTAL_ACTIVE(*t);
+	height = EDID_DETAILED_TIMING_VERTICAL_ACTIVE(*t);
+	hblank = EDID_DETAILED_TIMING_HORIZONTAL_BLANKING(*t);
+	vblank = EDID_DETAILED_TIMING_VERTICAL_BLANKING(*t);
+	hfp = EDID_DETAILED_TIMING_HSYNC_OFFSET(*t);
+	hsync = EDID_DETAILED_TIMING_HSYNC_PULSE_WIDTH(*t);
+	vfp = EDID_DETAILED_TIMING_VSYNC_OFFSET(*t);
+	vsync = EDID_DETAILED_TIMING_VSYNC_PULSE_WIDTH(*t);
+	if (hfp + hsync > hblank || vfp + vsync > vblank)
+		return;
+
+	flags |= EDID_DETAILED_TIMING_FLAG_HSYNC_POLARITY(*t) ?
+		 DISPLAY_FLAGS_HSYNC_HIGH : DISPLAY_FLAGS_HSYNC_LOW;
+	flags |= EDID_DETAILED_TIMING_FLAG_VSYNC_POLARITY(*t) ?
+		 DISPLAY_FLAGS_VSYNC_HIGH : DISPLAY_FLAGS_VSYNC_LOW;
+	tachyon_dp_fill_timing(&timing,
+			       EDID_DETAILED_TIMING_PIXEL_CLOCK(*t),
+			       width, hfp, hsync, hblank - hfp - hsync,
+			       height, vfp, vsync, vblank - vfp - vsync,
+			       flags);
+	tachyon_dp_add_mode_timing(modes, count, width, height, &timing);
+}
+
+static void tachyon_dp_parse_standard_timings(struct tachyon_dp_mode *modes,
+					      int *count,
+					      const struct edid1_info *edid)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(edid->standard_timings); i++) {
+		u8 x = edid->standard_timings[i].xresolution;
+		u8 aspect = EDID1_INFO_STANDARD_TIMING_ASPECT(*edid, i);
+		struct display_timing timing;
+		u32 width, height;
+
+		if (x == 0x01 && edid->standard_timings[i].aspect_vfreq == 0x01)
+			continue;
+
+		width = (x + 31) * 8;
+		switch (aspect) {
+		case ASPECT_625:
+			height = width * 10 / 16;
+			break;
+		case ASPECT_75:
+			height = width * 3 / 4;
+			break;
+		case ASPECT_8:
+			height = width * 4 / 5;
+			break;
+		default:
+			height = width * 9 / 16;
+			break;
+		}
+		if (tachyon_dp_known_timing(width, height, &timing))
+			tachyon_dp_add_mode_timing(modes, count, width, height,
+						   &timing);
+		else
+			tachyon_dp_add_mode(modes, count, width, height);
+	}
+}
+
+static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
+				   u8 vic);
+
+static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
+						 int *count,
+						 const struct edid1_info *edid)
+{
+	struct display_timing timing;
+
+	if (EDID1_INFO_ESTABLISHED_TIMING_640X480_60(*edid))
+		tachyon_dp_add_cea_vic(modes, count, 1);
+	if (EDID1_INFO_ESTABLISHED_TIMING_800X600_60(*edid)) {
+		tachyon_dp_fill_timing(&timing, 40000000, 800, 40, 128, 88,
+				       600, 1, 4, 23,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 800, 600, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_1024X768_60(*edid)) {
+		tachyon_dp_fill_timing(&timing, 65000000, 1024, 24, 136, 160,
+				       768, 3, 6, 29,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 1024, 768, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_1280X1024_75(*edid)) {
+		tachyon_dp_fill_timing(&timing, 135000000, 1280, 16, 144, 248,
+				       1024, 1, 3, 38,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1280, 1024, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_1152X870_75(*edid))
+		tachyon_dp_add_mode(modes, count, 1152, 870);
+}
+
+static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
+				   u8 vic)
+{
+	struct display_timing timing;
+
+	switch (vic & 0x7f) {
+	case 1:
+		tachyon_dp_fill_timing(&timing, 25175000, 640, 16, 96, 48,
+				       480, 10, 2, 33,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+		break;
+	case 4:
+		tachyon_dp_fill_timing(&timing, 74250000, 1280, 110, 40, 220,
+				       720, 5, 5, 20,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+		break;
+	case 19:
+		tachyon_dp_fill_timing(&timing, 74250000, 1280, 440, 40, 220,
+				       720, 5, 5, 20,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+		break;
+	case 16:
+		tachyon_dp_fill_timing(&timing, 148500000, 1920, 88, 44, 148,
+				       1080, 4, 5, 36,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		break;
+	case 31:
+		tachyon_dp_fill_timing(&timing, 148500000, 1920, 528, 44, 148,
+				       1080, 4, 5, 36,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		break;
+	case 93:
+		tachyon_dp_fill_timing(&timing, 297000000, 3840, 1276, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	case 94:
+		tachyon_dp_fill_timing(&timing, 297000000, 3840, 1056, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	case 95:
+		tachyon_dp_fill_timing(&timing, 297000000, 3840, 176, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	case 96:
+		tachyon_dp_fill_timing(&timing, 594000000, 3840, 1056, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	case 97:
+		tachyon_dp_fill_timing(&timing, 594000000, 3840, 176, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	default:
+		break;
+	}
+}
+
+static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
+				       int *count, const u8 *buf)
+{
+	const struct edid_cea861_info *cea =
+		(const struct edid_cea861_info *)buf;
+	int offset, dtd;
+
+	if (cea->extension_tag != EDID_CEA861_EXTENSION_TAG)
+		return;
+
+	for (offset = 4; cea->dtd_offset && offset < cea->dtd_offset;) {
+		u8 tag = EDID_CEA861_DB_TYPE(*cea, offset - 4);
+		u8 len = EDID_CEA861_DB_LEN(*cea, offset - 4);
+		int i;
+
+		if (offset + len >= EDID_SIZE)
+			break;
+
+		if (tag == EDID_CEA861_DB_VIDEO) {
+			for (i = 1; i <= len; i++)
+				tachyon_dp_add_cea_vic(modes, count,
+						       buf[offset + i]);
+		}
+
+		offset += len + 1;
+	}
+
+	dtd = cea->dtd_offset;
+	while (dtd && dtd + sizeof(struct edid_detailed_timing) <= EDID_SIZE) {
+		tachyon_dp_parse_dtd(modes, count, buf + dtd);
+		dtd += sizeof(struct edid_detailed_timing);
+	}
+}
+
+static void tachyon_dp_publish_edid_modes(struct tachyon_dp_mode *modes,
+					  int count)
+{
+	char out[TACHYON_DP_EDID_MODE_STR_SIZE] = {};
+	int pos = 0;
+	int i;
+
+	if (!count) {
+		env_set("tachyon_dp_edid_modes", NULL);
+		env_set("tachyon_dp_pref_xres", NULL);
+		env_set("tachyon_dp_pref_yres", NULL);
+		env_set("tachyon_dp_pref_pclk", NULL);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		int ret = snprintf(out + pos, sizeof(out) - pos, "%s%ux%u",
+				   pos ? " " : "", modes[i].width,
+				   modes[i].height);
+
+		if (ret < 0 || ret >= sizeof(out) - pos)
+			break;
+		pos += ret;
+	}
+
+	env_set("tachyon_dp_edid_modes", out);
+	env_set_ulong("tachyon_dp_pref_xres", modes[0].width);
+	env_set_ulong("tachyon_dp_pref_yres", modes[0].height);
+	if (modes[0].has_timing)
+		env_set_ulong("tachyon_dp_pref_pclk",
+			      modes[0].timing.pixelclock.typ);
+	else
+		env_set("tachyon_dp_pref_pclk", NULL);
+
+	log_info("DP EDID modes: %s\n", out);
+}
+
+static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
+{
+	struct edid1_info *edid;
+	u8 edid_buf[EDID_EXT_SIZE];
+	int i, ret;
+
+	memset(priv->modes, 0, sizeof(priv->modes));
+	priv->mode_count = 0;
+
+	ret = tachyon_dp_edid_read_block(priv, 0, edid_buf);
+	if (ret) {
+		tachyon_dp_publish_edid_modes(priv->modes, 0);
+		return ret;
+	}
+	if (!tachyon_dp_edid_header_ok(edid_buf) ||
+	    !tachyon_dp_edid_checksum_ok(edid_buf)) {
+		tachyon_dp_publish_edid_modes(priv->modes, 0);
+		return -EINVAL;
+	}
+
+	edid = (struct edid1_info *)edid_buf;
+
+	for (i = 0; i < 4; i++)
+		tachyon_dp_parse_dtd(priv->modes, &priv->mode_count,
+				     edid->monitor_details.timing +
+				     i * sizeof(struct edid_detailed_timing));
+
+	tachyon_dp_parse_standard_timings(priv->modes, &priv->mode_count, edid);
+	tachyon_dp_parse_established_timings(priv->modes, &priv->mode_count,
+					     edid);
+
+	if (edid->extension_flag) {
+		ret = tachyon_dp_edid_read_block(priv, 1, edid_buf + EDID_SIZE);
+		if (!ret && tachyon_dp_edid_checksum_ok(edid_buf + EDID_SIZE))
+			tachyon_dp_parse_cea_modes(priv->modes,
+						   &priv->mode_count,
+						   edid_buf + EDID_SIZE);
+	}
+
+	tachyon_dp_publish_edid_modes(priv->modes, priv->mode_count);
+
+	return priv->mode_count ? 0 : -ENOENT;
+}
+
+static void tachyon_dp_publish_selected_timing(struct tachyon_dp_priv *priv)
+{
+	const struct display_timing *t = &priv->timing;
+	char timing[96];
+
+	snprintf(timing, sizeof(timing), "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+		 t->pixelclock.typ, t->hactive.typ, t->hfront_porch.typ,
+		 t->hsync_len.typ, t->hback_porch.typ, t->vactive.typ,
+		 t->vfront_porch.typ, t->vsync_len.typ, t->vback_porch.typ,
+		 t->flags);
+	env_set("tachyon_dp_selected_timing", timing);
+}
+
+static void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
+				   u32 *width, u32 *height)
+{
+	int i, selected = -1;
+
+	tachyon_dp_env_mode(width, height);
+
+	for (i = 0; i < priv->mode_count; i++) {
+		if (priv->modes[i].width == *width &&
+		    priv->modes[i].height == *height) {
+			selected = i;
+			break;
+		}
+	}
+
+	if (selected < 0 && priv->mode_count) {
+		selected = 0;
+		*width = priv->modes[0].width;
+		*height = priv->modes[0].height;
+	}
+
+	if (selected >= 0 && priv->modes[selected].has_timing) {
+		priv->timing = priv->modes[selected].timing;
+	} else if (tachyon_dp_known_timing(*width, *height, &priv->timing)) {
+		log_warning("Using built-in timing for DP mode %ux%u\n",
+			    *width, *height);
+	} else {
+		log_warning("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
+			    *width, *height);
+		tachyon_dp_default_timing(&priv->timing);
+		tachyon_dp_timing_entry(&priv->timing.hactive, *width);
+		tachyon_dp_timing_entry(&priv->timing.vactive, *height);
+	}
+
+	tachyon_dp_publish_selected_timing(priv);
+	log_info("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u\n",
+		 *width, *height, priv->timing.pixelclock.typ,
+		 priv->timing.hfront_porch.typ, priv->timing.hsync_len.typ,
+		 priv->timing.hback_porch.typ, priv->timing.vfront_porch.typ,
+		 priv->timing.vsync_len.typ, priv->timing.vback_porch.typ);
+}
+
+static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
+
 static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
 {
 	u8 dpcd[16];
@@ -469,17 +1500,24 @@ static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
 		break;
 	}
 
-	priv->lanes = min_t(u8, priv->caps.lanes ?: 1,
-			    priv->pin_assignment == 2 ? 4 : 2);
-	priv->rate = min(priv->caps.max_rate,
-			 tachyon_dp_env_u32("tachyon_dp_max_rate",
-					    DP_LINK_RATE_HBR2));
+	tachyon_dp_reset_link_policy(priv);
 
-	log_info("DP sink DPCD rev=%02x max_rate=%u lanes=%u enhanced=%d\n",
+	log_info("DP sink DPCD rev=%02x max_rate=%u lanes=%u enhanced=%d policy_rate=%u policy_lanes=%u\n",
 		 priv->caps.dpcd_rev, priv->caps.max_rate, priv->caps.lanes,
-		 priv->caps.enhanced);
+		 priv->caps.enhanced, priv->max_rate, priv->lanes);
 
 	return 0;
+}
+
+static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv)
+{
+	priv->max_lanes = min_t(u8, priv->max_lanes ?: 1,
+				tachyon_dp_pin_assignment_lanes(priv));
+	priv->lanes = min_t(u8, priv->caps.lanes ?: 1, priv->max_lanes);
+	priv->max_rate = min(priv->caps.max_rate,
+			     tachyon_dp_env_u32("tachyon_dp_max_rate",
+						DP_LINK_RATE_HBR2));
+	priv->rate = priv->max_rate;
 }
 
 static u8 tachyon_dp_bw_code(u32 rate)
@@ -546,6 +1584,8 @@ static void tachyon_dp_apply_adjust(struct tachyon_dp_priv *priv, u8 *adj)
 
 		priv->swing[lane] = min_t(u8, raw & 0x3, 3);
 		priv->pre[lane] = min_t(u8, (raw >> 2) & 0x3, 3);
+		if (priv->swing[lane] + priv->pre[lane] > 3)
+			priv->pre[lane] = 3 - priv->swing[lane];
 	}
 }
 
@@ -553,6 +1593,11 @@ static int tachyon_dp_program_training_set(struct tachyon_dp_priv *priv)
 {
 	u8 training[4] = {};
 	u8 i;
+	int ret;
+
+	ret = tachyon_dp_qmp_program_tx(priv);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < priv->lanes; i++)
 		training[i] = tachyon_dp_train_set(priv, i);
@@ -678,6 +1723,162 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	return ret;
 }
 
+static u32 tachyon_dp_htotal(const struct display_timing *t)
+{
+	return t->hactive.typ + t->hfront_porch.typ + t->hsync_len.typ +
+	       t->hback_porch.typ;
+}
+
+static u32 tachyon_dp_vtotal(const struct display_timing *t)
+{
+	return t->vactive.typ + t->vfront_porch.typ + t->vsync_len.typ +
+	       t->vback_porch.typ;
+}
+
+static void tachyon_dp_program_pixel_clock(struct tachyon_dp_priv *priv)
+{
+	u32 rate = priv->timing.pixelclock.typ;
+	long ret;
+
+	if (!rate)
+		return;
+
+	if (!priv->has_pixel_clk)
+		return;
+
+	ret = clk_set_rate(&priv->pixel_clk, rate);
+	if (ret < 0)
+		log_warning("Failed to set DP pixel clock %u Hz: %d\n", rate,
+			    (int)ret);
+	ret = clk_enable(&priv->pixel_clk);
+	if (ret < 0)
+		log_warning("Failed to enable DP pixel clock: %d\n", (int)ret);
+}
+
+static void tachyon_dp_program_msa_timing(struct tachyon_dp_priv *priv)
+{
+	const struct display_timing *t = &priv->timing;
+	u32 htotal = tachyon_dp_htotal(t);
+	u32 vtotal = tachyon_dp_vtotal(t);
+	u32 hsync_start = t->hactive.typ + t->hfront_porch.typ;
+	u32 vsync_start = t->vactive.typ + t->vfront_porch.typ;
+	u32 total, sync_start, width_polarity, active;
+
+	total = (vtotal << 16) | htotal;
+	sync_start = ((vtotal - vsync_start) << 16) |
+		     (htotal - hsync_start);
+	width_polarity = (t->vsync_len.typ << 16) | t->hsync_len.typ;
+	if (t->flags & DISPLAY_FLAGS_VSYNC_LOW)
+		width_polarity |= BIT(31);
+	if (t->flags & DISPLAY_FLAGS_HSYNC_LOW)
+		width_polarity |= BIT(15);
+	active = (t->vactive.typ << 16) | t->hactive.typ;
+
+	writel(total, priv->link + REG_DP_TOTAL_HOR_VER);
+	writel(sync_start, priv->link + REG_DP_START_HOR_VER_FROM_SYNC);
+	writel(width_polarity,
+	       priv->link + REG_DP_HSYNC_VSYNC_WIDTH_POLARITY);
+	writel(active, priv->link + REG_DP_ACTIVE_HOR_VER);
+}
+
+static void tachyon_dp_program_msa_clock(struct tachyon_dp_priv *priv)
+{
+	u64 pclk_khz = priv->timing.pixelclock.typ / 1000;
+	u32 nvid = 0x8000;
+	u32 mvid;
+
+	if (!pclk_khz || !priv->rate)
+		return;
+
+	if (priv->rate >= DP_LINK_RATE_HBR3)
+		nvid *= 3;
+	else if (priv->rate >= DP_LINK_RATE_HBR2)
+		nvid *= 2;
+
+	mvid = (u32)((pclk_khz * nvid) / priv->rate);
+	if (!mvid)
+		mvid = 1;
+
+	writel(mvid, priv->link + REG_DP_SOFTWARE_MVID);
+	writel(nvid, priv->link + REG_DP_SOFTWARE_NVID);
+	writel(DP_MISC0_SYNCHRONOUS_CLK | (2 << DP_MISC0_TEST_BITS_DEPTH_SHIFT),
+	       priv->link + REG_DP_MISC1_MISC0);
+}
+
+static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
+{
+	u64 pclk_khz = priv->timing.pixelclock.typ / 1000;
+	u32 tu_size = 64;
+	u32 valid;
+
+	if (!pclk_khz || !priv->lanes || !priv->rate)
+		return;
+
+	valid = (u32)((pclk_khz * 24 * tu_size) /
+		      (8ULL * priv->lanes * priv->rate));
+	valid = clamp_t(u32, valid, 1, tu_size - 1);
+
+	writel(tu_size - 1, priv->link + REG_DP_TU);
+	writel(valid, priv->link + REG_DP_VALID_BOUNDARY);
+	writel(valid, priv->link + REG_DP_VALID_BOUNDARY_2);
+}
+
+static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
+{
+	const struct display_timing *t = &priv->timing;
+	u32 htotal = tachyon_dp_htotal(t);
+	u32 vtotal = tachyon_dp_vtotal(t);
+	u32 hsync_start = t->hactive.typ + t->hfront_porch.typ;
+	u32 hsync_end = hsync_start + t->hsync_len.typ;
+	u32 vsync_start = t->vactive.typ + t->vfront_porch.typ;
+	u32 display_v_start, display_v_end;
+	u32 hsync_start_x, hsync_end_x;
+	u32 hsync_ctl, display_hctl;
+
+	if (!priv->p0)
+		return;
+
+	display_v_start = ((vtotal - vsync_start) * htotal) +
+			  (htotal - hsync_start);
+	display_v_end = ((vtotal - (vsync_start - t->vactive.typ)) *
+			 htotal) - 1;
+	display_v_end -= hsync_start - t->hactive.typ;
+	hsync_start_x = htotal - hsync_start;
+	hsync_end_x = htotal - (hsync_start - t->hactive.typ) - 1;
+	hsync_ctl = (htotal << 16) | (hsync_end - hsync_start);
+	display_hctl = (hsync_end_x << 16) | hsync_start_x;
+
+	writel(hsync_ctl, priv->p0 + MMSS_DP_INTF_HSYNC_CTL);
+	writel(vtotal * htotal, priv->p0 + MMSS_DP_INTF_VSYNC_PERIOD_F0);
+	writel(t->vsync_len.typ * htotal,
+	       priv->p0 + MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F0);
+	writel(0, priv->p0 + MMSS_DP_INTF_VSYNC_PERIOD_F1);
+	writel(0, priv->p0 + MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F1);
+	writel(display_hctl, priv->p0 + MMSS_DP_INTF_DISPLAY_HCTL);
+	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_HCTL);
+	writel(display_v_start, priv->p0 + MMSS_INTF_DISPLAY_V_START_F0);
+	writel(display_v_end, priv->p0 + MMSS_DP_INTF_DISPLAY_V_END_F0);
+	writel(0, priv->p0 + MMSS_INTF_DISPLAY_V_START_F1);
+	writel(0, priv->p0 + MMSS_DP_INTF_DISPLAY_V_END_F1);
+	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_START_F0);
+	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_END_F0);
+	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_START_F1);
+	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_END_F1);
+	writel(0, priv->p0 + MMSS_DP_INTF_POLARITY_CTL);
+	writel(readl(priv->p0 + MMSS_DP_INTF_CONFIG),
+	       priv->p0 + MMSS_DP_INTF_CONFIG);
+	writel(DP_TIMING_ENGINE_EN_EN, priv->p0 + MMSS_DP_TIMING_ENGINE_EN);
+}
+
+static void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
+{
+	tachyon_dp_program_pixel_clock(priv);
+	tachyon_dp_program_msa_timing(priv);
+	tachyon_dp_program_msa_clock(priv);
+	tachyon_dp_program_transfer_unit(priv);
+	tachyon_dp_program_p0_timing(priv);
+}
+
 static void tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 {
 	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
@@ -694,12 +1895,222 @@ static void tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	udelay(1000);
 	writel(0, priv->ctrl + REG_DP_SW_RESET);
 
-	writel(0xe4, priv->link + REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING);
+	tachyon_dp_program_video_timing(priv);
+	writel(priv->lane_map, priv->link + REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING);
 	writel(cfg, priv->link + REG_DP_CONFIGURATION_CTRL);
-	writel(DP_MAINLINK_CTRL_ENABLE, priv->link + REG_DP_MAINLINK_CTRL);
+	writel(DP_MAINLINK_CTRL_RESET, priv->link + REG_DP_MAINLINK_CTRL);
+	udelay(1000);
+	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
+	       priv->link + REG_DP_MAINLINK_CTRL);
 	tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
 			     DP_MAINLINK_READY_FOR_VIDEO,
 			     DP_MAINLINK_READY_FOR_VIDEO, 5000);
+}
+
+static int tachyon_dpu_init(struct tachyon_dp_priv *priv)
+{
+	static const char * const names[TACHYON_DPU_CLK_COUNT] = {
+		"bus", "nrt_bus", "iface", "lut", "core", "vsync",
+	};
+	ofnode node;
+	fdt_addr_t addr;
+	fdt_size_t size;
+	int i, ret;
+
+	for (node = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-dpu");
+	     ofnode_valid(node);
+	     node = ofnode_by_compatible(node, "qcom,sc7280-dpu")) {
+		if (ofnode_is_enabled(node))
+			break;
+	}
+	if (!ofnode_valid(node))
+		return -ENODEV;
+
+	addr = ofnode_get_addr_size_index(node, 0, &size);
+	if (addr == FDT_ADDR_T_NONE)
+		return -EINVAL;
+	priv->dpu = map_sysmem(addr, size);
+
+	addr = ofnode_get_addr_size_index(node, 1, &size);
+	if (addr != FDT_ADDR_T_NONE)
+		priv->vbif = map_sysmem(addr, size);
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = clk_get_by_name_nodev(node, names[i], &priv->dpu_clks[i]);
+		if (ret) {
+			log_warning("DPU clock %s unavailable: %d\n", names[i],
+				    ret);
+			continue;
+		}
+		priv->dpu_clk_valid[i] = true;
+	}
+
+	return 0;
+}
+
+static int tachyon_dpu_enable_clocks(struct tachyon_dp_priv *priv)
+{
+	ulong core_rate;
+	long rate_ret;
+	int i, ret;
+
+	core_rate = max_t(ulong, 200000000,
+			  (ulong)priv->timing.pixelclock.typ * 2);
+	if (priv->dpu_clk_valid[4]) {
+		rate_ret = clk_set_rate(&priv->dpu_clks[4], core_rate);
+		if (rate_ret < 0)
+			log_warning("Failed to set DPU core clock %lu Hz: %d\n",
+				    core_rate, (int)rate_ret);
+	}
+	if (priv->dpu_clk_valid[5])
+		clk_set_rate(&priv->dpu_clks[5], 19200000);
+
+	for (i = 0; i < TACHYON_DPU_CLK_COUNT; i++) {
+		if (!priv->dpu_clk_valid[i])
+			continue;
+		ret = clk_enable(&priv->dpu_clks[i]);
+		if (ret && ret != -ENOSYS) {
+			log_warning("Failed to enable DPU clock %d: %d\n", i,
+				    ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static void tachyon_dpu_program_sspp(struct tachyon_dp_priv *priv,
+				     struct video_uc_plat *plat,
+				     struct video_priv *uc_priv)
+{
+	void __iomem *sspp = priv->dpu + DPU_SSPP_DMA0_BASE;
+	u32 width = uc_priv->xsize;
+	u32 height = uc_priv->ysize;
+	u32 size = (height << 16) | width;
+
+	writel(size, sspp + DPU_SSPP_SRC_SIZE);
+	writel(0, sspp + DPU_SSPP_SRC_XY);
+	writel(size, sspp + DPU_SSPP_OUT_SIZE);
+	writel(0, sspp + DPU_SSPP_OUT_XY);
+	writel((u32)(ulong)plat->base, sspp + DPU_SSPP_SRC0_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC1_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC2_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC3_ADDR);
+	writel(uc_priv->line_length, sspp + DPU_SSPP_SRC_YSTRIDE0);
+	writel(0, sspp + DPU_SSPP_SRC_YSTRIDE1);
+	writel(DPU_FORMAT_XRGB8888, sspp + DPU_SSPP_SRC_FORMAT);
+	writel(DPU_UNPACK_XRGB8888, sspp + DPU_SSPP_SRC_UNPACK_PATTERN);
+	writel(DPU_SSPP_PE_OVERRIDE, sspp + DPU_SSPP_SRC_OP_MODE);
+	writel(0x87, sspp + DPU_SSPP_FETCH_CONFIG);
+	writel(0xffff, sspp + DPU_SSPP_DANGER_LUT);
+	writel(0xff00, sspp + DPU_SSPP_SAFE_LUT);
+	writel(0, sspp + DPU_SSPP_CREQ_LUT);
+	writel(1, sspp + DPU_SSPP_QOS_CTRL);
+	writel(1, sspp + DPU_SSPP_CLK_CTRL);
+}
+
+static void tachyon_dpu_program_lm(struct tachyon_dp_priv *priv,
+				   struct video_priv *uc_priv)
+{
+	void __iomem *lm = priv->dpu + DPU_LM_0_BASE;
+
+	writel(0, lm + DPU_LM_OP_MODE);
+	writel((uc_priv->ysize << 16) | uc_priv->xsize, lm + DPU_LM_OUT_SIZE);
+}
+
+static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
+				     struct video_priv *uc_priv)
+{
+	const struct display_timing *t = &priv->timing;
+	void __iomem *intf = priv->dpu + DPU_INTF_0_BASE;
+	u32 hsync = t->hsync_len.typ;
+	u32 hbp = t->hback_porch.typ;
+	u32 hfp = t->hfront_porch.typ;
+	u32 vsync = t->vsync_len.typ;
+	u32 vbp = t->vback_porch.typ;
+	u32 vfp = t->vfront_porch.typ;
+	u32 htotal = tachyon_dp_htotal(t);
+	u32 vtotal = tachyon_dp_vtotal(t);
+	u32 hstart = hsync + hbp;
+	u32 hend = htotal - hfp - 1;
+	u32 display_v_start;
+	u32 display_v_end;
+	u32 active_v_start;
+	u32 active_v_end;
+
+	display_v_start = ((vsync + vbp) * htotal) + hstart;
+	display_v_end = ((vtotal - vfp) * htotal) - hfp - 1;
+	active_v_start = display_v_start;
+	active_v_end = active_v_start + uc_priv->ysize * htotal - 1;
+
+	writel(0, intf + DPU_INTF_TIMING_ENGINE_EN);
+	writel(0, intf + DPU_INTF_CONFIG);
+	writel((htotal << 16) | hsync, intf + DPU_INTF_HSYNC_CTL);
+	writel(vtotal * htotal, intf + DPU_INTF_VSYNC_PERIOD_F0);
+	writel(vsync * htotal, intf + DPU_INTF_VSYNC_PULSE_WIDTH_F0);
+	writel(display_v_start, intf + DPU_INTF_DISPLAY_V_START_F0);
+	writel(display_v_end, intf + DPU_INTF_DISPLAY_V_END_F0);
+	writel(active_v_start, intf + DPU_INTF_ACTIVE_V_START_F0);
+	writel(active_v_end, intf + DPU_INTF_ACTIVE_V_END_F0);
+	writel((hend << 16) | hstart, intf + DPU_INTF_DISPLAY_HCTL);
+	writel((hend << 16) | hstart, intf + DPU_INTF_ACTIVE_HCTL);
+	writel((hend << 16) | hstart, intf + DPU_INTF_DISPLAY_DATA_HCTL);
+	writel((hend << 16) | hstart, intf + DPU_INTF_ACTIVE_DATA_HCTL);
+	writel(0, intf + DPU_INTF_BORDER_COLOR);
+	writel(0, intf + DPU_INTF_UNDERFLOW_COLOR);
+	writel(0, intf + DPU_INTF_HSYNC_SKEW);
+	writel(0, intf + DPU_INTF_POLARITY_CTL);
+	writel(DPU_INTF_CONFIG2_DATA_HCTL_EN, intf + DPU_INTF_CONFIG2);
+	writel(DPU_INTF_FORMAT_XRGB8888, intf + DPU_INTF_PANEL_FORMAT);
+	writel(1, intf + DPU_INTF_FRAME_LINE_COUNT_EN);
+	writel(0, intf + DPU_INTF_MUX);
+	writel(1, intf + DPU_INTF_TIMING_ENGINE_EN);
+}
+
+static void tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
+{
+	void __iomem *ctl = priv->dpu + DPU_CTL_0_BASE;
+
+	writel(1, ctl + DPU_CTL_SW_RESET);
+	tachyon_dp_read_poll(ctl, DPU_CTL_SW_RESET, BIT(0), 0, 1000);
+
+	writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
+	       ctl + DPU_CTL_LAYER_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT2_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT3_0);
+	writel(0xf0000000, ctl + DPU_CTL_TOP);
+	writel(BIT(0), ctl + DPU_CTL_INTF_ACTIVE);
+	writel(BIT(0), ctl + DPU_CTL_FETCH_PIPE_ACTIVE);
+	writel(BIT(0), ctl + DPU_CTL_INTF_FLUSH);
+	writel(BIT(0), ctl + DPU_CTL_PERIPH_FLUSH);
+	writel(DPU_CTL_FLUSH_DMA0 | DPU_CTL_FLUSH_LM0 | DPU_CTL_FLUSH_CTL |
+	       DPU_CTL_FLUSH_INTF | DPU_CTL_FLUSH_PERIPH,
+	       ctl + DPU_CTL_FLUSH);
+	writel(1, ctl + DPU_CTL_START);
+}
+
+static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
+				       struct video_uc_plat *plat,
+				       struct video_priv *uc_priv)
+{
+	int ret;
+
+	if (!priv->dpu)
+		return -ENODEV;
+
+	ret = tachyon_dpu_enable_clocks(priv);
+	if (ret)
+		return ret;
+
+	setbits_le32(priv->dpu + DPU_TOP_BASE + DPU_CLK_CTRL,
+		     DPU_CLK_CTRL_DMA0);
+	tachyon_dpu_program_sspp(priv, plat, uc_priv);
+	tachyon_dpu_program_lm(priv, uc_priv);
+	tachyon_dpu_program_intf(priv, uc_priv);
+	tachyon_dpu_program_ctl(priv);
+
+	return 0;
 }
 
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
@@ -727,13 +2138,35 @@ static int tachyon_dp_probe(struct udevice *dev)
 	struct tachyon_dp_priv *priv = dev_get_priv(dev);
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+	u32 width, height;
 	int ret;
 
 	priv->ctrl = dev_remap_addr_index(dev, 0);
 	priv->aux = dev_remap_addr_index(dev, 1);
 	priv->link = dev_remap_addr_index(dev, 2);
+	priv->p0 = dev_remap_addr_name(dev, "p0");
+	if (!priv->p0)
+		priv->p0 = dev_remap_addr_index(dev, 3);
 	if (!priv->ctrl || !priv->aux || !priv->link)
 		return -EINVAL;
+
+	tachyon_dp_parse_graph(dev, priv);
+	tachyon_dp_request_core_clocks(dev, priv);
+	ret = tachyon_dp_enable_core_clocks(priv);
+	if (ret)
+		return ret;
+
+	ret = clk_get_by_name(dev, "stream_pixel", &priv->pixel_clk);
+	if (!ret) {
+		priv->has_pixel_clk = true;
+	} else {
+		ret = clk_get_by_name(dev, "pixel", &priv->pixel_clk);
+		priv->has_pixel_clk = !ret;
+	}
+
+	ret = tachyon_dpu_init(priv);
+	if (ret)
+		return ret;
 
 	ret = tachyon_dp_find_phy(dev, priv);
 	if (ret)
@@ -756,21 +2189,30 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	ret = tachyon_dp_read_edid_modes(priv);
+	if (ret)
+		log_warning("Failed to read DP EDID modes: %d\n", ret);
+	tachyon_dp_select_mode(priv, &width, &height);
+
 	ret = tachyon_dp_link_train(priv);
 	if (ret)
 		return ret;
 
-	tachyon_dp_program_mainlink(priv);
-
-	uc_priv->xsize = tachyon_dp_env_u32("tachyon_dp_xres",
-					    TACHYON_DP_DEFAULT_XRES);
-	uc_priv->ysize = tachyon_dp_env_u32("tachyon_dp_yres",
-					    TACHYON_DP_DEFAULT_YRES);
+	uc_priv->xsize = width;
+	uc_priv->ysize = height;
 	uc_priv->bpix = VIDEO_BPP32;
 	uc_priv->format = VIDEO_X8R8G8B8;
+	uc_priv->line_length = width * 4;
+	uc_priv->fb_size = uc_priv->line_length * height;
 
 	video_set_flush_dcache(dev, true);
 	memset((void *)plat->base, 0, plat->size);
+
+	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
+	if (ret)
+		return ret;
+
+	tachyon_dp_program_mainlink(priv);
 
 	log_info("DP framebuffer base=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
 		 (ulong)plat->base, (ulong)plat->size, priv->aux_timeouts,
@@ -779,15 +2221,53 @@ static int tachyon_dp_probe(struct udevice *dev)
 	return 0;
 }
 
+static int tachyon_dp_video_sync(struct udevice *dev)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
+	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+	u32 width, height;
+	int ret;
+
+	tachyon_dp_env_mode(&width, &height);
+	if (width == priv->timing.hactive.typ &&
+	    height == priv->timing.vactive.typ)
+		return 0;
+
+	tachyon_dp_select_mode(priv, &width, &height);
+	tachyon_dp_reset_link_policy(priv);
+
+	ret = tachyon_dp_link_train(priv);
+	if (ret)
+		return ret;
+
+	uc_priv->xsize = width;
+	uc_priv->ysize = height;
+	uc_priv->bpix = VIDEO_BPP32;
+	uc_priv->format = VIDEO_X8R8G8B8;
+	uc_priv->line_length = width * 4;
+	uc_priv->fb_size = uc_priv->line_length * height;
+	if (uc_priv->fb_size > plat->size)
+		return -ENOSPC;
+
+	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
+	if (ret)
+		return ret;
+
+	tachyon_dp_program_mainlink(priv);
+
+	return 0;
+}
+
+static const struct video_ops tachyon_dp_ops = {
+	.video_sync = tachyon_dp_video_sync,
+};
+
 static int tachyon_dp_bind(struct udevice *dev)
 {
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
-	u32 width = tachyon_dp_env_u32("tachyon_dp_xres",
-				       TACHYON_DP_DEFAULT_XRES);
-	u32 height = tachyon_dp_env_u32("tachyon_dp_yres",
-					TACHYON_DP_DEFAULT_YRES);
 
-	plat->size = width * height * 4;
+	plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
 	plat->align = TACHYON_DP_FB_ALIGN;
 
 	return 0;
@@ -804,6 +2284,7 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.of_match	= tachyon_dp_ids,
 	.bind		= tachyon_dp_bind,
 	.probe		= tachyon_dp_probe,
+	.ops		= &tachyon_dp_ops,
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
 };
