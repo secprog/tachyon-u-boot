@@ -75,6 +75,10 @@ static int sc7280_enable(struct clk *clk)
 		qcom_gate_clk_en(priv, GCC_USB3_PRIM_PHY_AUX_CLK);
 		qcom_gate_clk_en(priv, GCC_USB3_PRIM_PHY_COM_AUX_CLK);
 		break;
+	case GCC_DISP_HF_AXI_CLK:
+		qcom_gate_clk_en(priv, GCC_DISP_AHB_CLK);
+		qcom_gate_clk_en(priv, GCC_DISP_XO_CLK);
+		break;
 	}
 
 	qcom_gate_clk_en(priv, clk->id);

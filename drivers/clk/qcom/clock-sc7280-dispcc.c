@@ -73,9 +73,15 @@ static int sc7280_dispcc_enable(struct clk *clk)
 	return 0;
 }
 
+static const struct qcom_power_map sc7280_dispcc_gdscs[] = {
+	[DISP_CC_MDSS_CORE_GDSC] = { 0x1004 },
+};
+
 static struct msm_clk_data sc7280_dispcc_data = {
 	.clks = sc7280_dispcc_clks,
 	.num_clks = ARRAY_SIZE(sc7280_dispcc_clks),
+	.power_domains = sc7280_dispcc_gdscs,
+	.num_power_domains = ARRAY_SIZE(sc7280_dispcc_gdscs),
 	.enable = sc7280_dispcc_enable,
 };
 
