@@ -1569,7 +1569,7 @@
 };
 
 &mdss_dp_out {
-	data-lanes = <0 1>; // ?
+	data-lanes = <0 1 2 3>;
 	remote-endpoint = <&usb_1_qmpphy_dp_in>;
 };
 

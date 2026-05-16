@@ -2446,7 +2446,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
 	u32 width, height;
-	int ret;
+	int ret, timeout = 50;
 
 	priv->ctrl = dev_remap_addr_index(dev, 0);
 	priv->aux = dev_remap_addr_index(dev, 1);
@@ -2479,8 +2479,15 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
-	if (!tachyon_dp_altmode_ready(priv)) {
-		return -ENODEV;
+	while (!tachyon_dp_altmode_ready(priv) && timeout > 0) {
+		mdelay(100);
+		timeout--;
+	}
+
+	if (!timeout) {
+		log_warning("DP Alt-Mode timeout, falling back to default orientation\n");
+		priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+		priv->pin_assignment = 4; /* Pin assignment E, 4 lanes */
 	}
 
 	ret = tachyon_dp_request_sbu_mux(priv);
