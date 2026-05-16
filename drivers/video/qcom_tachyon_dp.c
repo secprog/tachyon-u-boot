@@ -87,9 +87,16 @@
 #define REG_DP_AUX_TRANS_CTRL		0x038
 #define DP_AUX_TRANS_CTRL_I2C		BIT(8)
 #define DP_AUX_TRANS_CTRL_GO		BIT(9)
+#define DP_AUX_TRANS_CTRL_NO_SEND_ADDR	BIT(10)
+#define DP_AUX_TRANS_CTRL_NO_SEND_STOP	BIT(11)
 #define REG_DP_TIMEOUT_COUNT		0x03c
 #define REG_DP_AUX_LIMITS		0x040
 #define REG_DP_AUX_STATUS		0x044
+#define DP_AUX_STATUS_NACK		BIT(4)
+#define DP_AUX_STATUS_DEFER		BIT(5)
+#define DP_AUX_STATUS_TIMEOUT		BIT(6)
+#define DP_AUX_STATUS_ERROR		BIT(7)
+#define DP_AUX_STATUS_ERR_MASK		GENMASK(7, 4)
 
 #define REG_DP_MAINLINK_CTRL		0x000
 #define DP_MAINLINK_CTRL_ENABLE		BIT(0)
@@ -222,6 +229,9 @@
 #define DPU_INTF_CONFIG2_DATA_HCTL_EN	BIT(4)
 #define DPU_INTF_FORMAT_XRGB8888	0x000021a8
 
+#define VBIF_XINL_QOS_RPT_CTRL		0xd00
+#define VBIF_XINL_QOS_LVL_PRIO_0	0xd20
+
 #define QMP_V3_DP_COM_PHY_MODE_CTRL	0x000
 #define QMP_V3_DP_COM_TYPEC_CTRL	0x010
 #define QMP_DP_COM_USB3_MODE		BIT(0)
@@ -229,15 +239,21 @@
 #define QMP_DP_COM_SW_PORTSELECT_VAL	BIT(0)
 #define QMP_DP_COM_SW_PORTSELECT_MUX	BIT(1)
 
+#define QMP_OFF_DP_SERDES		0x2000
 #define QMP_OFF_DP_TX0			0x2200
 #define QMP_OFF_DP_TX1			0x2600
 #define QMP_OFF_DP_PHY			0x2a00
 #define QMP_V3_TX_TX_EMP_POST1_LVL	0x00c
-#define QMP_V3_TX_TX_DRV_LVL		0x01c
-#define QMP_V3_TX_TRANSCEIVER_BIAS_EN	0x05c
-#define QMP_V3_TX_HIGHZ_DRVR_EN	0x060
+#define QMP_V3_TX_TX_DRV_LVL		0x014
+#define QMP_V3_TX_TRANSCEIVER_BIAS_EN	0x054
+#define QMP_V3_TX_HIGHZ_DRVR_EN	0x058
+#define QMP_V3_TX_TX_POL_INV		0x05c
 #define QMP_DP_TX_DRV_LVL_MUX_EN	BIT(5)
 #define QMP_DP_TX_EMP_POST1_LVL_MUX_EN	BIT(5)
+#define QMP_V4_COM_RESETSM_CNTRL	0x09c
+#define QMP_V4_COM_CMN_STATUS		0x140
+#define QMP_V4_COM_SW_RESET		0x170
+#define QMP_V4_COM_C_READY_STATUS	0x178
 #define QMP_DP_PHY_CFG			0x010
 #define QMP_V4_DP_PHY_CFG_1		0x014
 #define QMP_DP_PHY_PD_CTL		0x018
@@ -287,6 +303,11 @@ struct tachyon_dp_mode {
 	bool has_timing;
 };
 
+struct tachyon_qmp_reg {
+	u16 off;
+	u8 val;
+};
+
 struct tachyon_dp_priv {
 	void __iomem *ctrl;
 	void __iomem *aux;
@@ -312,6 +333,7 @@ struct tachyon_dp_priv {
 	u32 lane_map;
 	u8 lanes;
 	u8 max_lanes;
+	u8 graph_lanes;
 	struct tachyon_dp_mode modes[TACHYON_DP_MAX_EDID_MODES];
 	int mode_count;
 	struct display_timing timing;
@@ -319,6 +341,8 @@ struct tachyon_dp_priv {
 	u8 pre[4];
 	u32 aux_timeouts;
 	u32 aux_nacks;
+	u32 aux_defers;
+	u32 aux_errors;
 	u32 aux_retries;
 };
 
@@ -400,6 +424,7 @@ static void tachyon_dp_parse_graph(struct udevice *dev,
 	u32 lane, count = 0, lane_map = 0;
 
 	priv->max_lanes = 4;
+	priv->graph_lanes = 4;
 	priv->lane_map = 0xe4;
 
 	out_ep = tachyon_dp_find_endpoint(dp, 1);
@@ -412,6 +437,7 @@ static void tachyon_dp_parse_graph(struct udevice *dev,
 		}
 		if (count) {
 			priv->max_lanes = count;
+			priv->graph_lanes = count;
 			priv->lane_map = lane_map;
 		}
 
@@ -496,6 +522,23 @@ static bool tachyon_dp_edid_mode_supported(u32 width, u32 height)
 	}
 
 	return false;
+}
+
+static bool tachyon_dp_mode_fits_link(struct tachyon_dp_priv *priv,
+				      const struct display_timing *timing)
+{
+	u64 required_kbps;
+	u64 payload_kbps;
+	u32 pclk_khz;
+
+	if (!timing->pixelclock.typ || !priv->max_rate || !priv->max_lanes)
+		return false;
+
+	pclk_khz = timing->pixelclock.typ / 1000;
+	required_kbps = (u64)pclk_khz * 24;
+	payload_kbps = (u64)priv->max_rate * priv->max_lanes * 8;
+
+	return required_kbps <= payload_kbps;
 }
 
 static void tachyon_dp_env_mode(u32 *width, u32 *height)
@@ -625,6 +668,8 @@ static bool tachyon_dp_known_timing(u32 width, u32 height,
 	}
 }
 
+static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv);
+
 static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
 {
 	struct qcom_pmic_glink_altmode glink_altmode;
@@ -645,6 +690,23 @@ static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
 
 	log_warning("DP Alt-Mode not confirmed by PMIC-GLINK: %d\n", ret);
 	return false;
+}
+
+static int tachyon_dp_refresh_altmode(struct tachyon_dp_priv *priv,
+				      bool *changed)
+{
+	enum tachyon_dp_orientation old_orientation = priv->orientation;
+	u8 old_pin = priv->pin_assignment;
+
+	if (!tachyon_dp_altmode_ready(priv))
+		return -ENODEV;
+
+	*changed = old_orientation != priv->orientation ||
+		   old_pin != priv->pin_assignment;
+	if (*changed)
+		tachyon_dp_program_sbu_mux(priv);
+
+	return 0;
 }
 
 static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
@@ -737,6 +799,108 @@ static int tachyon_dp_read_poll(void __iomem *base, u32 reg, u32 mask,
 	return -ETIMEDOUT;
 }
 
+static void tachyon_qmp_write_table(void __iomem *base,
+				    const struct tachyon_qmp_reg *regs,
+				    int count)
+{
+	int i;
+
+	for (i = 0; i < count; i++)
+		writel(regs[i].val, base + regs[i].off);
+}
+
+static const struct tachyon_qmp_reg qmp_v4_dp_serdes_tbl[] = {
+	{ 0x184, 0x05 }, { 0x094, 0x3b }, { 0x04c, 0x02 },
+	{ 0x048, 0x0c }, { 0x050, 0x06 }, { 0x154, 0x30 },
+	{ 0x058, 0x0f }, { 0x084, 0x36 }, { 0x07c, 0x16 },
+	{ 0x074, 0x06 }, { 0x17c, 0x02 }, { 0x0ec, 0x3f },
+	{ 0x0f0, 0x00 }, { 0x10c, 0x00 }, { 0x0cc, 0x00 },
+	{ 0x00c, 0x0a }, { 0x168, 0x0a }, { 0x108, 0x00 },
+	{ 0x044, 0x17 }, { 0x174, 0x1f },
+	/* CMN_MODE: select DP output mode (rate-independent) */
+	{ 0x1a4, 0x04 },
+};
+
+static const struct tachyon_qmp_reg qmp_v4_dp_serdes_rbr_tbl[] = {
+	{ 0x158, 0x05 }, { 0x0bc, 0x69 }, { 0x0d0, 0x80 },
+	{ 0x0d4, 0x07 }, { 0x0ac, 0x6f }, { 0x0b0, 0x08 },
+	{ 0x0a4, 0x04 }, { 0x1bc, 0x22 },
+};
+
+static const struct tachyon_qmp_reg qmp_v4_dp_serdes_hbr_tbl[] = {
+	{ 0x158, 0x03 }, { 0x0bc, 0x69 }, { 0x0d0, 0x80 },
+	{ 0x0d4, 0x07 }, { 0x0ac, 0x0f }, { 0x0b0, 0x0e },
+	{ 0x0a4, 0x08 }, { 0x1bc, 0x22 },
+};
+
+static const struct tachyon_qmp_reg qmp_v4_dp_serdes_hbr2_tbl[] = {
+	{ 0x158, 0x01 }, { 0x0bc, 0x8c }, { 0x0d0, 0x00 },
+	{ 0x0d4, 0x0a }, { 0x0ac, 0x1f }, { 0x0b0, 0x1c },
+	{ 0x0a4, 0x08 }, { 0x1bc, 0x11 },
+};
+
+static const struct tachyon_qmp_reg qmp_v4_dp_serdes_hbr3_tbl[] = {
+	{ 0x158, 0x00 }, { 0x0bc, 0x69 }, { 0x0d0, 0x80 },
+	{ 0x0d4, 0x07 }, { 0x0ac, 0x2f }, { 0x0b0, 0x2a },
+	{ 0x0a4, 0x08 }, { 0x1bc, 0x00 },
+};
+
+static const struct tachyon_qmp_reg qmp_v4_dp_tx_tbl[] = {
+	{ 0x0e8, 0x40 }, { 0x020, 0x30 }, { 0x02c, 0x3b },
+	{ 0x008, 0x0f }, { 0x01c, 0x03 }, { 0x0b8, 0x0f },
+	{ 0x060, 0x00 }, { 0x0bc, 0x00 }, { 0x03c, 0x11 },
+	{ 0x040, 0x11 }, { 0x024, 0x04 }, { 0x05c, 0x0a },
+	{ 0x014, 0x2a }, { 0x00c, 0x20 },
+};
+
+static void tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
+{
+	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	const struct tachyon_qmp_reg *rate_tbl;
+	int rate_tbl_count;
+
+	/*
+	 * Assert SW reset before writing init tables so the SERDES starts
+	 * from a known state regardless of what firmware left behind.
+	 * This matches the Linux sc7280 phy-qcom-qmp-dp-phy.c sequence:
+	 * reset → write tables → de-assert → kick PLL.
+	 */
+	writel(1, serdes + QMP_V4_COM_SW_RESET);
+	udelay(10);
+
+	tachyon_qmp_write_table(serdes, qmp_v4_dp_serdes_tbl,
+				ARRAY_SIZE(qmp_v4_dp_serdes_tbl));
+
+	switch (priv->rate) {
+	case DP_LINK_RATE_RBR:
+		rate_tbl = qmp_v4_dp_serdes_rbr_tbl;
+		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_rbr_tbl);
+		break;
+	case DP_LINK_RATE_HBR:
+		rate_tbl = qmp_v4_dp_serdes_hbr_tbl;
+		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr_tbl);
+		break;
+	case DP_LINK_RATE_HBR3:
+		rate_tbl = qmp_v4_dp_serdes_hbr3_tbl;
+		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr3_tbl);
+		break;
+	case DP_LINK_RATE_HBR2:
+	default:
+		rate_tbl = qmp_v4_dp_serdes_hbr2_tbl;
+		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr2_tbl);
+		break;
+	}
+
+	tachyon_qmp_write_table(serdes, rate_tbl, rate_tbl_count);
+	tachyon_qmp_write_table(priv->phy + QMP_OFF_DP_TX0, qmp_v4_dp_tx_tbl,
+				ARRAY_SIZE(qmp_v4_dp_tx_tbl));
+	tachyon_qmp_write_table(priv->phy + QMP_OFF_DP_TX1, qmp_v4_dp_tx_tbl,
+				ARRAY_SIZE(qmp_v4_dp_tx_tbl));
+
+	/* De-assert SW reset; all init values are now latched */
+	writel(0, serdes + QMP_V4_COM_SW_RESET);
+}
+
 static const u8 qmp_dp_v3_pre_hbr3_hbr2[4][4] = {
 	{ 0x00, 0x0c, 0x15, 0x1a },
 	{ 0x02, 0x0e, 0x16, 0xff },
@@ -773,7 +937,7 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	const u8 (*pre_tbl)[4];
 	u8 swing = 0, pre = 0;
 	u8 swing_cfg, pre_cfg;
-	u32 bias_en, drvr_en;
+	u32 bias0_en, bias1_en, drvr0_en, drvr1_en;
 	int i;
 
 	for (i = 0; i < priv->lanes; i++) {
@@ -810,17 +974,34 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	writel(pre_cfg, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
 
 	if (priv->lanes == 1) {
-		bias_en = 0x3e;
-		drvr_en = 0x13;
+		bias0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x3e : 0x15;
+		bias1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x15 : 0x3e;
+		drvr0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x13 : 0x10;
+		drvr1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x10 : 0x13;
+	} else if (priv->lanes == 2) {
+		bias0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x3f : 0x15;
+		bias1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			   0x15 : 0x3f;
+		drvr0_en = 0x10;
+		drvr1_en = 0x10;
 	} else {
-		bias_en = 0x3f;
-		drvr_en = 0x10;
+		bias0_en = 0x3f;
+		bias1_en = 0x3f;
+		drvr0_en = 0x10;
+		drvr1_en = 0x10;
 	}
 
-	writel(drvr_en, tx0 + QMP_V3_TX_HIGHZ_DRVR_EN);
-	writel(bias_en, tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
-	writel(drvr_en, tx1 + QMP_V3_TX_HIGHZ_DRVR_EN);
-	writel(bias_en, tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+	writel(drvr0_en, tx0 + QMP_V3_TX_HIGHZ_DRVR_EN);
+	writel(bias0_en, tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+	writel(drvr1_en, tx1 + QMP_V3_TX_HIGHZ_DRVR_EN);
+	writel(bias1_en, tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+	writel(0x0a, tx0 + QMP_V3_TX_TX_POL_INV);
+	writel(0x0a, tx1 + QMP_V3_TX_TX_POL_INV);
 
 	return 0;
 }
@@ -912,14 +1093,39 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	writel(0x05, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x09, priv->phy_dp + QMP_DP_PHY_CFG);
+
+	writel(0x20, priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_RESETSM_CNTRL);
+	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
+				   QMP_V4_COM_C_READY_STATUS, BIT(0), BIT(0),
+				   10000);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
+				   QMP_V4_COM_CMN_STATUS, BIT(0), BIT(0),
+				   10000);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
+				   QMP_V4_COM_CMN_STATUS, BIT(1), BIT(1),
+				   10000);
+	if (ret)
+		return ret;
+
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
 	ret = tachyon_dp_read_poll(priv->phy_dp, QMP_V4_DP_PHY_STATUS,
 				   BIT(0) | BIT(1), BIT(0) | BIT(1), 10000);
 	if (ret)
 		log_warning("DP PHY did not report full lock: %d\n", ret);
+	if (ret)
+		return ret;
 
-	return ret;
+	writel(0x18, priv->phy_dp + QMP_DP_PHY_CFG);
+	udelay(2000);
+	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
+
+	return tachyon_dp_read_poll(priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				    BIT(1), BIT(1), 10000);
 }
 
 static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
@@ -931,8 +1137,9 @@ static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
 	writel(0xffff, priv->aux + REG_DP_AUX_LIMITS);
 }
 
-static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
-				   bool read, u32 addr, u8 *buf, size_t len)
+static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
+			       bool read, bool mot, u32 addr, u8 *buf,
+			       size_t len)
 {
 	u8 hdr[4];
 	u32 ctrl, reg;
@@ -957,7 +1164,8 @@ static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
 
 	if (!read) {
 		for (i = 0; i < len; i++) {
-			reg = DP_AUX_DATA_INDEX_WRITE | ((u32)buf[i] << DP_AUX_DATA_OFFSET);
+			reg = DP_AUX_DATA_INDEX_WRITE |
+			      ((u32)buf[i] << DP_AUX_DATA_OFFSET);
 			writel(reg, priv->aux + REG_DP_AUX_DATA);
 		}
 	}
@@ -965,12 +1173,15 @@ static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
 	ctrl = DP_AUX_TRANS_CTRL_GO;
 	if (i2c)
 		ctrl |= DP_AUX_TRANS_CTRL_I2C;
+	if (mot)
+		ctrl |= DP_AUX_TRANS_CTRL_NO_SEND_STOP;
 
 	writel(ctrl, priv->aux + REG_DP_AUX_TRANS_CTRL);
 
 	for (i = 0; i < 250; i++) {
 		reg = readl(priv->aux + REG_DP_AUX_STATUS);
-		if (!(readl(priv->aux + REG_DP_AUX_TRANS_CTRL) & DP_AUX_TRANS_CTRL_GO))
+		if (!(readl(priv->aux + REG_DP_AUX_TRANS_CTRL) &
+			    DP_AUX_TRANS_CTRL_GO))
 			break;
 		udelay(1000);
 	}
@@ -980,8 +1191,22 @@ static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
 		return -ETIMEDOUT;
 	}
 
-	if (reg & GENMASK(7, 4)) {
-		priv->aux_nacks++;
+	if (reg & DP_AUX_STATUS_ERR_MASK) {
+		log_debug("DP AUX status error: addr=%x i2c=%d read=%d len=%zu status=%08x\n",
+			  addr, i2c, read, len, reg);
+		if (reg & DP_AUX_STATUS_TIMEOUT) {
+			priv->aux_timeouts++;
+			return -ETIMEDOUT;
+		}
+		if (reg & DP_AUX_STATUS_DEFER) {
+			priv->aux_defers++;
+			return -EAGAIN;
+		}
+		if (reg & DP_AUX_STATUS_NACK) {
+			priv->aux_nacks++;
+			return -EREMOTEIO;
+		}
+		priv->aux_errors++;
 		return -EIO;
 	}
 
@@ -999,20 +1224,41 @@ static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
 	return 0;
 }
 
-static int tachyon_dp_aux_retry(struct tachyon_dp_priv *priv, bool i2c,
-				bool read, u32 addr, u8 *buf, size_t len)
+static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
+				   bool read, u32 addr, u8 *buf, size_t len)
 {
-	int ret, retry;
+	return tachyon_dp_aux_xfer(priv, i2c, read, false, addr, buf, len);
+}
 
-	for (retry = 0; retry < 5; retry++) {
-		ret = tachyon_dp_aux_transfer(priv, i2c, read, addr, buf, len);
+static int tachyon_dp_aux_retry_mot(struct tachyon_dp_priv *priv, bool i2c,
+				    bool read, bool mot, u32 addr, u8 *buf,
+				    size_t len)
+{
+	int ret, retry, n_defer = 0;
+
+	for (retry = 0; retry < 8; retry++) {
+		ret = tachyon_dp_aux_xfer(priv, i2c, read, mot, addr, buf, len);
 		if (!ret)
 			return 0;
 		priv->aux_retries++;
-		udelay(4000);
+		if (ret == -EAGAIN) {
+			/* DP spec: give up after 7 consecutive DEFERs */
+			if (++n_defer >= 7)
+				break;
+			udelay(8000);
+		} else {
+			n_defer = 0;
+			udelay(4000);
+		}
 	}
 
 	return ret;
+}
+
+static int tachyon_dp_aux_retry(struct tachyon_dp_priv *priv, bool i2c,
+				bool read, u32 addr, u8 *buf, size_t len)
+{
+	return tachyon_dp_aux_retry_mot(priv, i2c, read, false, addr, buf, len);
 }
 
 static int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
@@ -1024,24 +1270,28 @@ static int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
 	int ret;
 
 	if (segment) {
-		ret = tachyon_dp_aux_retry(priv, true, false,
-					   TACHYON_DP_DDC_SEGMENT_ADDR,
-					   &segment, 1);
+		/* MOT=1: keep bus open for the address write that follows */
+		ret = tachyon_dp_aux_retry_mot(priv, true, false, true,
+					       TACHYON_DP_DDC_SEGMENT_ADDR,
+					       &segment, 1);
 		if (ret)
 			return ret;
 	}
 
-	ret = tachyon_dp_aux_retry(priv, true, false, TACHYON_DP_DDC_ADDR,
-				   &offset, 1);
+	/* MOT=1: keep bus open; the read burst follows */
+	ret = tachyon_dp_aux_retry_mot(priv, true, false, true,
+				       TACHYON_DP_DDC_ADDR, &offset, 1);
 	if (ret)
 		return ret;
 
 	while (done < EDID_SIZE) {
 		size_t len = min_t(size_t, 16, EDID_SIZE - done);
+		/* MOT=0 only on the final chunk to release the bus */
+		bool last = (done + len >= EDID_SIZE);
 
-		ret = tachyon_dp_aux_retry(priv, true, true,
-					   TACHYON_DP_DDC_ADDR, buf + done,
-					   len);
+		ret = tachyon_dp_aux_retry_mot(priv, true, true, !last,
+					       TACHYON_DP_DDC_ADDR,
+					       buf + done, len);
 		if (ret)
 			return ret;
 		done += len;
@@ -1104,7 +1354,13 @@ static void tachyon_dp_add_mode_timing(struct tachyon_dp_mode *modes,
 static void tachyon_dp_add_mode(struct tachyon_dp_mode *modes, int *count,
 				u32 width, u32 height)
 {
-	tachyon_dp_add_mode_timing(modes, count, width, height, NULL);
+	struct display_timing timing;
+
+	if (tachyon_dp_known_timing(width, height, &timing))
+		tachyon_dp_add_mode_timing(modes, count, width, height,
+					   &timing);
+	else
+		tachyon_dp_add_mode_timing(modes, count, width, height, NULL);
 }
 
 static void tachyon_dp_parse_dtd(struct tachyon_dp_mode *modes, int *count,
@@ -1333,14 +1589,44 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
 	}
 }
 
-static void tachyon_dp_publish_edid_modes(struct tachyon_dp_mode *modes,
-					  int count)
+static void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
+{
+	int in, out = 0;
+
+	for (in = 0; in < priv->mode_count; in++) {
+		struct display_timing timing;
+
+		if (!priv->modes[in].has_timing &&
+		    tachyon_dp_known_timing(priv->modes[in].width,
+					    priv->modes[in].height,
+					    &timing)) {
+			priv->modes[in].timing = timing;
+			priv->modes[in].has_timing = true;
+		}
+
+		if (!priv->modes[in].has_timing ||
+		    !tachyon_dp_mode_fits_link(priv, &priv->modes[in].timing)) {
+			log_info("Dropping DP EDID mode %ux%u: exceeds %u kHz x %u lane policy\n",
+				 priv->modes[in].width, priv->modes[in].height,
+				 priv->max_rate, priv->max_lanes);
+			continue;
+		}
+
+		if (out != in)
+			priv->modes[out] = priv->modes[in];
+		out++;
+	}
+
+	priv->mode_count = out;
+}
+
+static void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv)
 {
 	char out[TACHYON_DP_EDID_MODE_STR_SIZE] = {};
 	int pos = 0;
 	int i;
 
-	if (!count) {
+	if (!priv->mode_count) {
 		env_set("tachyon_dp_edid_modes", NULL);
 		env_set("tachyon_dp_pref_xres", NULL);
 		env_set("tachyon_dp_pref_yres", NULL);
@@ -1348,10 +1634,10 @@ static void tachyon_dp_publish_edid_modes(struct tachyon_dp_mode *modes,
 		return;
 	}
 
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < priv->mode_count; i++) {
 		int ret = snprintf(out + pos, sizeof(out) - pos, "%s%ux%u",
-				   pos ? " " : "", modes[i].width,
-				   modes[i].height);
+				   pos ? " " : "", priv->modes[i].width,
+				   priv->modes[i].height);
 
 		if (ret < 0 || ret >= sizeof(out) - pos)
 			break;
@@ -1359,11 +1645,13 @@ static void tachyon_dp_publish_edid_modes(struct tachyon_dp_mode *modes,
 	}
 
 	env_set("tachyon_dp_edid_modes", out);
-	env_set_ulong("tachyon_dp_pref_xres", modes[0].width);
-	env_set_ulong("tachyon_dp_pref_yres", modes[0].height);
-	if (modes[0].has_timing)
+	env_set_ulong("tachyon_dp_pref_xres", priv->modes[0].width);
+	env_set_ulong("tachyon_dp_pref_yres", priv->modes[0].height);
+	env_set_ulong("tachyon_dp_policy_lanes", priv->max_lanes);
+	env_set_ulong("tachyon_dp_policy_rate", priv->max_rate);
+	if (priv->modes[0].has_timing)
 		env_set_ulong("tachyon_dp_pref_pclk",
-			      modes[0].timing.pixelclock.typ);
+			      priv->modes[0].timing.pixelclock.typ);
 	else
 		env_set("tachyon_dp_pref_pclk", NULL);
 
@@ -1381,12 +1669,14 @@ static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 
 	ret = tachyon_dp_edid_read_block(priv, 0, edid_buf);
 	if (ret) {
-		tachyon_dp_publish_edid_modes(priv->modes, 0);
+		priv->mode_count = 0;
+		tachyon_dp_publish_edid_modes(priv);
 		return ret;
 	}
 	if (!tachyon_dp_edid_header_ok(edid_buf) ||
 	    !tachyon_dp_edid_checksum_ok(edid_buf)) {
-		tachyon_dp_publish_edid_modes(priv->modes, 0);
+		priv->mode_count = 0;
+		tachyon_dp_publish_edid_modes(priv);
 		return -EINVAL;
 	}
 
@@ -1409,7 +1699,8 @@ static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 						   edid_buf + EDID_SIZE);
 	}
 
-	tachyon_dp_publish_edid_modes(priv->modes, priv->mode_count);
+	tachyon_dp_filter_edid_modes(priv);
+	tachyon_dp_publish_edid_modes(priv);
 
 	return priv->mode_count ? 0 : -ENOENT;
 }
@@ -1511,7 +1802,7 @@ static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv)
 {
-	priv->max_lanes = min_t(u8, priv->max_lanes ?: 1,
+	priv->max_lanes = min_t(u8, priv->graph_lanes ?: 1,
 				tachyon_dp_pin_assignment_lanes(priv));
 	priv->lanes = min_t(u8, priv->caps.lanes ?: 1, priv->max_lanes);
 	priv->max_rate = min(priv->caps.max_rate,
@@ -1879,7 +2170,7 @@ static void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
 	tachyon_dp_program_p0_timing(priv);
 }
 
-static void tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
+static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 {
 	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
 		  DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
@@ -1902,9 +2193,9 @@ static void tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	udelay(1000);
 	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
 	       priv->link + REG_DP_MAINLINK_CTRL);
-	tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
-			     DP_MAINLINK_READY_FOR_VIDEO,
-			     DP_MAINLINK_READY_FOR_VIDEO, 5000);
+	return tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
+				    DP_MAINLINK_READY_FOR_VIDEO,
+				    DP_MAINLINK_READY_FOR_VIDEO, 5000);
 }
 
 static int tachyon_dpu_init(struct tachyon_dp_priv *priv)
@@ -2067,12 +2358,15 @@ static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
 	writel(1, intf + DPU_INTF_TIMING_ENGINE_EN);
 }
 
-static void tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
+static int tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
 {
 	void __iomem *ctl = priv->dpu + DPU_CTL_0_BASE;
+	int ret;
 
 	writel(1, ctl + DPU_CTL_SW_RESET);
-	tachyon_dp_read_poll(ctl, DPU_CTL_SW_RESET, BIT(0), 0, 1000);
+	ret = tachyon_dp_read_poll(ctl, DPU_CTL_SW_RESET, BIT(0), 0, 1000);
+	if (ret)
+		return ret;
 
 	writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
 	       ctl + DPU_CTL_LAYER_0);
@@ -2088,6 +2382,14 @@ static void tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
 	       DPU_CTL_FLUSH_INTF | DPU_CTL_FLUSH_PERIPH,
 	       ctl + DPU_CTL_FLUSH);
 	writel(1, ctl + DPU_CTL_START);
+
+	/* Poll for flush commit – HW clears DMA0 bit when pipeline goes active */
+	ret = tachyon_dp_read_poll(ctl, DPU_CTL_FLUSH, DPU_CTL_FLUSH_DMA0, 0,
+				   5000);
+	if (ret)
+		log_warning("DPU CTL flush did not commit: %d\n", ret);
+
+	return 0;
 }
 
 static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
@@ -2105,12 +2407,17 @@ static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 
 	setbits_le32(priv->dpu + DPU_TOP_BASE + DPU_CLK_CTRL,
 		     DPU_CLK_CTRL_DMA0);
+
+	/* Basic VBIF QoS: set all XIN clients to mid-level real-time priority */
+	if (priv->vbif) {
+		writel(0, priv->vbif + VBIF_XINL_QOS_RPT_CTRL);
+		writel(0x22222222, priv->vbif + VBIF_XINL_QOS_LVL_PRIO_0);
+	}
+
 	tachyon_dpu_program_sspp(priv, plat, uc_priv);
 	tachyon_dpu_program_lm(priv, uc_priv);
 	tachyon_dpu_program_intf(priv, uc_priv);
-	tachyon_dpu_program_ctl(priv);
-
-	return 0;
+	return tachyon_dpu_program_ctl(priv);
 }
 
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
@@ -2198,6 +2505,16 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Re-filter EDID modes against actual trained rate/lanes, which may
+	 * be lower than the policy ceiling after link-training fallback.
+	 */
+	priv->max_rate  = priv->rate;
+	priv->max_lanes = priv->lanes;
+	tachyon_dp_filter_edid_modes(priv);
+	tachyon_dp_publish_edid_modes(priv);
+	tachyon_dp_select_mode(priv, &width, &height);
+
 	uc_priv->xsize = width;
 	uc_priv->ysize = height;
 	uc_priv->bpix = VIDEO_BPP32;
@@ -2212,7 +2529,9 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
-	tachyon_dp_program_mainlink(priv);
+	ret = tachyon_dp_program_mainlink(priv);
+	if (ret)
+		return ret;
 
 	log_info("DP framebuffer base=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
 		 (ulong)plat->base, (ulong)plat->size, priv->aux_timeouts,
@@ -2227,19 +2546,48 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
 	u32 width, height;
+	bool alt_changed = false;
+	bool mode_changed;
 	int ret;
 
+	ret = tachyon_dp_refresh_altmode(priv, &alt_changed);
+	if (ret)
+		return ret;
+
+	if (alt_changed) {
+		tachyon_dp_aux_hw_init(priv);
+		ret = tachyon_dp_wait_sink(priv);
+		if (ret)
+			return ret;
+		ret = tachyon_dp_read_edid_modes(priv);
+		if (ret)
+			log_warning("Failed to refresh DP EDID modes: %d\n",
+				    ret);
+	}
+
 	tachyon_dp_env_mode(&width, &height);
-	if (width == priv->timing.hactive.typ &&
-	    height == priv->timing.vactive.typ)
+	mode_changed = width != priv->timing.hactive.typ ||
+		       height != priv->timing.vactive.typ;
+	if (!mode_changed && !alt_changed)
 		return 0;
 
 	tachyon_dp_select_mode(priv, &width, &height);
-	tachyon_dp_reset_link_policy(priv);
+	if (!alt_changed)
+		tachyon_dp_reset_link_policy(priv);
 
 	ret = tachyon_dp_link_train(priv);
 	if (ret)
 		return ret;
+
+	/*
+	 * Re-filter modes against actual trained parameters in case link
+	 * training fell back to a lower rate or lane count.
+	 */
+	priv->max_rate  = priv->rate;
+	priv->max_lanes = priv->lanes;
+	tachyon_dp_filter_edid_modes(priv);
+	tachyon_dp_publish_edid_modes(priv);
+	tachyon_dp_select_mode(priv, &width, &height);
 
 	uc_priv->xsize = width;
 	uc_priv->ysize = height;
@@ -2254,7 +2602,9 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	if (ret)
 		return ret;
 
-	tachyon_dp_program_mainlink(priv);
+	ret = tachyon_dp_program_mainlink(priv);
+	if (ret)
+		return ret;
 
 	return 0;
 }
