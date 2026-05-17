@@ -112,11 +112,12 @@ int acpi_fill_madt(struct acpi_madt *madt, struct acpi_ctx *ctx)
 	 * Create 8 entries for the 8 CPU cores
 	 *
 	 * MPIDR values for QCM6490 (SC7280):
-	 * - CPU 0-3 (Cortex-A55): MPIDR = 0x00000000, 0x00000100, 0x00000200, 0x00000300
-	 * - CPU 4-7 (Cortex-A78): MPIDR = 0x00000400, 0x00000500, 0x00000600, 0x00000700
+	 * - All 8 cores are in cluster 0 (Aff1 = 0)
+	 * - CPU 0-7: MPIDR Aff0 = 0-7, Aff1 = 0
+	 * - Correct MPIDR: 0x000, 0x001, 0x002, ..., 0x007
 	 *
-	 * Note: The extracted table had wrong MPIDR values (0x1900000000).
-	 * We use the correct MPIDR values based on the device tree.
+	 * The previous implementation used (i << 8) which incorrectly
+	 * set Aff1 = i, making Windows think each CPU is in a different cluster.
 	 */
 	for (int i = 0; i < 8; i++) {
 		gicc = ctx->current;
@@ -133,10 +134,10 @@ int acpi_fill_madt(struct acpi_madt *madt, struct acpi_ctx *ctx)
 		/* PMU/perf interrupt (PPI 23) */
 		gicc->perf_gsiv = 23;
 
-		/* MPIDR for this CPU */
-		gicc->mpidr = (i << 8);  /* Simple MPIDR: 0x000, 0x100, 0x200, etc. */
+		/* MPIDR for this CPU - Aff0 = i, Aff1 = 0 (single cluster) */
+		gicc->mpidr = i;  /* Correct: 0x0, 0x1, 0x2, ..., 0x7 */
 
-		/* GICR base for this CPU */
+		/* GICR base for this CPU - redistributors are contiguous */
 		gicc->gicr_base = 0x17a60000 + (i * 0x20000);
 
 		/* Parked address - not used with PSCI */
