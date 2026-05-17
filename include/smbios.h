@@ -264,6 +264,45 @@ struct __packed smbios_type7 {
 	char eos[SMBIOS_STRUCT_EOS_BYTES];
 };
 
+struct __packed smbios_type16 {
+	struct smbios_header hdr;
+	u8 location;
+	u8 use;
+	u8 memory_error_correction;
+	u32 maximum_capacity;
+	u16 memory_error_info_handle;
+	u16 number_of_memory_devices;
+	u64 extended_maximum_capacity;
+	char eos[SMBIOS_STRUCT_EOS_BYTES];
+};
+
+struct __packed smbios_type17 {
+	struct smbios_header hdr;
+	u16 physical_memory_array_handle;
+	u16 memory_error_info_handle;
+	u16 total_width;
+	u16 data_width;
+	u16 size;
+	u8 form_factor;
+	u8 device_set;
+	u8 device_locator;
+	u8 bank_locator;
+	u8 memory_type;
+	u16 type_detail;
+	u16 speed;
+	u8 manufacturer;
+	u8 serial_number;
+	u8 asset_tag;
+	u8 part_number;
+	u8 attributes;
+	u32 extended_size;
+	u16 configured_memory_speed;
+	u16 minimum_voltage;
+	u16 maximum_voltage;
+	u16 configured_voltage;
+	char eos[SMBIOS_STRUCT_EOS_BYTES];
+};
+
 struct __packed smbios_type32 {
 	u8 type;
 	u8 length;

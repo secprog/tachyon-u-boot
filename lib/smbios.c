@@ -852,6 +852,125 @@ static int smbios_write_type7(ulong *current, int handle,
 
 #endif /* #if IS_ENABLED(CONFIG_GENERATE_SMBIOS_TABLE_VERBOSE) */
 
+struct smbios_dram_info {
+	u64 size;
+};
+
+static void smbios_get_dram_info(struct smbios_dram_info *info)
+{
+	int i;
+
+	memset(info, 0, sizeof(*info));
+
+	if (gd->bd) {
+		for (i = 0; i < CONFIG_NR_DRAM_BANKS; i++)
+			info->size += gd->bd->bi_dram[i].size;
+	}
+
+	if (!info->size)
+		info->size = gd->ram_size;
+}
+
+static void smbios_encode_memdev_size(u64 bytes, u16 *size,
+					      u32 *extended_size)
+{
+	u64 size_mb;
+
+	*extended_size = 0;
+
+	if (!bytes) {
+		*size = SMBIOS_MEMORY_DEVICE_SIZE_UNKNOWN;
+		return;
+	}
+
+	if (bytes < SZ_1M) {
+		*size = (bytes / SZ_1K) |
+			SMBIOS_MEMORY_DEVICE_SIZE_GRANULARITY_KB;
+		return;
+	}
+
+	size_mb = bytes / SZ_1M;
+	if (size_mb < SMBIOS_MEMORY_DEVICE_SIZE_EXTENDED) {
+		*size = size_mb;
+		return;
+	}
+
+	*size = SMBIOS_MEMORY_DEVICE_SIZE_EXTENDED;
+	*extended_size = size_mb > 0xffffffffULL ? 0xffffffffU : size_mb;
+}
+
+static int smbios_write_type16(ulong *current, int handle,
+				       struct smbios_ctx *ctx)
+{
+	struct smbios_dram_info info;
+	struct smbios_type16 *t;
+	u64 capacity_kb;
+	int len = sizeof(*t);
+
+	smbios_get_dram_info(&info);
+
+	t = map_sysmem(*current, len);
+	memset(t, 0, len);
+	fill_smbios_header(t, SMBIOS_PHYS_MEMORY_ARRAY, len, handle);
+	smbios_set_eos(ctx, t->eos);
+
+	t->location = SMBIOS_MEMORY_ARRAY_LOCATION_SYSTEM_BOARD;
+	t->use = SMBIOS_MEMORY_ARRAY_USE_SYSTEM_MEMORY;
+	t->memory_error_correction = SMBIOS_MEMORY_ARRAY_ECC_UNKNOWN;
+	t->memory_error_info_handle =
+		SMBIOS_MEMORY_ERROR_INFO_HANDLE_NOT_PROVIDED;
+	t->number_of_memory_devices = 1;
+
+	capacity_kb = info.size / SZ_1K;
+	if (capacity_kb < SMBIOS_MEMORY_ARRAY_MAX_CAPACITY_EXTENDED) {
+		t->maximum_capacity = capacity_kb;
+	} else {
+		t->maximum_capacity = SMBIOS_MEMORY_ARRAY_MAX_CAPACITY_EXTENDED;
+		t->extended_maximum_capacity = info.size;
+	}
+
+	len = t->hdr.length + smbios_string_table_len(ctx);
+	*current += len;
+	unmap_sysmem(t);
+
+	return len;
+}
+
+static int smbios_write_type17(ulong *current, int handle,
+				       struct smbios_ctx *ctx)
+{
+	struct smbios_dram_info info;
+	struct smbios_type17 *t;
+	int len = sizeof(*t);
+
+	smbios_get_dram_info(&info);
+
+	t = map_sysmem(*current, len);
+	memset(t, 0, len);
+	fill_smbios_header(t, SMBIOS_MEMORY_DEVICE, len, handle);
+	smbios_set_eos(ctx, t->eos);
+
+	t->physical_memory_array_handle = handle - 1;
+	t->memory_error_info_handle =
+		SMBIOS_MEMORY_ERROR_INFO_HANDLE_NOT_PROVIDED;
+	t->total_width = SMBIOS_MEMORY_DEVICE_WIDTH_UNKNOWN;
+	t->data_width = SMBIOS_MEMORY_DEVICE_WIDTH_UNKNOWN;
+	smbios_encode_memdev_size(info.size, &t->size, &t->extended_size);
+	t->form_factor = SMBIOS_MEMORY_DEVICE_FORM_FACTOR_UNKNOWN;
+	t->device_locator = smbios_add_string(ctx, "DRAM");
+	t->bank_locator = smbios_add_string(ctx, "BANK 0");
+	t->memory_type = SMBIOS_MEMORY_DEVICE_TYPE_UNKNOWN;
+	t->type_detail = SMBIOS_MEMORY_DEVICE_TYPE_DETAIL_UNKNOWN;
+	t->speed = SMBIOS_MEMORY_DEVICE_SPEED_UNKNOWN;
+	t->attributes = SMBIOS_MEMORY_DEVICE_ATTR_UNKNOWN;
+
+	len = t->hdr.length + smbios_string_table_len(ctx);
+	*current += len;
+	unmap_sysmem(t);
+
+	return len;
+}
+
 static int smbios_write_type32(ulong *current, int handle,
 			       struct smbios_ctx *ctx)
 {
@@ -896,6 +1015,8 @@ static struct smbios_write_method smbios_write_funcs[] = {
 	{ smbios_write_type7, "cache", },
 #endif
 	{ smbios_write_type4, "processor"},
+	{ smbios_write_type16, },
+	{ smbios_write_type17, },
 	{ smbios_write_type32, },
 	{ smbios_write_type127 },
 };
