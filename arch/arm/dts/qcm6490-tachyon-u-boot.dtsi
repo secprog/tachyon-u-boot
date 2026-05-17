@@ -65,7 +65,12 @@
 	// RAM Entry 3 : Base 0x0100000000  Size 0x0100000000
 };
 
-// &usb_1_dwc3 {
-// 	dr_mode = "host";
-// 	/delete-property/ usb-role-switch;
-// };
+/* Enable USB-C Display (DP Alt Mode) */
+&usb_1_dwc3 {
+	dr_mode = "host";
+	/* Enable DisplayPort Alternate Mode for USB-C video out */
+	snps,dis_u2_entry_quirk;
+	snps,dis_u1_entry_quirk;
+	maximum-speed = "super-speed";
+	status = "okay";
+};

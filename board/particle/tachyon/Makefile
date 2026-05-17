@@ -6,3 +6,4 @@ obj-y	+= tachyon.o
 obj-y	+= qcom_dram.o
 obj-y	+= efs.o
 obj-y	+= efs_impl.o
+obj-$(CONFIG_ACPI) += acpi.o
