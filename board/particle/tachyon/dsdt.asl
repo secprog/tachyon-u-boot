@@ -14285,12 +14285,12 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
                 \_SB.MMU0, 
             })
             Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
-            Name (_STR, Unicode ("QUP_0_SE_1,Shared"))  // _STR: Description String
+            Name (_STR, Unicode ("QUP_0_SE_2,Shared"))  // _STR: Description String
             Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
             {
                 Name (RBUF, Buffer (0x17)
                 {
-                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x40, 0x98, 0x00,  // .....@..
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x80, 0x98, 0x00,  // .....@..
                     /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // .@......
                     /* 0010 */  0x01, 0x7A, 0x02, 0x00, 0x00, 0x79, 0x00         // .z...y.
                 })
