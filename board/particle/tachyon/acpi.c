@@ -378,38 +378,6 @@ static int tachyon_write_bgrt(struct acpi_ctx *ctx, const struct acpi_writer *en
 ACPI_WRITER(5bgrt, "BGRT", tachyon_write_bgrt, 0);
 
 /*
- * CSRT (Core System Resource Table) support
- * Defines DMA controllers and their channels
- */
-static int tachyon_write_csrt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
-{
-	struct acpi_table_header *header;
-
-	header = ctx->current;
-
-	acpi_fill_header(header, "CSRT");
-	/* CSRT length from extracted table: 69258 bytes */
-	header->length = 69258;
-	header->revision = 0;  /* CSRT revision 0 */
-
-	/*
-	 * CSRT contains DMA controller descriptions.
-	 * The extracted table is 69258 bytes - quite large.
-	 * For now, create a minimal CSRT. If DMA is needed,
-	 * this should be expanded with proper DMA controller info.
-	 */
-
-	header->checksum = table_compute_checksum(header, header->length);
-
-	acpi_add_table(ctx, header);
-	acpi_inc(ctx, header->length);
-
-	return 0;
-}
-
-ACPI_WRITER(5csrt, "CSRT", tachyon_write_csrt, 0);
-
-/*
  * DBG2 (Debug Port Table 2) support
  * Defines debug UART for Windows debugging
  */

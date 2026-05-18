@@ -23,7 +23,7 @@
 #include <linux/log2.h>
 
 enum {
-	TABLE_SIZE	= SZ_64K,
+	TABLE_SIZE	= SZ_256K,
 };
 
 DECLARE_GLOBAL_DATA_PTR;
