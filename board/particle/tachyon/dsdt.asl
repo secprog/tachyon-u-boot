@@ -14298,28 +14298,7 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
             }
         }
 
-        Device (I2C4)
-        {
-            Name (_HID, "QCOM0A10")  // _HID: Hardware ID
-            Alias (\_SB.PSUB, _SUB)
-            Name (_UID, 0x04)  // _UID: Unique ID
-            Name (_DEP, Package (0x01)  // _DEP: Dependencies
-            {
-                \_SB.PEP0, 
-            })
-            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
-            Name (_STR, Unicode ("QUP_0_SE_3"))  // _STR: Description String
-            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
-            {
-                Name (RBUF, Buffer (0x17)
-                {
-                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0xC0, 0x98, 0x00,  // ........
-                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // .@......
-                    /* 0010 */  0x01, 0x7C, 0x02, 0x00, 0x00, 0x79, 0x00         // .|...y.
-                })
-                Return (RBUF) /* \_SB_.I2C4._CRS.RBUF */
-            }
-        }
+        /* I2C4 (QUP_0_SE_3 @ 0x98C000) removed - not used by Tachyon */
 
         Device (UAR5)
         {
@@ -14407,6 +14386,184 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
             Method (_STA, 0, NotSerialized)  // _STA: Status
             {
                 Return (0x0B)
+            }
+        }
+
+        /* --- QUP_1 devices for Tachyon (based on device tree sc7280.dtsi) --- */
+
+        Device (I2C0)
+        {
+            Name (_HID, "QCOM0A10")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, Zero)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_0_SE_0,Audio"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0x98, 0x00,  // i2c0@0x980000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x59, 0x02, 0x00, 0x00, 0x79, 0x00         // IRQ=601 (0x259)
+                })
+                Return (RBUF) /* \_SB_.I2C0._CRS.RBUF */
+            }
+        }
+
+        Device (UAR9)
+        {
+            Name (_HID, "QCOM0A16")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x08)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_0,40pin"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0xA8, 0x00,  // uart8@0xA80000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x61, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=353 (0x161)
+                })
+                Return (RBUF) /* \_SB_.UAR9._CRS.RBUF */
+            }
+
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                Return (0x0F)
+            }
+        }
+
+        Device (I2C9)
+        {
+            Name (_HID, "QCOM0A10")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x09)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_1"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x40, 0xA8, 0x00,  // i2c9@0xA84000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x62, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=354 (0x162)
+                })
+                Return (RBUF) /* \_SB_.I2C9._CRS.RBUF */
+            }
+        }
+
+        Device (I2CA)
+        {
+            Name (_HID, "QCOM0A10")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x0A)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_2,QWIIC"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x80, 0xA8, 0x00,  // i2c10@0xA88000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x63, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=355 (0x163)
+                })
+                Return (RBUF) /* \_SB_.I2CA._CRS.RBUF */
+            }
+        }
+
+        Device (UARC)
+        {
+            Name (_HID, "QCOM0A16")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x0C)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_4,Syscon"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0xA9, 0x00,  // uart12@0xA90000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x65, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=357 (0x165)
+                })
+                Return (RBUF) /* \_SB_.UARC._CRS.RBUF */
+            }
+
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                Return (0x0F)
+            }
+        }
+
+        Device (I2CD)
+        {
+            Name (_HID, "QCOM0A10")  // _HID: Hardware ID
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x0D)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_5"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x40, 0xA9, 0x00,  // i2c13@0xA94000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x66, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=358 (0x166)
+                })
+                Return (RBUF) /* \_SB_.I2CD._CRS.RBUF */
+            }
+        }
+
+        Device (SPIE)
+        {
+            Name (_HID, "QCOM0A15")  // _HID: Hardware ID (QCOM SPI)
+            Alias (\_SB.PSUB, _SUB)
+            Name (_UID, 0x0E)  // _UID: Unique ID
+            Name (_DEP, Package (0x01)  // _DEP: Dependencies
+            {
+                \_SB.PEP0,
+            })
+            Name (_CCA, Zero)  // _CCA: Cache Coherency Attribute
+            Name (_STR, Unicode ("QUP_1_SE_6,40pin"))  // _STR: Description String
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, Buffer (0x17)
+                {
+                    /* 0000 */  0x86, 0x09, 0x00, 0x01, 0x00, 0x80, 0xA9, 0x00,  // spi14@0xA98000
+                    /* 0008 */  0x00, 0x40, 0x00, 0x00, 0x89, 0x06, 0x00, 0x01,  // size=0x4000
+                    /* 0010 */  0x01, 0x67, 0x01, 0x00, 0x00, 0x79, 0x00         // IRQ=359 (0x167)
+                })
+                Return (RBUF) /* \_SB_.SPIE._CRS.RBUF */
+            }
+
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                Return (0x0F)
             }
         }
 
