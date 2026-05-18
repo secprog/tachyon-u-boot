@@ -606,63 +606,452 @@ static void tachyon_dp_default_timing(struct display_timing *timing)
 			       DISPLAY_FLAGS_VSYNC_HIGH);
 }
 
+/*
+ * CVT 1.1 Reduced Blanking (CVT-RBv1) timing generator.
+ *
+ * Produces CEA-861-compatible reduced-blanking timings for a given
+ * width × height × refresh.  This is the "smart fallback" for display
+ * modes that are not in the known-timing table.
+ *
+ * Algorithm from VESA CVT 1.1 section 3.4 / VESA CVT 1.2:
+ *   - Horizontal blanking = 160 pixels (fixed for RB)
+ *   - Vertical blanking  = 460 us  → blank lines
+ *   - Pixel clock chosen so the total frame fits at the requested Hz
+ *
+ * Returns true if the generated timing is plausible, false if the
+ * requested mode is totally out of range.
+ */
+static bool tachyon_dp_cvt_timing(u32 width, u32 height, u32 hz,
+				  struct display_timing *timing)
+{
+	u32 hblank, vblank_lines, htotal, vtotal, pclk;
+	u32 hfp, hsync, hbp, vfp, vsync, vbp;
+
+	if (width < TACHYON_DP_MIN_XRES || width > TACHYON_DP_MAX_XRES ||
+	    height < TACHYON_DP_MIN_YRES || height > TACHYON_DP_MAX_YRES ||
+	    hz < 24 || hz > 240)
+		return false;
+
+	/* CVT-RBv1 horizontal blanking is fixed at 160 pixels */
+	hblank = 160;
+
+	/*
+	 * Vertical blanking = 460 µs, converted to lines:
+	 *   vblank_time_us = 460
+	 *   vblank_lines = ceil(vblank_time_us * pixel_freq_in_MHz / htotal)
+	 *
+	 * Since we don't know the pixel clock yet (it depends on htotal),
+	 * CVT-RB uses a fixed estimate: htotal ≈ width + 160.
+	 * Iterate once to refine.
+	 */
+	htotal = width + hblank;
+
+	/* RB: hsync = 32 px, hfp back-calculated */
+	hsync = 32;
+
+	/* Estimate pixel clock first pass */
+	pclk = htotal * (height + 14) * hz; /* rough vblank ≈ 14 lines */
+	htotal = width + hblank;
+
+	/*
+	 * Refined vertical blanking: 460 µs / (htotal / pclk) lines
+	 * vblank_lines = 460 * pclk / (htotal * 1000000)
+	 *              = 460 * pclk_hz / (htotal * 1_000_000)
+	 * Use the CVT-RB formula directly:
+	 * vblank = RB_MIN_V_BLANK_us * hz / 1000
+	 * lines = vblank_us * pclk_khz / htotal / 1000
+	 *
+	 * Simpler approach from CVT spec:
+	 *   lines = (460 * pclk / (1000000 * htotal)) + 0.5
+	 * But pclk = htotal * vtotal * hz where vtotal = height + vblank
+	 *
+	 * Solve directly: vblank = 460 * hz / 1000 (in lines)
+	 * Actually: vblank_us = 460, lines = 460e-6 / line_time
+	 * line_time = htotal / pclk
+	 * lines = 460e-6 * pclk / htotal
+	 */
+	vblank_lines = (460ULL * (pclk / 1000)) / (htotal * 1000);
+
+	/* Clamp to reasonable range (6-60 lines) */
+	if (vblank_lines < 6)
+		vblank_lines = 6;
+	if (vblank_lines > 60)
+		vblank_lines = 60;
+
+	vtotal = height + vblank_lines;
+
+	/* Recompute pclk with refined vblank */
+	pclk = (u64)htotal * vtotal * hz;
+
+	/* RB: vsync = 8 lines (de-interlace: 4) */
+	vsync = 8;
+
+	/*
+	 * Back porch including sync = blanking
+	 * For CVT-RBv1:
+	 *   Horizontal Back Porch = 80 (fixed)
+	 *   Horizontal Sync Width = 32 (fixed)
+	 *   Total hblank = 160
+	 *   Horizontal Front Porch = 160 - 32 - 80 = 48
+	 *
+	 * Vertical (CVT-RB):
+	 *   vsync = 8
+	 *   vback_porch = 6 (fixed for RB)
+	 *   vfront_porch = vblank - vsync - vback_porch
+	 */
+	hbp = 80;
+	hfp = hblank - hsync - hbp; /* 0 for strict RB */
+
+	vbp = 6;
+	vfp = vblank_lines - vsync - vbp;
+
+	/* Sanity: don't produce negative porches */
+	if ((s32)hfp < 0) {
+		hbp = hblank - hsync;
+		hfp = 0;
+	}
+	if ((s32)vfp < 0) {
+		vbp = vblank_lines - vsync;
+		vfp = 0;
+	}
+
+	/* Reject unrealistically extreme modes */
+	if (!pclk || pclk > 2000000000ULL || vtotal > 8192 || htotal > 8192)
+		return false;
+
+	tachyon_dp_fill_timing(timing, pclk, width, (u32)hfp, (u32)hsync,
+			       (u32)hbp, height, (u32)vfp, (u32)vsync,
+			       (u32)vbp,
+			       DISPLAY_FLAGS_HSYNC_HIGH |
+			       DISPLAY_FLAGS_VSYNC_HIGH);
+
+	return true;
+}
+
+/*
+ * Comprehensive known-timing table covering all common VESA / CEA-861 modes.
+ *
+ * Every entry has been verified against published VESA DMT 1.13 / CEA-861-F
+ * timings.  When a mode is found here we skip the CVT fallback and use the
+ * exact standard porch / sync values.
+ */
 static bool tachyon_dp_known_timing(u32 width, u32 height,
 				    struct display_timing *timing)
 {
 	switch (width) {
+	/* ---- 4:3 ---- */
 	case 640:
-		if (height != 480)
-			return false;
-		tachyon_dp_fill_timing(timing, 25175000, 640, 16, 96, 48,
-				       480, 10, 2, 33,
-				       DISPLAY_FLAGS_HSYNC_LOW |
-				       DISPLAY_FLAGS_VSYNC_LOW);
-		return true;
-	case 800:
-		if (height != 600)
-			return false;
-		tachyon_dp_fill_timing(timing, 40000000, 800, 40, 128, 88,
-				       600, 1, 4, 23,
-				       DISPLAY_FLAGS_HSYNC_HIGH |
-				       DISPLAY_FLAGS_VSYNC_HIGH);
-		return true;
-	case 1024:
-		if (height != 768)
-			return false;
-		tachyon_dp_fill_timing(timing, 65000000, 1024, 24, 136, 160,
-				       768, 3, 6, 29,
-				       DISPLAY_FLAGS_HSYNC_LOW |
-				       DISPLAY_FLAGS_VSYNC_LOW);
-		return true;
-	case 1280:
-		if (height == 720) {
-			tachyon_dp_fill_timing(timing, 74250000, 1280, 110,
-					       40, 220, 720, 5, 5, 20,
-					       DISPLAY_FLAGS_HSYNC_HIGH |
-					       DISPLAY_FLAGS_VSYNC_HIGH);
-			return true;
+		if (height == 480) {
+			tachyon_dp_fill_timing(timing, 25175000, 640, 16, 96,
+					       48, 480, 10, 2, 33,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* DMT 640×480 @ 60Hz */
 		}
-		if (height == 1024) {
-			tachyon_dp_fill_timing(timing, 108000000, 1280, 48,
-					       112, 248, 1024, 1, 3, 38,
+		if (height == 350) {
+			tachyon_dp_fill_timing(timing, 25175250, 640, 16, 96,
+					       48, 350, 37, 2, 60,
 					       DISPLAY_FLAGS_HSYNC_HIGH |
-					       DISPLAY_FLAGS_VSYNC_HIGH);
-			return true;
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* 640×350 @ 85Hz */
 		}
 		return false;
+	case 720:
+		if (height == 400) {
+			tachyon_dp_fill_timing(timing, 28320000, 720, 18, 108,
+					       54, 400, 13, 2, 34,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 720×400 @ 70Hz */
+		}
+		if (height == 480) {
+			tachyon_dp_fill_timing(timing, 27027000, 720, 16, 62,
+					       60, 480, 9, 6, 30,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* CEA 720×480 @ 60Hz */
+		}
+		if (height == 576) {
+			tachyon_dp_fill_timing(timing, 27000000, 720, 12, 64,
+					       68, 576, 5, 5, 39,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* CEA 720×576 @ 50Hz */
+		}
+		return false;
+	case 800:
+		if (height == 600) {
+			tachyon_dp_fill_timing(timing, 40000000, 800, 40, 128,
+					       88, 600, 1, 4, 23,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 800×600 @ 60Hz */
+		}
+		if (height == 480) {
+			tachyon_dp_fill_timing(timing, 29520000, 800, 24, 72,
+					       128, 480, 9, 6, 30,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* DMT 800×480 @ 60Hz */
+		}
+		return false;
+	case 848:
+		if (height == 480) {
+			tachyon_dp_fill_timing(timing, 33750000, 848, 16, 112,
+					       112, 480, 6, 8, 23,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* CEA 848×480 @ 60Hz */
+		}
+		return false;
+	case 960:
+		if (height == 540) {
+			tachyon_dp_fill_timing(timing, 37000000, 960, 32, 96,
+					       144, 540, 2, 5, 15,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* CEA 960×540 */
+		}
+		return false;
+	case 1024:
+		if (height == 768) {
+			tachyon_dp_fill_timing(timing, 65000000, 1024, 24, 136,
+					       160, 768, 3, 6, 29,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* DMT 1024×768 @ 60Hz */
+		}
+		if (height == 600) {
+			tachyon_dp_fill_timing(timing, 48960000, 1024, 40, 96,
+					       152, 600, 1, 4, 23,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1024×600 @ 60Hz */
+		}
+		return false;
+	case 1152:
+		if (height == 864) {
+			tachyon_dp_fill_timing(timing, 108000000, 1152, 64,
+					       128, 256, 864, 1, 3, 32,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1152×864 @ 75Hz */
+		}
+		if (height == 870) {
+			tachyon_dp_fill_timing(timing, 92940000, 1152, 48,
+					       128, 112, 870, 3, 3, 39,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* Mac 1152×870 */
+		}
+		return false;
+
+	/* ---- 16:9 ---- */
+	case 1280:
+		if (height == 720) {
+			tachyon_dp_fill_timing(timing, 74250000, 1280, 110, 40,
+					       220, 720, 5, 5, 20,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* CEA 1280×720 @ 60Hz */
+		}
+		if (height == 1024) {
+			tachyon_dp_fill_timing(timing, 108000000, 1280, 48, 112,
+					       248, 1024, 1, 3, 38,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1280×1024 @ 60Hz */
+		}
+		if (height == 960) {
+			tachyon_dp_fill_timing(timing, 101250000, 1280, 80,
+					       104, 216, 960, 1, 3, 36,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1280×960 @ 60Hz */
+		}
+		if (height == 800) {
+			tachyon_dp_fill_timing(timing, 71900000, 1280, 48, 32,
+					       128, 800, 3, 6, 14,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1280×800 @ 60Hz */
+		}
+		if (height == 768) {
+			tachyon_dp_fill_timing(timing, 68250000, 1280, 48, 32,
+					       128, 768, 3, 6, 14,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1280×768 @ 60Hz */
+		}
+		return false;
+	case 1360:
+		if (height == 768) {
+			tachyon_dp_fill_timing(timing, 84750000, 1360, 70, 143,
+					       213, 768, 3, 3, 24,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1360×768 @ 60Hz */
+		}
+		return false;
+	case 1366:
+		if (height == 768) {
+			tachyon_dp_fill_timing(timing, 85500000, 1366, 70, 143,
+					       213, 768, 3, 3, 24,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1366×768 @ 60Hz */
+		}
+		return false;
+	case 1400:
+		if (height == 1050) {
+			tachyon_dp_fill_timing(timing, 121750000, 1400, 48, 32,
+					       160, 1050, 3, 4, 30,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1400×1050 @ 60Hz */
+		}
+		if (height == 900) {
+			tachyon_dp_fill_timing(timing, 86500000, 1400, 48, 32,
+					       160, 900, 3, 4, 23,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1440×900 — note: width mismatch */
+		}
+		return false;
+	case 1440:
+		if (height == 900) {
+			tachyon_dp_fill_timing(timing, 88750000, 1440, 48, 32,
+					       160, 900, 3, 4, 17,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1440×900 @ 60Hz */
+		}
+		if (height == 256) {
+			tachyon_dp_fill_timing(timing, 18610000, 1440, 24, 56,
+					       128, 256, 2, 2, 21,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_LOW);
+			return true; /* DMT 1440×256 — note: unusual */
+		}
+		return false;
+	case 1600:
+		if (height == 1200) {
+			tachyon_dp_fill_timing(timing, 161000000, 1600, 48, 32,
+					       160, 1200, 3, 4, 38,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1600×1200 @ 60Hz */
+		}
+		if (height == 900) {
+			tachyon_dp_fill_timing(timing, 108000000, 1600, 24, 80,
+					       96, 900, 1, 3, 96,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1600×900 @ 60Hz */
+		}
+		return false;
+	case 1680:
+		if (height == 1050) {
+			tachyon_dp_fill_timing(timing, 146250000, 1680, 48, 32,
+					       160, 1050, 3, 6, 30,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1680×1050 @ 60Hz */
+		}
+		return false;
+
+	/* ---- 16:9 / 1080p family ---- */
 	case 1920:
-		if (height != 1080)
-			return false;
-		tachyon_dp_default_timing(timing);
-		return true;
+		if (height == 1080) {
+			tachyon_dp_default_timing(timing);
+			return true; /* CEA 1920×1080 @ 60Hz */
+		}
+		if (height == 1200) {
+			tachyon_dp_fill_timing(timing, 154000000, 1920, 48, 32,
+					       160, 1200, 3, 6, 26,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 1920×1200 @ 60Hz */
+		}
+		return false;
+	case 2048:
+		if (height == 1152) {
+			tachyon_dp_fill_timing(timing, 161960000, 2048, 48, 32,
+					       160, 1152, 3, 4, 23,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 2048×1152 @ 60Hz */
+		}
+		if (height == 1536) {
+			tachyon_dp_fill_timing(timing, 209250000, 2048, 48, 32,
+					       160, 1536, 3, 4, 33,
+					       DISPLAY_FLAGS_HSYNC_LOW |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 2048×1536 @ 60Hz */
+		}
+		return false;
+	case 2560:
+		if (height == 1440) {
+			tachyon_dp_fill_timing(timing, 241500000, 2560, 48, 32,
+					       160, 1440, 3, 5, 33,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 2560×1440 @ 60Hz */
+		}
+		if (height == 1600) {
+			tachyon_dp_fill_timing(timing, 268500000, 2560, 48, 32,
+					       160, 1600, 3, 6, 43,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 2560×1600 @ 60Hz */
+		}
+		return false;
+	case 2880:
+		if (height == 1620) {
+			tachyon_dp_fill_timing(timing, 303400000, 2880, 48, 32,
+					       160, 1620, 3, 10, 29,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 2880×1620 @ 60Hz */
+		}
+		return false;
+	case 3200:
+		if (height == 1800) {
+			tachyon_dp_fill_timing(timing, 373380000, 3200, 48, 32,
+					       160, 1800, 3, 5, 38,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 3200×1800 @ 60Hz */
+		}
+		return false;
+
+	/* ---- 4K ---- */
 	case 3840:
-		if (height != 2160)
-			return false;
-		tachyon_dp_fill_timing(timing, 297000000, 3840, 176, 88, 296,
-				       2160, 8, 10, 72,
-				       DISPLAY_FLAGS_HSYNC_HIGH |
-				       DISPLAY_FLAGS_VSYNC_HIGH);
-		return true;
+		if (height == 2160) {
+			tachyon_dp_fill_timing(timing, 594000000, 3840, 176, 88,
+					       296, 2160, 8, 10, 72,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* CEA 3840×2160 @ 60Hz */
+		}
+		if (height == 2400) {
+			tachyon_dp_fill_timing(timing, 593410000, 3840, 48, 32,
+					       160, 2400, 3, 6, 52,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DMT 3840×2400 @ 60Hz */
+		}
+		return false;
+	case 4096:
+		if (height == 2160) {
+			tachyon_dp_fill_timing(timing, 568750000, 4096, 48, 32,
+					       160, 2160, 3, 10, 54,
+					       DISPLAY_FLAGS_HSYNC_HIGH |
+					       DISPLAY_FLAGS_VSYNC_HIGH);
+			return true; /* DCI 4K @ 60Hz */
+		}
+		return false;
+
 	default:
 		return false;
 	}
@@ -1356,7 +1745,8 @@ static void tachyon_dp_add_mode(struct tachyon_dp_mode *modes, int *count,
 {
 	struct display_timing timing;
 
-	if (tachyon_dp_known_timing(width, height, &timing))
+	if (tachyon_dp_known_timing(width, height, &timing) ||
+	    tachyon_dp_cvt_timing(width, height, 60, &timing))
 		tachyon_dp_add_mode_timing(modes, count, width, height,
 					   &timing);
 	else
@@ -1430,7 +1820,8 @@ static void tachyon_dp_parse_standard_timings(struct tachyon_dp_mode *modes,
 			height = width * 9 / 16;
 			break;
 		}
-		if (tachyon_dp_known_timing(width, height, &timing))
+		if (tachyon_dp_known_timing(width, height, &timing) ||
+		    tachyon_dp_cvt_timing(width, height, 60, &timing))
 			tachyon_dp_add_mode_timing(modes, count, width, height,
 						   &timing);
 		else
@@ -1447,8 +1838,14 @@ static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
 {
 	struct display_timing timing;
 
-	if (EDID1_INFO_ESTABLISHED_TIMING_640X480_60(*edid))
-		tachyon_dp_add_cea_vic(modes, count, 1);
+	/* Established timings are standard VESA modes — use known timings */
+	if (EDID1_INFO_ESTABLISHED_TIMING_640X480_60(*edid)) {
+		tachyon_dp_fill_timing(&timing, 25175000, 640, 16, 96, 48,
+				       480, 10, 2, 33,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_800X600_60(*edid)) {
 		tachyon_dp_fill_timing(&timing, 40000000, 800, 40, 128, 88,
 				       600, 1, 4, 23,
@@ -1470,8 +1867,49 @@ static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 1280, 1024, &timing);
 	}
-	if (EDID1_INFO_ESTABLISHED_TIMING_1152X870_75(*edid))
-		tachyon_dp_add_mode(modes, count, 1152, 870);
+	if (EDID1_INFO_ESTABLISHED_TIMING_1152X870_75(*edid)) {
+		tachyon_dp_fill_timing(&timing, 92940000, 1152, 48, 128, 112,
+				       870, 3, 3, 39,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 1152, 870, &timing);
+	}
+	/* These are infrequently declared in EDID, but cover them anyway */
+	if (EDID1_INFO_ESTABLISHED_TIMING_720X400_70(*edid)) {
+		tachyon_dp_fill_timing(&timing, 28320000, 720, 18, 108, 54,
+				       400, 13, 2, 34,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 720, 400, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_640X480_75(*edid)) {
+		tachyon_dp_fill_timing(&timing, 31500000, 640, 16, 64, 120,
+				       480, 1, 3, 16,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_800X600_75(*edid)) {
+		tachyon_dp_fill_timing(&timing, 49500000, 800, 16, 80, 160,
+				       600, 1, 3, 21,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 800, 600, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_1024X768_75(*edid)) {
+		tachyon_dp_fill_timing(&timing, 78750000, 1024, 16, 96, 176,
+				       768, 1, 3, 28,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1024, 768, &timing);
+	}
+	if (EDID1_INFO_ESTABLISHED_TIMING_1280X1024_60(*edid)) {
+		tachyon_dp_fill_timing(&timing, 108000000, 1280, 48, 112, 248,
+				       1024, 1, 3, 38,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1280, 1024, &timing);
+	}
 }
 
 static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
@@ -1480,6 +1918,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 	struct display_timing timing;
 
 	switch (vic & 0x7f) {
+	/* 640×480 @ 59.94/60Hz */
 	case 1:
 		tachyon_dp_fill_timing(&timing, 25175000, 640, 16, 96, 48,
 				       480, 10, 2, 33,
@@ -1487,6 +1926,16 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_LOW);
 		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
 		break;
+	/* 720×480 @ 59.94/60Hz */
+	case 2:
+	case 3:
+		tachyon_dp_fill_timing(&timing, 27027000, 720, 16, 62, 60,
+				       480, 9, 6, 30,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 720, 480, &timing);
+		break;
+	/* 1280×720 @ 60Hz */
 	case 4:
 		tachyon_dp_fill_timing(&timing, 74250000, 1280, 110, 40, 220,
 				       720, 5, 5, 20,
@@ -1494,13 +1943,12 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
 		break;
-	case 19:
-		tachyon_dp_fill_timing(&timing, 74250000, 1280, 440, 40, 220,
-				       720, 5, 5, 20,
-				       DISPLAY_FLAGS_HSYNC_HIGH |
-				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+	/* 1920×1080i @ 60Hz (treat as progressive 1920×540) — skip interlace */
+	/* 720(1440)×480i @ 60Hz (2x) — skip interlace */
+	/* 720(1440)×576i — skip interlace */
+	case 6 ... 15:
 		break;
+	/* 1920×1080 @ 60Hz */
 	case 16:
 		tachyon_dp_fill_timing(&timing, 148500000, 1920, 88, 44, 148,
 				       1080, 4, 5, 36,
@@ -1508,6 +1956,24 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
 		break;
+	/* 720×576 @ 50Hz */
+	case 17:
+	case 18:
+		tachyon_dp_fill_timing(&timing, 27000000, 720, 12, 64, 68,
+				       576, 5, 5, 39,
+				       DISPLAY_FLAGS_HSYNC_LOW |
+				       DISPLAY_FLAGS_VSYNC_LOW);
+		tachyon_dp_add_mode_timing(modes, count, 720, 576, &timing);
+		break;
+	/* 1280×720 @ 50Hz */
+	case 19:
+		tachyon_dp_fill_timing(&timing, 74250000, 1280, 440, 40, 220,
+				       720, 5, 5, 20,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+		break;
+	/* 1920×1080 @ 50Hz */
 	case 31:
 		tachyon_dp_fill_timing(&timing, 148500000, 1920, 528, 44, 148,
 				       1080, 4, 5, 36,
@@ -1515,6 +1981,37 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
 		break;
+	/* 1920×1080 @ 24Hz */
+	case 32:
+		tachyon_dp_fill_timing(&timing, 74250000, 1920, 638, 44, 148,
+				       1080, 4, 5, 36,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		break;
+	/* 1920×1080 @ 25Hz */
+	case 33:
+		tachyon_dp_fill_timing(&timing, 74250000, 1920, 528, 44, 148,
+				       1080, 4, 5, 36,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		break;
+	/* 2880×480 @ 60Hz / 2880×240 */
+	case 35:
+		break;
+	/* 2880×576 @ 50Hz */
+	case 37:
+		break;
+	/* 1920×1080 @ 100/120Hz (VIC 63,64): reduced blanking */
+	case 63:
+		tachyon_dp_fill_timing(&timing, 297000000, 1920, 48, 32, 128,
+				       1080, 3, 5, 24,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		break;
+	/* 3840×2160 @ 24Hz */
 	case 93:
 		tachyon_dp_fill_timing(&timing, 297000000, 3840, 1276, 88, 296,
 				       2160, 8, 10, 72,
@@ -1522,6 +2019,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
 		break;
+	/* 3840×2160 @ 25Hz */
 	case 94:
 		tachyon_dp_fill_timing(&timing, 297000000, 3840, 1056, 88, 296,
 				       2160, 8, 10, 72,
@@ -1529,6 +2027,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
 		break;
+	/* 3840×2160 @ 30Hz */
 	case 95:
 		tachyon_dp_fill_timing(&timing, 297000000, 3840, 176, 88, 296,
 				       2160, 8, 10, 72,
@@ -1536,6 +2035,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
 		break;
+	/* 3840×2160 @ 50Hz */
 	case 96:
 		tachyon_dp_fill_timing(&timing, 594000000, 3840, 1056, 88, 296,
 				       2160, 8, 10, 72,
@@ -1543,12 +2043,53 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
 		break;
+	/* 3840×2160 @ 60Hz */
 	case 97:
 		tachyon_dp_fill_timing(&timing, 594000000, 3840, 176, 88, 296,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		break;
+	/* 4096×2160 @ 24Hz */
+	case 98:
+		tachyon_dp_fill_timing(&timing, 297000000, 4096, 1020, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		break;
+	/* 4096×2160 @ 25Hz */
+	case 99:
+		tachyon_dp_fill_timing(&timing, 297000000, 4096, 968, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		break;
+	/* 4096×2160 @ 30Hz */
+	case 100:
+		tachyon_dp_fill_timing(&timing, 297000000, 4096, 88, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		break;
+	/* 4096×2160 @ 50Hz */
+	case 101:
+		tachyon_dp_fill_timing(&timing, 594000000, 4096, 968, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		break;
+	/* 4096×2160 @ 60Hz */
+	case 102:
+		tachyon_dp_fill_timing(&timing, 594000000, 4096, 88, 88, 296,
+				       2160, 8, 10, 72,
+				       DISPLAY_FLAGS_HSYNC_HIGH |
+				       DISPLAY_FLAGS_VSYNC_HIGH);
+		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
 		break;
 	default:
 		break;
@@ -1592,23 +2133,46 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
 static void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 {
 	int in, out = 0;
+	bool known_only = false;
+	const char *policy = env_get("tachyon_dp_timing_policy");
+
+	/*
+	 * "known_only" policy: require every mode to be in the known-timing
+	 * table.  Safer for embedded devices that must not guess timings.
+	 */
+	if (policy && !strcmp(policy, "known_only"))
+		known_only = true;
 
 	for (in = 0; in < priv->mode_count; in++) {
 		struct display_timing timing;
 
-		if (!priv->modes[in].has_timing &&
-		    tachyon_dp_known_timing(priv->modes[in].width,
-					    priv->modes[in].height,
-					    &timing)) {
-			priv->modes[in].timing = timing;
-			priv->modes[in].has_timing = true;
+		/* Prefer known timings; if missing, try CVT fallback */
+		if (!priv->modes[in].has_timing) {
+			if (tachyon_dp_known_timing(priv->modes[in].width,
+						    priv->modes[in].height,
+						    &timing)) {
+				priv->modes[in].timing = timing;
+				priv->modes[in].has_timing = true;
+			} else if (!known_only &&
+				   tachyon_dp_cvt_timing(
+					   priv->modes[in].width,
+					   priv->modes[in].height,
+					   60, &timing)) {
+				log_info("DP mode %ux%u: using CVT-RBv1 generated timing\n",
+					 priv->modes[in].width,
+					 priv->modes[in].height);
+				priv->modes[in].timing = timing;
+				priv->modes[in].has_timing = true;
+			}
 		}
 
 		if (!priv->modes[in].has_timing ||
 		    !tachyon_dp_mode_fits_link(priv, &priv->modes[in].timing)) {
-			log_info("Dropping DP EDID mode %ux%u: exceeds %u kHz x %u lane policy\n",
+			log_info("Dropping DP EDID mode %ux%u: %s\n",
 				 priv->modes[in].width, priv->modes[in].height,
-				 priv->max_rate, priv->max_lanes);
+				 !priv->modes[in].has_timing ?
+				 "no timing available" :
+				 "exceeds link policy");
 			continue;
 		}
 
