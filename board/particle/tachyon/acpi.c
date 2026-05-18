@@ -329,7 +329,7 @@ static int tachyon_write_mcfg(struct acpi_ctx *ctx, const struct acpi_writer *en
 	 * End Bus: 255 (full bus range)
 	 */
 	size = acpi_create_mcfg_mmconfig((void *)ctx->current,
-		(0x40000000,  /* ECAM base from extracted table */
+		0x40000000,  /* ECAM base from extracted table */
 		0,           /* PCI segment group number */
 		0,           /* Start bus number */
 		255);         /* End bus number */
