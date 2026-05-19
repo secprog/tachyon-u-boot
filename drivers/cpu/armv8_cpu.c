@@ -138,6 +138,7 @@ static const struct cpu_ops cpu_ops = {
 
 static const struct udevice_id cpu_ids[] = {
 	{ .compatible = "arm,armv8" },
+	{ .compatible = "qcom,kryo" },
 	{}
 };
 
