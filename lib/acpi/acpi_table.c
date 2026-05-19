@@ -725,6 +725,107 @@ int acpi_iort_add_smmu_v3(struct acpi_ctx *ctx,
 	return offset;
 }
 
+int acpi_iort_add_smmu(struct acpi_ctx *ctx,
+		       const u64 base_address,
+		       const u64 span,
+		       const u32 model,
+		       const u32 flags,
+		       const u32 *global_gsiv,
+		       const u32 *global_flags,
+		       const int num_ctx_irq,
+		       const u32 *ctx_irq,
+		       const int num_pmu_irq,
+		       const u32 *pmu_irq,
+		       const int num_mappings,
+		       const struct acpi_iort_id_mapping *map)
+{
+	struct acpi_iort_node *node;
+	struct acpi_iort_smmu *smmu;
+	struct acpi_iort_id_mapping *mapping;
+	u32 *irq_gsiv, *irq_flags;
+	int offset;
+	int base_len;
+
+	offset = ctx->current - ctx->tab_start;
+
+	node = ctx->current;
+	memset(node, '\0', sizeof(struct acpi_iort_node));
+
+	node->type = ACPI_IORT_NODE_SMMU;
+	node->revision = 3;
+
+	/*
+	 * SMMUv2 node layout per IORT spec (ARM DEN 0049E):
+	 *   acpi_iort_node (fixed header)
+	 *   acpi_iort_smmu (fixed data)
+	 *   4 × global interrupt GSIV
+	 *   4 × global interrupt flags
+	 *   num_ctx_irq × (context_irq GSIV + flags)
+	 *   num_pmu_irq × (pmu_irq GSIV + flags)
+	 *   num_mappings × acpi_iort_id_mapping
+	 */
+
+	node->mapping_count = num_mappings;
+	node->mapping_offset = sizeof(struct acpi_iort_node) +
+			       sizeof(struct acpi_iort_smmu) +
+			       4 * sizeof(u32) +  /* global_gsiv */
+			       4 * sizeof(u32) +  /* global_flags */
+			       num_ctx_irq * 2 * sizeof(u32) +
+			       num_pmu_irq * 2 * sizeof(u32);
+
+	node->length = node->mapping_offset +
+		       sizeof(struct acpi_iort_id_mapping) * num_mappings;
+
+	smmu = (struct acpi_iort_smmu *)node->node_data;
+	smmu->base_address = base_address;
+	smmu->span = span;
+	smmu->model = model;
+	smmu->flags = flags;
+	smmu->global_interrupt_offset = sizeof(struct acpi_iort_smmu);
+	smmu->num_context_interrupts = num_ctx_irq;
+	smmu->context_interrupt_offset = sizeof(struct acpi_iort_smmu) +
+					 4 * sizeof(u32) + 4 * sizeof(u32);
+	smmu->num_pmu_interrupts = num_pmu_irq;
+	smmu->pmu_interrupt_offset = smmu->context_interrupt_offset +
+				     num_ctx_irq * 2 * sizeof(u32);
+
+	/* Global interrupt GSIVs */
+	irq_gsiv = (u32 *)(smmu + 1);
+	memcpy(irq_gsiv, global_gsiv, 4 * sizeof(u32));
+
+	/* Global interrupt flags */
+	irq_flags = irq_gsiv + 4;
+	memcpy(irq_flags, global_flags, 4 * sizeof(u32));
+
+	/* Context interrupts (GSIV + flags pairs) */
+	base_len = 8;  /* 4 GSIVs + 4 flags */
+	for (int i = 0; i < num_ctx_irq; i++) {
+		u32 *irq = (u32 *)(smmu + 1) + base_len + i * 2;
+		irq[0] = ctx_irq[i * 2];      /* GSIV */
+		irq[1] = ctx_irq[i * 2 + 1];  /* flags */
+	}
+
+	/* PMU interrupts (GSIV + flags pairs) */
+	base_len += num_ctx_irq * 2;
+	for (int i = 0; i < num_pmu_irq; i++) {
+		u32 *irq = (u32 *)(smmu + 1) + base_len + i * 2;
+		irq[0] = pmu_irq[i * 2];      /* GSIV */
+		irq[1] = pmu_irq[i * 2 + 1];  /* flags */
+	}
+
+	/* ID mappings */
+	mapping = (struct acpi_iort_id_mapping *)((void *)(smmu + 1) +
+		   node->mapping_offset - sizeof(struct acpi_iort_node));
+	for (int i = 0; i < num_mappings; i++) {
+		memcpy(mapping, &map[i], sizeof(struct acpi_iort_id_mapping));
+		mapping++;
+	}
+
+	ctx->current += node->length;
+
+	return offset;
+}
+
 static int acpi_write_iort(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct acpi_table_iort *iort;

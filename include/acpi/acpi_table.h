@@ -902,6 +902,30 @@ struct acpi_iort_smmu_v3 {
 #define ACPI_IORT_SMMU_V3_PXM_VALID         (1 << 3)
 #define ACPI_IORT_SMMU_V3_DEVICEID_VALID    (1 << 4)
 
+/* SMMUv1/v2 (MMU-400/500) node revision 3 */
+struct acpi_iort_smmu {
+	u64 base_address;	/* SMMU base address */
+	u64 span;		/* Length of SMMU register space */
+	u32 model;		/* 0 = generic MMU-500 */
+	u32 flags;		/* SMMU flags */
+	u32 global_interrupt_offset;	/* Relative to start of node data */
+	u32 num_context_interrupts;	/* Number of context interrupts */
+	u32 context_interrupt_offset;	/* Relative to start of node data */
+	u32 num_pmu_interrupts;		/* Number of PMU interrupts */
+	u32 pmu_interrupt_offset;	/* Relative to start of node data */
+	/* Followed by: SMMU_NSgIrpt[4], SMMU_NSgIrptFlags[4],
+	 * context_irq[4+4...], pmu_irq[4+4...] */
+} __packed;
+
+/* Masks for flags field in acpi_iort_smmu */
+#define ACPI_IORT_SMMU_COHERENT_WALK     (1 << 0)
+#define ACPI_IORT_SMMU_DVM_SUPPORTED     (1 << 1)
+#define ACPI_IORT_SMMU_PXM_VALID         (1 << 2)
+
+/* SMMU interrupt GSIV flags */
+#define ACPI_IORT_SMMU_IRQ_EDGE          (1 << 0)  /* Edge-triggered */
+#define ACPI_IORT_SMMU_IRQ_LEVEL         (0 << 0)  /* Level-triggered */
+
 struct acpi_iort_id_mapping {
 	u32 input_base;		/* Lowest value in input range */
 	u32 id_count;		/* Number of IDs */
@@ -1149,6 +1173,40 @@ int acpi_fill_iort(struct acpi_ctx *ctx);
 int acpi_iort_add_its_group(struct acpi_ctx *ctx,
 			    const u32 its_count,
 			    const u32 *identifiers);
+
+/**
+ * acpi_iort_add_smmu() - Add SMMUv1/v2 node to IORT table
+ *
+ * Called by SoC specific code within acpi_fill_iort().
+ *
+ * @ctx: ACPI context to write to
+ * @base_address: Base address of the SMMU
+ * @span: Length of SMMU register space (typically 0x100000)
+ * @model: SMMU model (0 = generic MMU-500)
+ * @flags: SMMU flags (ACPI_IORT_SMMU_COHERENT_WALK etc.)
+ * @global_gsiv: Array of 4 global interrupt GSIV values
+ * @global_flags: Array of 4 global interrupt flags
+ * @num_ctx_irq: Number of context interrupt pairs (GSIV + flags)
+ * @ctx_irq: Array of context interrupt GSIVs (grouped with flags: gsiv1, flags1, gsiv2, flags2...)
+ * @num_pmu_irq: Number of PMU interrupt pairs (GSIV + flags)
+ * @pmu_irq: Array of PMU interrupt GSIVs (grouped with flags)
+ * @num_mappings: Number of elements in map
+ * @map: ID mappings for this node
+ * @return Offset of table within parent
+ */
+int acpi_iort_add_smmu(struct acpi_ctx *ctx,
+		       const u64 base_address,
+		       const u64 span,
+		       const u32 model,
+		       const u32 flags,
+		       const u32 *global_gsiv,
+		       const u32 *global_flags,
+		       const int num_ctx_irq,
+		       const u32 *ctx_irq,
+		       const int num_pmu_irq,
+		       const u32 *pmu_irq,
+		       const int num_mappings,
+		       const struct acpi_iort_id_mapping *map);
 
 /**
  * acpi_iort_add_named_component() - Add named component to IORT table

@@ -60,6 +60,118 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
 }
 
 /*
+ * IORT (IO Remapping Table) support — REQUIRED for Qualcomm Windows boot
+ *
+ * Describes the SMMU (System MMU) and GIC ITS topology so Windows can
+ * correctly configure DMA remapping and MSI interrupt translation.
+ *
+ * QCM6490 (SC7280) IORT topology:
+ *   ITS Group (GIC ITS @ 0x17a40000, ID 0)
+ *     └── SMMUv2 (ARM MMU-500 @ 0x15000000)
+ *           └── PCIe Root Complex (segment 0, bus 0-255)
+ *
+ * Without this table:
+ * - Windows may fail to boot or use polled I/O
+ * - DMA from PCIe/Storage may not work correctly
+ * - MSI/MSI-X interrupts may not be delivered
+ */
+int acpi_fill_iort(struct acpi_ctx *ctx)
+{
+	u32 its_offset, smmu_offset;
+
+	/*
+	 * GIC ITS (Interrupt Translation Service) Group node
+	 *
+	 * Type: 0x00 (ITS Group)
+	 * ITS ID: 0 — must match the gic_its_id field of the MADT GIC ITS entry
+	 *         (type 0x0F) we added in acpi_fill_madt() above.
+	 *
+	 * Windows uses this to discover which ITS provides MSI translation
+	 * for the SMMU's own control interrupts.
+	 */
+	u32 identifiers[] = { 0 };
+
+	its_offset = acpi_iort_add_its_group(ctx, ARRAY_SIZE(identifiers),
+					     identifiers);
+
+	/*
+	 * SMMUv2 (ARM MMU-500) node
+	 *
+	 * Type: 0x03 (SMMU)
+	 * Base: 0x15000000 — apps_smmu from sc7280.dtsi
+	 * Size: 0x100000 (1MB — same as DT reg size)
+	 * Model: 0 (generic MMU-500)
+	 *
+	 * Interrupts (from sc7280.dtsi apps_smmu node):
+	 * - Global interrupt: GIC_SPI 65 (level-high, #global-interrupts=1)
+	 * - Context interrupts: pre-configured by hypervisor, not listed here
+	 *   (SMMU is in bypass for all streams under Gunyah hyp)
+	 *
+	 * Flags: COHERENT_WALK — SMMU page table walks are cache-coherent
+	 *        (matches dma-coherent property in DT)
+	 *
+	 * ID mapping: SMMU control interrupts → ITS Group (offset its_offset)
+	 *             Input range 0-0xFFFF (all SIDs)
+	 */
+	u32 global_gsiv[4] = { 65, 0, 0, 0 };
+	u32 global_flags[4] = { 0, 0, 0, 0 };  /* 0 = level-triggered */
+
+	struct acpi_iort_id_mapping map_smmu[] = {{
+		0,           /* input_base: lowest StreamID to match */
+		0xffff,      /* id_count: number of StreamIDs */
+		0,           /* output_base: lowest output ID */
+		its_offset,  /* output_reference: offset to ITS Group node */
+		0            /* flags: single-mapping = 0 (range mapping) */
+	}};
+
+	smmu_offset = acpi_iort_add_smmu(ctx,
+		0x15000000,                 /* base_address (apps_smmu) */
+		0x100000,                   /* span (1MB register space) */
+		0,                          /* model (generic MMU-500) */
+		ACPI_IORT_SMMU_COHERENT_WALK, /* flags (dma-coherent) */
+		global_gsiv,                /* global interrupt GSIVs */
+		global_flags,               /* global interrupt flags */
+		0,                          /* num_ctx_irq (none — hyp owns) */
+		NULL,                       /* ctx_irq array */
+		0,                          /* num_pmu_irq (none) */
+		NULL,                       /* pmu_irq array */
+		ARRAY_SIZE(map_smmu),       /* num_mappings */
+		map_smmu);                  /* ID mapping array */
+
+	/*
+	 * PCIe Root Complex node
+	 *
+	 * Type: 0x02 (PCI Root Complex)
+	 * Segment: 0 (matches MCFG pci_segment_group_number = 0)
+	 * Memory address size limit: 64 (64-bit addressing)
+	 *
+	 * Memory access properties:
+	 *   bit 0  = Cache Coherent (PCIe is cache-coherent on this SoC)
+	 *   bit 56 = CCA/CPM (Coherent Processing Memory — ARM-specific)
+	 *
+	 * ID mapping: PCIe Requester ID → SMMU (offset smmu_offset)
+	 *             Input range 0-0xFFFF covers all 16-bit RIDs
+	 */
+	struct acpi_iort_id_mapping map_rc[] = {{
+		0,            /* input_base: lowest RequesterID */
+		0xffff,       /* id_count: number of RequesterIDs */
+		0,            /* output_base: lowest SMMU StreamID */
+		smmu_offset,  /* output_reference: offset to SMMU node */
+		0             /* flags: single-mapping = 0 (range mapping) */
+	}};
+
+	acpi_iort_add_rc(ctx,
+		BIT(0) | BIT(56),       /* mem_access_properties (CacheCoherent + CPM) */
+		0,                      /* ats_attributes (ATS not supported) */
+		0,                      /* pci_segment_number (matches MCFG) */
+		64,                     /* memory_address_size_limit (64-bit) */
+		ARRAY_SIZE(map_rc),     /* num_mappings */
+		map_rc);                /* ID mapping array */
+
+	return 0;
+}
+
+/*
  * MADT (Multiple APIC Description Table) support
  * Defines GIC (Generic Interrupt Controller) structures for ARM
  *
@@ -73,6 +185,7 @@ int acpi_fill_madt(struct acpi_madt *madt, struct acpi_ctx *ctx)
 	struct acpi_madt_gicd *gicd;
 	struct acpi_madt_gicr *gicr;
 	struct acpi_madt_gicc *gicc;
+	struct acpi_madt_its *its;
 
 	/*
 	 * GICD (GIC Distributor) - Type 0x0C
@@ -156,6 +269,24 @@ int acpi_fill_madt(struct acpi_madt *madt, struct acpi_ctx *ctx)
 
 		acpi_inc(ctx, gicc->length);
 	}
+
+	/*
+	 * GIC ITS (Interrupt Translation Service) - Type 0x0F
+	 * Base address: 0x17a40000 (from sc7280.dtsi)
+	 * ITS ID: 0 (identifier referenced by IORT ITS Group node)
+	 *
+	 * This is REQUIRED for IORT to work — the IORT ITS Group
+	 * node references the ITS ID from this MADT entry.
+	 */
+	its = ctx->current;
+	its->type = ACPI_APIC_ITS;
+	its->length = sizeof(struct acpi_madt_its);
+	its->reserved = 0;
+	its->gic_its_id = 0;
+	its->physical_base_address = 0x17a40000;  /* GIC ITS base from sc7280.dtsi */
+	its->reserved2 = 0;
+
+	acpi_inc(ctx, its->length);
 
 	return 0;
 }
