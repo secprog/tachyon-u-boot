@@ -183,7 +183,6 @@ static int acpi_write_pptt(struct acpi_ctx *ctx, const struct acpi_writer *entry
 	header->length = ctx->current - ctx->tab_start;
 	header->checksum = table_compute_checksum(header, header->length);
 
-	acpi_inc(ctx, header->length);
 	acpi_add_table(ctx, header);
 
 	return 0;
