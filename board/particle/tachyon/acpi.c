@@ -641,3 +641,60 @@ static int tachyon_write_facs(struct acpi_ctx *ctx, const struct acpi_writer *en
 }
 
 ACPI_WRITER(5facs, "FACS", tachyon_write_facs, 0);
+
+/*
+ * TPM2 (Trusted Platform Module 2.0) Table
+ * Required by Windows 11 to discover the firmware TPM (fTPM in OP-TEE)
+ *
+ * Uses start_method = 7 (Command Response Buffer) for fTPM over TEE.
+ * The EFI TCG2 protocol manages its own event log; we reference the
+ * log buffer that EFI TCG2 will allocate.
+ */
+static int tachyon_write_tpm2(struct acpi_ctx *ctx, const struct acpi_writer *entry)
+{
+	struct acpi_table_header *header;
+	struct acpi_tpm2 *tpm2;
+
+	if (!IS_ENABLED(CONFIG_TPM_V2))
+		return -ENOENT;
+
+	tpm2 = ctx->current;
+	header = &tpm2->header;
+	memset(tpm2, 0, sizeof(struct acpi_tpm2));
+
+	acpi_fill_header(header, "TPM2");
+	header->length = sizeof(struct acpi_tpm2);
+	header->revision = acpi_get_table_revision(ACPITAB_TPM2);
+
+	/* Platform class: 1 = client system */
+	tpm2->platform_class = 1;
+
+	/*
+	 * Start method 7 = Command Response Buffer
+	 * This is the correct method for fTPM running in OP-TEE,
+	 * where the OS communicates via SMC calls through the
+	 * TCG2 protocol rather than direct MMIO.
+	 */
+	tpm2->control_area = 0;
+	tpm2->start_method = 7;
+	memset(tpm2->msp, 0, sizeof(tpm2->msp));
+
+	/*
+	 * Log Area Minimum Length (laml) and Log Area Start Address (lasa):
+	 * The EFI TCG2 protocol allocates its own event log buffer at boot.
+	 * Set laml to the configured log size; lasa will be populated by
+	 * the EFI TCG2 protocol at ExitBootServices or left zero if not
+	 * yet available.
+	 */
+	tpm2->laml = CONFIG_TPM2_EVENT_LOG_SIZE;
+	tpm2->lasa = 0;
+
+	header->checksum = table_compute_checksum(tpm2, header->length);
+
+	acpi_inc(ctx, tpm2->header.length);
+	acpi_add_table(ctx, tpm2);
+
+	return 0;
+}
+
+ACPI_WRITER(5tpm2, "TPM2", tachyon_write_tpm2, 0);

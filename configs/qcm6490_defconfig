@@ -35,7 +35,15 @@ CONFIG_EFI_ACPI_TABLES=y
 CONFIG_ARMV8_PSCI=y
 CONFIG_SEC_FIRMWARE_ARMV8_PSCI=y
 
+# FIT Signature verification (dependency of EFI Secure Boot)
+CONFIG_FIT_SIGNATURE=y
+
+# Trusted Execution Environment (dependency of fTPM in OP-TEE)
+CONFIG_TEE=y
+CONFIG_OPTEE=y
+
 # EFI Secure Boot (required for Windows 11)
+# Note: PK/KEK/db must be enrolled at first boot or via EFI_VARIABLES_PRESEED
 CONFIG_EFI_SECURE_BOOT=y
 
 # TPM 2.0 via OP-TEE fTPM (required for Windows 11)

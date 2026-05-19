@@ -199,6 +199,27 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
         Name (SKUV, 0xFFFFFFFF)
         Name (SDDR, 0xFFFFFFFF)
         Name (UAON, 0xFFFFFFFF)
+        Device (TPM0)
+        {
+            Name (_HID, "MSFT0101")  // _HID: Hardware ID — Microsoft TPM 2.0
+            Name (_CID, "MSFT0101")  // _CID: Compatible ID
+            Name (_UID, Zero)        // _UID: Unique ID
+            Name (_STA, 0x0F)        // _STA: Present, enabled, functional
+            Name (_CCA, One)         // _CCA: Cache-coherent on ARM64
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                /*
+                 * fTPM in OP-TEE uses SMC calls (start_method=7 in TPM2 table).
+                 * No MMIO resources needed; return EndDescriptor only.
+                 */
+                Name (RBUF, Buffer (One)
+                {
+                    0x79     // End Descriptor
+                })
+                Return (RBUF) /* \_SB_.TPM0._CRS.RBUF */
+            }
+        }
+
         Device (UFS0)
         {
             Method (_STA, 0, NotSerialized)  // _STA: Status
