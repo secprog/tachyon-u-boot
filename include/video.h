@@ -129,9 +129,30 @@ struct video_priv {
  *		For these devices implement video_sync hook to call a sync
  *		function. vid is pointer to video device udevice. Function
  *		should return 0 on success video_sync and error code otherwise
+ * @video_get_mode_count: Return the number of supported display modes.
+ *		If NULL, treats the driver as single-mode (mode 0 only).
+ * @video_get_mode_info: Fill in a mode descriptor for a given mode index.
+ *		@mode_number: 0-based mode index
+ *		@width: output — horizontal resolution
+ *		@height: output — vertical resolution
+ *		@format: output — pixel format (enum video_format)
+ *		@bpix: output — log2 bits per pixel (enum video_log2_bpp)
+ *		Returns 0 on success, -ENOENT if mode_number out of range.
+ * @video_set_mode: Switch the hardware to a new display mode.
+ *		@mode_number: 0-based mode index to activate
+ *		Returns 0 on success, -EINVAL if mode_number out of range.
+ *		After a successful call the driver updates uc_priv->xsize,
+ *		uc_priv->ysize, uc_priv->line_length, and uc_priv->fb_size
+ *		to reflect the new mode.
  */
 struct video_ops {
 	int (*video_sync)(struct udevice *vid);
+	int (*video_get_mode_count)(struct udevice *vid);
+	int (*video_get_mode_info)(struct udevice *vid, u32 mode_number,
+				   u32 *width, u32 *height,
+				   enum video_format *format,
+				   enum video_log2_bpp *bpix);
+	int (*video_set_mode)(struct udevice *vid, u32 mode_number);
 };
 
 #define video_get_ops(dev)        ((struct video_ops *)(dev)->driver->ops)

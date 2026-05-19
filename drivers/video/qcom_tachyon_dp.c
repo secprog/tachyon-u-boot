@@ -3180,8 +3180,83 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	return 0;
 }
 
+static int tachyon_dp_get_mode_count(struct udevice *dev)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+
+	return priv->mode_count;
+}
+
+static int tachyon_dp_get_mode_info(struct udevice *dev, u32 mode_number,
+				    u32 *width, u32 *height,
+				    enum video_format *format,
+				    enum video_log2_bpp *bpix)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+
+	if (mode_number >= (u32)priv->mode_count)
+		return -ENOENT;
+
+	*width = priv->modes[mode_number].width;
+	*height = priv->modes[mode_number].height;
+	*format = VIDEO_X8R8G8B8;
+	*bpix = VIDEO_BPP32;
+	return 0;
+}
+
+static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
+	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
+	u32 width, height;
+	int ret;
+
+	if (mode_number >= (u32)priv->mode_count)
+		return -EINVAL;
+
+	width = priv->modes[mode_number].width;
+	height = priv->modes[mode_number].height;
+
+	tachyon_dp_select_mode(priv, &width, &height);
+	tachyon_dp_reset_link_policy(priv);
+	memset(priv->swing, 0, sizeof(priv->swing));
+	memset(priv->pre, 0, sizeof(priv->pre));
+
+	ret = tachyon_dp_link_train(priv);
+	if (ret)
+		return ret;
+
+	priv->max_rate  = priv->rate;
+	priv->max_lanes = priv->lanes;
+	tachyon_dp_filter_edid_modes(priv);
+	tachyon_dp_publish_edid_modes(priv);
+
+	uc_priv->xsize = width;
+	uc_priv->ysize = height;
+	uc_priv->bpix = VIDEO_BPP32;
+	uc_priv->format = VIDEO_X8R8G8B8;
+	uc_priv->line_length = width * 4;
+	uc_priv->fb_size = uc_priv->line_length * height;
+	if (uc_priv->fb_size > plat->size)
+		return -ENOSPC;
+
+	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
+	if (ret)
+		return ret;
+
+	ret = tachyon_dp_program_mainlink(priv);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 static const struct video_ops tachyon_dp_ops = {
 	.video_sync = tachyon_dp_video_sync,
+	.video_get_mode_count = tachyon_dp_get_mode_count,
+	.video_get_mode_info = tachyon_dp_get_mode_info,
+	.video_set_mode = tachyon_dp_set_mode,
 };
 
 static int tachyon_dp_bind(struct udevice *dev)

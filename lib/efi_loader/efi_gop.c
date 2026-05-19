@@ -28,6 +28,8 @@ static const efi_guid_t efi_gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
  * @mode:	graphical output mode
  * @bpix:	bits per pixel
  * @fb:		frame buffer
+ * @vdev:	underlying video uclass device (for video_set_mode etc.)
+ * @plat:	video uclass platform data (for fb_base reference)
  */
 struct efi_gop_obj {
 	struct efi_object header;
@@ -37,6 +39,8 @@ struct efi_gop_obj {
 	/* Fields we only have access to during init */
 	u32 bpix;
 	void *fb;
+	struct udevice *vdev;
+	struct video_uc_plat *plat;
 };
 
 static efi_status_t EFIAPI gop_query_mode(struct efi_gop *this, u32 mode_number,
@@ -44,25 +48,70 @@ static efi_status_t EFIAPI gop_query_mode(struct efi_gop *this, u32 mode_number,
 					  struct efi_gop_mode_info **info)
 {
 	struct efi_gop_obj *gopobj;
-	efi_status_t ret = EFI_SUCCESS;
+	struct video_ops *vops;
+	u32 width, height;
+	enum video_format fmt;
+	enum video_log2_bpp bpix;
+	int ret;
 
 	EFI_ENTRY("%p, %x, %p, %p", this, mode_number, size_of_info, info);
 
-	if (!this || !size_of_info || !info || mode_number) {
-		ret = EFI_INVALID_PARAMETER;
-		goto out;
-	}
+	if (!this || !size_of_info || !info)
+		return EFI_EXIT(EFI_INVALID_PARAMETER);
 
 	gopobj = container_of(this, struct efi_gop_obj, ops);
-	ret = efi_allocate_pool(EFI_BOOT_SERVICES_DATA, sizeof(gopobj->info),
+	vops = video_get_ops(gopobj->vdev);
+
+	if (vops && vops->video_get_mode_info &&
+	    vops->video_get_mode_count(gopobj->vdev) > 0) {
+		ret = vops->video_get_mode_info(gopobj->vdev, mode_number,
+						&width, &height, &fmt, &bpix);
+		if (ret)
+			return EFI_EXIT(EFI_INVALID_PARAMETER);
+	} else {
+		/* Single-mode fallback: only mode 0 is valid */
+		if (mode_number)
+			return EFI_EXIT(EFI_INVALID_PARAMETER);
+		width = gopobj->info.width;
+		height = gopobj->info.height;
+		fmt = VIDEO_X8R8G8B8;
+		bpix = VIDEO_BPP32;
+	}
+
+	ret = efi_allocate_pool(EFI_BOOT_SERVICES_DATA, sizeof(**info),
 				(void **)info);
 	if (ret != EFI_SUCCESS)
-		goto out;
-	*size_of_info = sizeof(gopobj->info);
-	memcpy(*info, &gopobj->info, sizeof(gopobj->info));
+		return EFI_EXIT(ret);
 
-out:
-	return EFI_EXIT(ret);
+	(*info)->version = 0;
+	(*info)->width = width;
+	(*info)->height = height;
+	(*info)->pixels_per_scanline = width;
+
+	if (bpix == VIDEO_BPP32) {
+		if (fmt == VIDEO_X2R10G10B10) {
+			(*info)->pixel_format = EFI_GOT_BITMASK;
+			(*info)->pixel_bitmask[0] = 0x3ff00000; /* red */
+			(*info)->pixel_bitmask[1] = 0x000ffc00; /* green */
+			(*info)->pixel_bitmask[2] = 0x000003ff; /* blue */
+			(*info)->pixel_bitmask[3] = 0xc0000000; /* reserved */
+		} else {
+			(*info)->pixel_format = EFI_GOT_BGRA8;
+		}
+	} else {
+		(*info)->pixel_format = EFI_GOT_BITMASK;
+		(*info)->pixel_bitmask[0] = 0xf800; /* red */
+		(*info)->pixel_bitmask[1] = 0x07e0; /* green */
+		(*info)->pixel_bitmask[2] = 0x001f; /* blue */
+	}
+	(*info)->pixel_information.red_mask = (*info)->pixel_bitmask[0];
+	(*info)->pixel_information.green_mask = (*info)->pixel_bitmask[1];
+	(*info)->pixel_information.blue_mask = (*info)->pixel_bitmask[2];
+	(*info)->pixel_information.reserved_mask = (*info)->pixel_bitmask[3];
+
+	*size_of_info = sizeof(**info);
+
+	return EFI_EXIT(EFI_SUCCESS);
 }
 
 static __always_inline struct efi_gop_pixel efi_vid30_to_blt_col(u32 vid)
@@ -361,27 +410,64 @@ static efi_status_t gop_blt_vid_to_buf(struct efi_gop *this,
 static efi_status_t EFIAPI gop_set_mode(struct efi_gop *this, u32 mode_number)
 {
 	struct efi_gop_obj *gopobj;
+	struct video_ops *vops;
+	struct video_priv *priv;
 	struct efi_gop_pixel buffer = {0, 0, 0, 0};
 	efi_uintn_t vid_bpp;
-	efi_status_t ret = EFI_SUCCESS;
+	int ret;
 
 	EFI_ENTRY("%p, %x", this, mode_number);
 
-	if (!this) {
-		ret = EFI_INVALID_PARAMETER;
-		goto out;
-	}
-	if (mode_number) {
-		ret = EFI_UNSUPPORTED;
-		goto out;
-	}
+	if (!this)
+		return EFI_EXIT(EFI_INVALID_PARAMETER);
+
 	gopobj = container_of(this, struct efi_gop_obj, ops);
-	vid_bpp = gop_get_bpp(this);
-	ret = gop_blt_video_fill(this, &buffer, EFI_BLT_VIDEO_FILL, 0, 0, 0, 0,
-				 gopobj->info.width, gopobj->info.height, 0,
-				 vid_bpp);
-out:
-	return EFI_EXIT(ret);
+	vops = video_get_ops(gopobj->vdev);
+
+	if (vops && vops->video_set_mode) {
+		/* Real hardware mode switch via the video driver */
+		ret = vops->video_set_mode(gopobj->vdev, mode_number);
+		if (ret)
+			return EFI_EXIT(EFI_UNSUPPORTED);
+
+		/* Reflect new mode in GOP fields */
+		priv = dev_get_uclass_priv(gopobj->vdev);
+		gopobj->info.width = priv->xsize;
+		gopobj->info.height = priv->ysize;
+		gopobj->info.pixels_per_scanline = priv->xsize;
+		gopobj->bpix = priv->bpix;
+		if (priv->bpix == VIDEO_BPP32) {
+			if (priv->format == VIDEO_X2R10G10B10) {
+				gopobj->info.pixel_format = EFI_GOT_BITMASK;
+				gopobj->info.pixel_bitmask[0] = 0x3ff00000;
+				gopobj->info.pixel_bitmask[1] = 0x000ffc00;
+				gopobj->info.pixel_bitmask[2] = 0x000003ff;
+				gopobj->info.pixel_bitmask[3] = 0xc0000000;
+			} else {
+				gopobj->info.pixel_format = EFI_GOT_BGRA8;
+			}
+		} else {
+			gopobj->info.pixel_format = EFI_GOT_BITMASK;
+			gopobj->info.pixel_bitmask[0] = 0xf800;
+			gopobj->info.pixel_bitmask[1] = 0x07e0;
+			gopobj->info.pixel_bitmask[2] = 0x001f;
+		}
+		gopobj->fb = map_sysmem(gopobj->mode.fb_base,
+					gopobj->mode.fb_size);
+		video_sync_all();
+	} else {
+		/* Legacy single-mode: only mode 0 = clear FB */
+		if (mode_number)
+			return EFI_EXIT(EFI_UNSUPPORTED);
+		vid_bpp = gop_get_bpp(this);
+		ret = gop_blt_video_fill(this, &buffer, EFI_BLT_VIDEO_FILL,
+					 0, 0, 0, 0, gopobj->info.width,
+					 gopobj->info.height, 0, vid_bpp);
+		if (ret != EFI_SUCCESS)
+			return EFI_EXIT(ret);
+	}
+
+	return EFI_EXIT(EFI_SUCCESS);
 }
 
 /*
@@ -468,11 +554,13 @@ efi_status_t efi_gop_register(void)
 {
 	struct efi_gop_obj *gopobj;
 	u32 bpix, format, col, row;
+	int mode_count = 1;
 	u64 fb_base, fb_size;
 	efi_status_t ret;
 	struct udevice *vdev;
 	struct video_priv *priv;
 	struct video_uc_plat *plat;
+	struct video_ops *vops;
 
 	/* We only support a single video output device for now */
 	if (uclass_first_device_err(UCLASS_VIDEO, &vdev)) {
@@ -490,6 +578,13 @@ efi_status_t efi_gop_register(void)
 	fb_base = IS_ENABLED(CONFIG_VIDEO_COPY) ? plat->copy_base : plat->base;
 	fb_size = plat->size;
 
+	vops = video_get_ops(vdev);
+	if (vops && vops->video_get_mode_count) {
+		mode_count = vops->video_get_mode_count(vdev);
+		if (mode_count < 1)
+			mode_count = 1;
+	}
+
 	switch (bpix) {
 	case VIDEO_BPP16:
 	case VIDEO_BPP32:
@@ -506,6 +601,10 @@ efi_status_t efi_gop_register(void)
 		return EFI_OUT_OF_RESOURCES;
 	}
 
+	/* Store references for SetMode() and QueryMode() callbacks */
+	gopobj->vdev = vdev;
+	gopobj->plat = plat;
+
 	/* Hook up to the device list */
 	efi_add_handle(&gopobj->header);
 
@@ -521,7 +620,7 @@ efi_status_t efi_gop_register(void)
 	gopobj->ops.blt = gop_blt;
 	gopobj->ops.mode = &gopobj->mode;
 
-	gopobj->mode.max_mode = 1;
+	gopobj->mode.max_mode = mode_count;
 	gopobj->mode.info = &gopobj->info;
 	gopobj->mode.info_size = sizeof(gopobj->info);
 
@@ -551,6 +650,26 @@ efi_status_t efi_gop_register(void)
 	gopobj->info.pixels_per_scanline = col;
 	gopobj->bpix = bpix;
 	gopobj->fb = map_sysmem(fb_base, fb_size);
+
+	/*
+	 * Re-mark the framebuffer as EFI_RESERVED_MEMORY_TYPE so the OS
+	 * does not reclaim it after ExitBootServices().  The display
+	 * hardware is still actively scanning out from this region.
+	 *
+	 * Without this, the FB ends up as EFI_BOOT_SERVICES_DATA (carved
+	 * by the LMB notifier), and Windows Setup / WinPE may reuse the
+	 * physical pages after ExitBootServices, causing visual corruption
+	 * or a blank screen.
+	 *
+	 * We carve the FB from whatever type it currently is
+	 * (overlap_conventional=false) and re-add it as reserved memory
+	 * with EFI_MEMORY_WC for framebuffer performance.
+	 */
+	ret = efi_add_memory_map(fb_base, fb_size,
+				 EFI_RESERVED_MEMORY_TYPE);
+	if (ret != EFI_SUCCESS)
+		log_warning("Failed to reserve FB memory map entry: %lx\n",
+			    ret & ~EFI_ERROR_MASK);
 
 	return EFI_SUCCESS;
 }
