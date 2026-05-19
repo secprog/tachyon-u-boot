@@ -174,6 +174,41 @@ config VIDEO_QCOM_TACHYON_DP
 	  Tachyon SBU mux, performs AUX/DPCD probing and link training, and
 	  exposes a framebuffer through the U-Boot video uclass.
 
+if VIDEO_QCOM_TACHYON_DP
+
+config VIDEO_TACHYON_DP_AUDIO
+	bool "DP audio infoframe support"
+	default y
+	help
+	  Program DP audio clock regeneration (MAUD/NAUD) and transmit
+	  CEA-861 Audio InfoFrames so the sink exposes audio capability
+	  to the OS. Required for Windows Setup startup sound and any
+	  OS-level audio output through the DP-connected monitor or dock.
+	  Adds ~200 bytes of code and a few AUX reads at probe time.
+
+config VIDEO_TACHYON_DP_ADVANCED_HOTPLUG
+	bool "Advanced DP hotplug policy (IRQ polling, SINK_COUNT)"
+	default y
+	help
+	  Poll DPCD ESI IRQ vector and SINK_COUNT registers to detect
+	  connect/disconnect events, monitor wake-from-sleep, docking-
+	  station hotplug, and link-loss conditions. Without this the
+	  driver only re-checks orientation via PMIC-GLINK on video_sync().
+	  Adds ~300 bytes of code and a single-byte DPCD read per sync cycle.
+
+config VIDEO_TACHYON_DP_MULTI_PLANE
+	bool "DP multi-plane overlay (DMA1 SSPP + LM blend)"
+	default n
+	help
+	  Enable a second DMA SSPP (DMA1) as an ARGB8888 overlay plane
+	  blended by the Layer Mixer (LM). Exposes video_get_max_planes,
+	  video_enable_plane, and video_set_plane_fb in video_ops.
+	  Useful for hardware-cursor boot logo overlays and debugging.
+	  Adds ~400 bytes of code and requires the overlay framebuffer
+	  to fit within the existing video_uc_plat allocation.
+
+endif # VIDEO_QCOM_TACHYON_DP
+
 config CONSOLE_NORMAL
 	bool "Support a simple text console"
 	default y

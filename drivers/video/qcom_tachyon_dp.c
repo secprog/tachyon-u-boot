@@ -130,6 +130,63 @@
 #define DP_MAINLINK_READY_FOR_VIDEO	BIT(0)
 #define REG_DP_TU			0x04c
 
+/* DP Audio clock regeneration registers (SC7280 / QCM6490 DP controller) */
+#define REG_DP_AUDIO_MAUD		0x054
+#define REG_DP_AUDIO_NAUD		0x058
+#define REG_DP_AUDIO_CFG		0x050
+#define DP_AUDIO_CFG_ENABLE		BIT(0)
+#define DP_AUDIO_CFG_CHANNEL_COUNT_SHIFT 1
+#define REG_DP_AUDIO_CTRL		0x05c
+#define DP_AUDIO_CTRL_SAMPLE_PRESENT	BIT(0)
+#define DP_AUDIO_CTRL_NPC_EN		BIT(1)
+
+/* DP Audio InfoFrame transmit registers */
+#define REG_DP_AUDIO_INFOFRAME_HEADER	0x060
+#define REG_DP_AUDIO_INFOFRAME_DATA(n)	(0x064 + (n) * 4)
+#define DP_AUDIO_INFOFRAME_SEND		BIT(0)
+#define DP_AUDIO_INFOFRAME_SENT		BIT(1)
+
+/* Audio InfoFrame HB0: type=0x04 (Audio), version=1 */
+#define DP_AUDIO_INFOFRAME_TYPE_CODE	0x84
+
+/* DPCD registers for hotplug IRQ / Event Status Indicator */
+#define DPCD_SINK_COUNT			0x00200
+#define DPCD_DEVICE_SERVICE_IRQ		0x00201
+#define DPCD_SINK_COUNT_ESI		0x02002
+#define DPCD_DEV_SERVICE_IRQ_VECTOR_ESI0 0x02003
+#define DPCD_LANE0_1_STATUS_ESI		0x0200C
+#define DPCD_LANE2_3_STATUS_ESI		0x0200D
+#define DPCD_LANE_ALIGN_STATUS_ESI	0x0200E
+#define DPCD_SINK_STATUS_ESI		0x0200F
+
+#define DP_IRQ_REMOTE_CONTROL		BIT(0)
+#define DP_IRQ_HPD			BIT(1)
+#define DP_IRQ_TEST_REQUEST		BIT(2)
+#define DP_IRQ_AUTOMATED_TEST		BIT(3)
+#define DP_IRQ_CP_IRQ			BIT(4)
+#define DP_IRQ_SINK_SPECIFIC		BIT(6)
+
+#define DP_SINK_COUNT_LOW_MASK		0x3f
+#define DP_SINK_CP_READY		BIT(6)
+
+/* DPCD audio capability registers */
+#define DPCD_NUM_AUDIO_EPS		0x00022
+
+/* Multi-plane DPU register extensions */
+#define DPU_SSPP_DMA1_BASE		0x26000
+#define DPU_CTL_FLUSH_DMA1		BIT(12)
+#define DPU_CTL_LAYER_DMA1_STAGE1	(1 << 26)
+#define DPU_LM_BLEND_OP_MODE		0x008
+#define DPU_LM_BLEND_STAGE0_FG_ALPHA	0x00c
+#define DPU_LM_BLEND_STAGE0_BG_ALPHA	0x010
+#define DPU_LM_BLEND_STAGE1_FG_ALPHA	0x014
+#define DPU_LM_BLEND_STAGE1_BG_ALPHA	0x018
+#define DPU_LM_BLEND_OUT		0x01c
+#define DPU_LM_BLEND_STAGE0_EN		BIT(0)
+#define DPU_LM_BLEND_STAGE1_EN		BIT(1)
+#define DPU_FORMAT_ARGB8888		0x00023428
+#define DPU_UNPACK_ARGB8888		0x03020100
+
 #define MMSS_DP_TIMING_ENGINE_EN	0x010
 #define DP_TIMING_ENGINE_EN_EN		BIT(0)
 #define MMSS_DP_INTF_CONFIG		0x014
@@ -308,6 +365,21 @@ struct tachyon_qmp_reg {
 	u8 val;
 };
 
+struct tachyon_dp_audio_format {
+	u8 format_code;
+	u8 max_channels;
+	u8 sample_rates;
+	u8 sample_sizes;
+};
+
+struct tachyon_dp_audio_caps {
+	bool basic_audio;
+	u8 speaker_alloc;
+	u8 num_audio_eps;
+	u8 format_count;
+	struct tachyon_dp_audio_format formats[8];
+};
+
 struct tachyon_dp_priv {
 	void __iomem *ctrl;
 	void __iomem *aux;
@@ -317,6 +389,7 @@ struct tachyon_dp_priv {
 	void __iomem *phy_dp;
 	void __iomem *dpu;
 	void __iomem *vbif;
+	void __iomem *dpu_sspp_dma1;
 	struct clk pixel_clk;
 	struct clk dp_clks[TACHYON_DP_CORE_CLK_COUNT];
 	struct clk dpu_clks[TACHYON_DPU_CLK_COUNT];
@@ -344,6 +417,11 @@ struct tachyon_dp_priv {
 	u32 aux_defers;
 	u32 aux_errors;
 	u32 aux_retries;
+	struct tachyon_dp_audio_caps audio;
+	u8 last_sink_count;
+	u32 last_hpd_poll_ms;
+	bool hpd_fast_poll;
+	bool overlay_active;
 };
 
 static bool tachyon_dp_valid_resolution(u32 width, u32 height)
@@ -2130,6 +2208,204 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
 	}
 }
 
+#ifdef CONFIG_VIDEO_TACHYON_DP_AUDIO
+static void tachyon_dp_parse_cea_audio(struct tachyon_dp_priv *priv,
+				       const u8 *buf)
+{
+	const struct edid_cea861_info *cea =
+		(const struct edid_cea861_info *)buf;
+	int offset;
+
+	priv->audio.basic_audio =
+		EDID_CEA861_SUPPORTS_BASIC_AUDIO(cea->dtd_count);
+
+	if (cea->extension_tag != EDID_CEA861_EXTENSION_TAG)
+		return;
+
+	for (offset = 4; cea->dtd_offset && offset < cea->dtd_offset;) {
+		u8 tag = EDID_CEA861_DB_TYPE(*cea, offset - 4);
+		u8 len = EDID_CEA861_DB_LEN(*cea, offset - 4);
+		int i;
+
+		if (offset + len >= EDID_SIZE)
+			break;
+
+		if (tag == EDID_CEA861_DB_AUDIO) {
+			/*
+			 * Short Audio Descriptors: 3 bytes each.
+			 * Byte 1: format code (1=LPCM) + max channels - 1
+			 * Byte 2: supported sample rates (bitmask)
+			 * Byte 3: supported sample sizes (bitmask, LPCM only)
+			 */
+			for (i = 1; i + 2 <= len &&
+			     priv->audio.format_count < 8; i += 3) {
+				u8 *sad = (u8 *)&buf[offset + i];
+
+				priv->audio.formats[priv->audio.format_count].format_code =
+					(sad[0] >> 3) & 0x0f;
+				priv->audio.formats[priv->audio.format_count].max_channels =
+					(sad[0] & 0x07) + 1;
+				priv->audio.formats[priv->audio.format_count].sample_rates =
+					sad[1];
+				priv->audio.formats[priv->audio.format_count].sample_sizes =
+					sad[2];
+				priv->audio.format_count++;
+			}
+		}
+
+		if (tag == EDID_CEA861_DB_SPEAKER && len >= 1)
+			priv->audio.speaker_alloc = buf[offset + 1];
+
+		offset += len + 1;
+	}
+
+	/*
+	 * Fallback: if no SADs were parsed but basic audio is supported,
+	 * assume 2ch LPCM 48kHz 16-bit (the minimum required by CEA-861).
+	 */
+	if (!priv->audio.format_count && priv->audio.basic_audio) {
+		priv->audio.formats[0].format_code = 1; /* LPCM */
+		priv->audio.formats[0].max_channels = 2;
+		priv->audio.formats[0].sample_rates = 0x06; /* 48k + 44.1k */
+		priv->audio.formats[0].sample_sizes = 0x02; /* 16-bit */
+		priv->audio.format_count = 1;
+	}
+}
+
+static int tachyon_dp_read_audio_dpcd(struct tachyon_dp_priv *priv)
+{
+	u8 val;
+	int ret;
+
+	ret = tachyon_dp_aux_retry(priv, false, true, DPCD_NUM_AUDIO_EPS,
+				   &val, 1);
+	if (ret) {
+		priv->audio.num_audio_eps = 0;
+		return ret;
+	}
+
+	priv->audio.num_audio_eps = val;
+	return 0;
+}
+
+static bool tachyon_dp_audio_present(struct tachyon_dp_priv *priv)
+{
+	return priv->audio.num_audio_eps > 0 &&
+	       priv->audio.format_count > 0 &&
+	       priv->audio.basic_audio;
+}
+
+static void tachyon_dp_program_audio_clock(struct tachyon_dp_priv *priv)
+{
+	u64 link_rate_khz = priv->rate;
+	u32 n_aud, m_aud;
+
+	if (!link_rate_khz)
+		return;
+
+	/*
+	 * Audio clock regeneration: Maud / Naud = 512 * fs / f_Link
+	 * For 48kHz LPCM: 512 * 48000 = 24576000
+	 *
+	 * NAUD = 32768 (recommended by DP spec for async audio clock mode)
+	 * MAUD = (24576000 * NAUD) / (link_rate * 1000)
+	 */
+	n_aud = 32768;
+	m_aud = (u32)((24576000ULL * n_aud) / (link_rate_khz * 1000ULL));
+
+	writel(m_aud, priv->link + REG_DP_AUDIO_MAUD);
+	writel(n_aud, priv->link + REG_DP_AUDIO_NAUD);
+
+	log_debug("DP audio clock: MAUD=%u NAUD=%u link_rate=%u kHz\n",
+		  m_aud, n_aud, (u32)link_rate_khz);
+}
+
+static void tachyon_dp_program_audio_infoframe(struct tachyon_dp_priv *priv)
+{
+	u8 channels = 2;
+	u32 header, data[8] = {};
+	int i;
+
+	/*
+	 * Build CEA-861 Audio InfoFrame packet:
+	 *
+	 * HB0 = 0x84 (type=0x04 Audio, version=1)
+	 * HB1 = 0x01 (1 byte of data follows in packet body, per CEA-861F §8.2)
+	 * HB2 = 0x00 (version-specific: 0=refer to stream header)
+	 *
+	 * PB0 = (channel_count - 1) | (coding_type << 4)
+	 *        coding_type=0 (refer to stream header for linear PCM)
+	 * PB1 = speaker allocation (from EDID, or 0x00 = FL/FR default)
+	 * PB2-PB5: sample size, sample frequency, format-dependent
+	 * PB6 = 0x00 (reserved)
+	 * PB7 = 0x00 (reserved)
+	 */
+
+	/* Use first audio format from EDID; if unavailable, default to 2ch LPCM */
+	if (priv->audio.format_count > 0)
+		channels = priv->audio.formats[0].max_channels;
+	channels = clamp_t(u8, channels, 2, 8);
+
+	data[0] = (channels - 1) & 0x07;
+
+	/* Speaker allocation from EDID CEA block, or front L/R default */
+	data[1] = priv->audio.speaker_alloc ?: 0x00;
+
+	/* PB2: sample size = 16-bit (0x01 = 16-bit, per CEA-861 Table 29) */
+	data[2] = 0x01;
+
+	/* PB3: sample frequency = 48kHz (0x01 = 48kHz, per CEA-861 Table 28) */
+	data[3] = 0x01;
+
+	/* PB4: format-dependent bytes; for LPCM: 0x00 */
+	data[4] = 0x00;
+
+	header = DP_AUDIO_INFOFRAME_TYPE_CODE | (0x01 << 8);
+
+	/* Write header to controller */
+	writel(header, priv->link + REG_DP_AUDIO_INFOFRAME_HEADER);
+
+	/* Write 8 data bytes (DB0–DB31 split across 8 x 32-bit registers) */
+	for (i = 0; i < 8; i++)
+		writel(data[i], priv->link + REG_DP_AUDIO_INFOFRAME_DATA(i));
+
+	/* Trigger infoframe transmission */
+	writel(DP_AUDIO_INFOFRAME_SEND,
+	       priv->link + REG_DP_AUDIO_INFOFRAME_HEADER);
+
+	log_info("DP audio infoframe sent: %u channels, speaker_alloc=0x%02x\n",
+		 channels, priv->audio.speaker_alloc);
+}
+
+static void tachyon_dp_program_audio_enable(struct tachyon_dp_priv *priv)
+{
+	u32 cfg = DP_AUDIO_CFG_ENABLE |
+		  ((2 - 1) << DP_AUDIO_CFG_CHANNEL_COUNT_SHIFT);
+
+	/* Enable audio in the DP controller configuration */
+	writel(cfg, priv->link + REG_DP_AUDIO_CFG);
+
+	/*
+	 * Set Audio Sample Present bit in MSA attributes,
+	 * enable Native Packet Controller for audio stream packets.
+	 */
+	writel(DP_AUDIO_CTRL_SAMPLE_PRESENT | DP_AUDIO_CTRL_NPC_EN,
+	       priv->link + REG_DP_AUDIO_CTRL);
+
+	log_info("DP audio enabled: 2ch LPCM 48kHz\n");
+}
+#else
+static inline void tachyon_dp_parse_cea_audio(struct tachyon_dp_priv *priv,
+					      const u8 *buf) {}
+static inline int tachyon_dp_read_audio_dpcd(struct tachyon_dp_priv *priv)
+{ return 0; }
+static inline bool tachyon_dp_audio_present(struct tachyon_dp_priv *priv)
+{ return false; }
+static inline void tachyon_dp_program_audio_clock(struct tachyon_dp_priv *priv) {}
+static inline void tachyon_dp_program_audio_infoframe(struct tachyon_dp_priv *priv) {}
+static inline void tachyon_dp_program_audio_enable(struct tachyon_dp_priv *priv) {}
+#endif /* CONFIG_VIDEO_TACHYON_DP_AUDIO */
+
 static void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 {
 	int in, out = 0;
@@ -2757,6 +3033,13 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	udelay(1000);
 	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
 	       priv->link + REG_DP_MAINLINK_CTRL);
+
+	if (tachyon_dp_audio_present(priv)) {
+		tachyon_dp_program_audio_clock(priv);
+		tachyon_dp_program_audio_infoframe(priv);
+		tachyon_dp_program_audio_enable(priv);
+	}
+
 	return tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
 				    DP_MAINLINK_READY_FOR_VIDEO,
 				    DP_MAINLINK_READY_FOR_VIDEO, 5000);
@@ -2799,6 +3082,11 @@ static int tachyon_dpu_init(struct tachyon_dp_priv *priv)
 		}
 		priv->dpu_clk_valid[i] = true;
 	}
+
+#ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
+	priv->dpu_sspp_dma1 = (void __iomem *)((u8 __iomem *)priv->dpu +
+					       DPU_SSPP_DMA1_BASE);
+#endif
 
 	return 0;
 }
@@ -2981,7 +3269,12 @@ static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 	tachyon_dpu_program_sspp(priv, plat, uc_priv);
 	tachyon_dpu_program_lm(priv, uc_priv);
 	tachyon_dpu_program_intf(priv, uc_priv);
+#ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
+	tachyon_dpu_program_lm_blend(priv);
+	return tachyon_dpu_program_ctl_multi(priv);
+#else
 	return tachyon_dpu_program_ctl(priv);
+#endif
 }
 
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
@@ -3003,6 +3296,307 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 
 	return ret;
 }
+
+#ifdef CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG
+
+#define TACHYON_DP_HPD_FAST_MS		100
+#define TACHYON_DP_HPD_SLOW_MS		1000
+#define TACHYON_DP_HPD_FAST_DURATION_MS	5000
+
+static int tachyon_dp_read_sink_count(struct tachyon_dp_priv *priv, u8 *count)
+{
+	u8 val;
+	int ret;
+
+	ret = tachyon_dp_aux_retry(priv, false, true, DPCD_SINK_COUNT,
+				   &val, 1);
+	if (ret)
+		return ret;
+
+	*count = val & DP_SINK_COUNT_LOW_MASK;
+	return 0;
+}
+
+/**
+ * tachyon_dp_poll_hpd_irq() — poll DPCD IRQ vector for hotplug events
+ * @priv: driver private data
+ *
+ * Returns 1 if an event was detected and acknowledged, 0 if no event,
+ * negative on error.
+ */
+static int tachyon_dp_poll_hpd_irq(struct tachyon_dp_priv *priv)
+{
+	u8 irq_vec;
+	int ret;
+
+	ret = tachyon_dp_aux_retry(priv, false, true,
+				   DPCD_DEVICE_SERVICE_IRQ, &irq_vec, 1);
+	if (ret) {
+		log_debug("DP HPD IRQ read failed: %d\n", ret);
+		return ret;
+	}
+
+	if (!(irq_vec & (DP_IRQ_HPD | DP_IRQ_SINK_SPECIFIC)))
+		return 0;
+
+	/* Acknowledge the IRQ by writing zero to clear it */
+	{
+		u8 zero = 0;
+
+		ret = tachyon_dp_aux_retry(priv, false, false,
+					   DPCD_DEVICE_SERVICE_IRQ, &zero, 1);
+	}
+	if (ret)
+		log_debug("DP HPD IRQ clear failed: %d\n", ret);
+
+	if (irq_vec & DP_IRQ_HPD)
+		log_info("DP HPD IRQ detected\n");
+	if (irq_vec & DP_IRQ_TEST_REQUEST)
+		log_info("DP automated test request IRQ detected\n");
+	if (irq_vec & DP_IRQ_SINK_SPECIFIC)
+		log_info("DP sink-specific IRQ detected\n");
+
+	return 1;
+}
+
+static int tachyon_dp_handle_disconnect(struct tachyon_dp_priv *priv)
+{
+	priv->last_sink_count = 0;
+
+	log_info("DP sink disconnected — clearing display\n");
+	return 0;
+}
+
+static int tachyon_dp_handle_connect(struct tachyon_dp_priv *priv)
+{
+	int ret;
+
+	log_info("DP sink connected — re-reading EDID and re-training link\n");
+
+	priv->last_sink_count = 1;
+
+	tachyon_dp_aux_hw_init(priv);
+
+	ret = tachyon_dp_wait_sink(priv);
+	if (ret)
+		return ret;
+
+	ret = tachyon_dp_read_edid_modes(priv);
+	if (ret)
+		log_warning("Failed to read DP EDID on reconnect: %d\n", ret);
+
+	tachyon_dp_reset_link_policy(priv);
+	memset(priv->swing, 0, sizeof(priv->swing));
+	memset(priv->pre, 0, sizeof(priv->pre));
+
+	ret = tachyon_dp_link_train(priv);
+	if (ret) {
+		log_warning("DP link re-training failed: %d\n", ret);
+		return ret;
+	}
+
+	priv->max_rate  = priv->rate;
+	priv->max_lanes = priv->lanes;
+	tachyon_dp_filter_edid_modes(priv);
+	tachyon_dp_publish_edid_modes(priv);
+
+	return 0;
+}
+
+static int tachyon_dp_verify_link(struct tachyon_dp_priv *priv)
+{
+	u8 status[3];
+	int ret;
+
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_LANE0_1_STATUS,
+				   &status[0], 1);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true,
+				   DP_LANE0_1_STATUS + 1, &status[1], 1);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true,
+				   DP_LANE0_1_STATUS + 2, &status[2], 1);
+	if (ret)
+		return ret;
+
+	/* Check if all active lanes still have CR + EQ + symbol lock */
+	if (!tachyon_dp_eq_done(status, priv->lanes)) {
+		log_warning("DP link lost CR/EQ — re-training\n");
+		ret = tachyon_dp_link_train(priv);
+		if (ret)
+			return ret;
+		priv->max_rate  = priv->rate;
+		priv->max_lanes = priv->lanes;
+		tachyon_dp_filter_edid_modes(priv);
+		tachyon_dp_publish_edid_modes(priv);
+	}
+
+	return 0;
+}
+
+static int tachyon_dp_hotplug_policy(struct tachyon_dp_priv *priv)
+{
+	u32 now_ms = get_timer(0);
+	bool fast = now_ms - priv->last_hpd_poll_ms <
+		    TACHYON_DP_HPD_FAST_DURATION_MS;
+	u32 interval = fast ? TACHYON_DP_HPD_FAST_MS :
+			      TACHYON_DP_HPD_SLOW_MS;
+	u8 sink_count, sc1, sc2;
+	int ret;
+
+	if (now_ms - priv->last_hpd_poll_ms < interval)
+		return 0;
+
+	priv->last_hpd_poll_ms = now_ms;
+
+	/* Poll IRQ vector first (fast, 1-byte read) */
+	ret = tachyon_dp_poll_hpd_irq(priv);
+	if (ret <= 0)
+		return 0;
+
+	/*
+	 * IRQ event detected — check SINK_COUNT for connect/disconnect.
+	 * Debounce: require 2 consecutive stable reads.
+	 */
+	if (tachyon_dp_read_sink_count(priv, &sc1))
+		return 0;
+	udelay(5000);
+	if (tachyon_dp_read_sink_count(priv, &sc2))
+		return 0;
+
+	if (sc1 != sc2) {
+		log_debug("DP SINK_COUNT unstable: %u→%u (debouncing)\n",
+			  sc1, sc2);
+		return 0;
+	}
+
+	sink_count = sc1;
+
+	if (sink_count == 0 && priv->last_sink_count != 0)
+		return tachyon_dp_handle_disconnect(priv);
+
+	if (sink_count != 0 && priv->last_sink_count == 0)
+		return tachyon_dp_handle_connect(priv);
+
+	if (sink_count != 0) {
+		/* Sink count unchanged but IRQ was raised — check link status */
+		ret = tachyon_dp_verify_link(priv);
+		if (ret)
+			return ret;
+		/* Refresh EDID in case modes changed (monitor swap on KVM) */
+		ret = tachyon_dp_read_edid_modes(priv);
+		if (!ret) {
+			tachyon_dp_filter_edid_modes(priv);
+			tachyon_dp_publish_edid_modes(priv);
+		}
+	}
+
+	return 0;
+}
+#else
+static inline int tachyon_dp_hotplug_policy(struct tachyon_dp_priv *priv)
+{ return 0; }
+static inline int tachyon_dp_verify_link(struct tachyon_dp_priv *priv)
+{ return 0; }
+#endif /* CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG */
+
+#ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
+static void tachyon_dpu_program_sspp_dma1(struct tachyon_dp_priv *priv,
+					  void *fb, u32 width, u32 height,
+					  u32 stride, u32 x, u32 y, u8 alpha)
+{
+	void __iomem *sspp = priv->dpu_sspp_dma1;
+	u32 size = (height << 16) | width;
+	u32 xy = (y << 16) | x;
+
+	writel(size, sspp + DPU_SSPP_SRC_SIZE);
+	writel(0, sspp + DPU_SSPP_SRC_XY);
+	writel(size, sspp + DPU_SSPP_OUT_SIZE);
+	writel(xy, sspp + DPU_SSPP_OUT_XY);
+	writel((u32)(ulong)fb, sspp + DPU_SSPP_SRC0_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC1_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC2_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC3_ADDR);
+	writel(stride, sspp + DPU_SSPP_SRC_YSTRIDE0);
+	writel(0, sspp + DPU_SSPP_SRC_YSTRIDE1);
+	writel(DPU_FORMAT_ARGB8888, sspp + DPU_SSPP_SRC_FORMAT);
+	writel(DPU_UNPACK_ARGB8888, sspp + DPU_SSPP_SRC_UNPACK_PATTERN);
+	writel(DPU_SSPP_PE_OVERRIDE, sspp + DPU_SSPP_SRC_OP_MODE);
+	writel(0x87, sspp + DPU_SSPP_FETCH_CONFIG);
+	writel(0xffff, sspp + DPU_SSPP_DANGER_LUT);
+	writel(0xff00, sspp + DPU_SSPP_SAFE_LUT);
+	writel(0, sspp + DPU_SSPP_CREQ_LUT);
+	writel(1, sspp + DPU_SSPP_QOS_CTRL);
+
+	/*
+	 * Write global alpha (BG_ALPHA) to LM blend stage 1.
+	 * The overlay plane uses per-pixel alpha from ARGB8888 combined
+	 * with this global alpha for fade effects.
+	 */
+	writel((alpha << 24) | alpha, priv->dpu + DPU_LM_0_BASE +
+	       DPU_LM_BLEND_STAGE1_BG_ALPHA);
+
+	priv->overlay_active = true;
+}
+
+static void tachyon_dpu_program_lm_blend(struct tachyon_dp_priv *priv)
+{
+	void __iomem *lm = priv->dpu + DPU_LM_0_BASE;
+	u32 blend_op = DPU_LM_BLEND_STAGE0_EN;
+
+	if (priv->overlay_active) {
+		blend_op |= DPU_LM_BLEND_STAGE1_EN;
+		writel(0xff000000, lm + DPU_LM_BLEND_STAGE0_BG_ALPHA);
+		writel(0xff000000, lm + DPU_LM_BLEND_STAGE1_FG_ALPHA);
+		writel(0x00000000, lm + DPU_LM_BLEND_STAGE1_BG_ALPHA);
+	} else {
+		writel(0xff000000, lm + DPU_LM_BLEND_STAGE0_BG_ALPHA);
+		writel(0x00000000, lm + DPU_LM_BLEND_STAGE0_FG_ALPHA);
+	}
+
+	writel(blend_op, lm + DPU_LM_BLEND_OP_MODE);
+}
+
+static int tachyon_dpu_program_ctl_multi(struct tachyon_dp_priv *priv)
+{
+	void __iomem *ctl = priv->dpu + DPU_CTL_0_BASE;
+	u32 flush_mask = DPU_CTL_FLUSH_DMA0 | DPU_CTL_FLUSH_LM0 |
+			 DPU_CTL_FLUSH_CTL | DPU_CTL_FLUSH_INTF |
+			 DPU_CTL_FLUSH_PERIPH;
+	u32 fetch_active = BIT(0);
+	u32 layer1 = 0;
+	int ret;
+
+	if (priv->overlay_active) {
+		flush_mask |= DPU_CTL_FLUSH_DMA1;
+		fetch_active |= BIT(1);
+		layer1 = DPU_CTL_LAYER_DMA1_STAGE1;
+	}
+
+	writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
+	       ctl + DPU_CTL_LAYER_0);
+	writel(layer1, ctl + DPU_CTL_LAYER_EXT_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT2_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT3_0);
+	writel(0xf0000000, ctl + DPU_CTL_TOP);
+	writel(BIT(0), ctl + DPU_CTL_INTF_ACTIVE);
+	writel(fetch_active, ctl + DPU_CTL_FETCH_PIPE_ACTIVE);
+	writel(BIT(0), ctl + DPU_CTL_INTF_FLUSH);
+	writel(BIT(0), ctl + DPU_CTL_PERIPH_FLUSH);
+	writel(flush_mask, ctl + DPU_CTL_FLUSH);
+	writel(1, ctl + DPU_CTL_START);
+
+	ret = tachyon_dp_read_poll(ctl, DPU_CTL_FLUSH, DPU_CTL_FLUSH_DMA0, 0,
+				   5000);
+	if (ret)
+		log_warning("DPU CTL multi-plane flush did not commit: %d\n",
+			    ret);
+
+	return 0;
+}
+#endif /* CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE */
 
 static int tachyon_dp_probe(struct udevice *dev)
 {
@@ -3070,6 +3664,36 @@ static int tachyon_dp_probe(struct udevice *dev)
 	ret = tachyon_dp_read_edid_modes(priv);
 	if (ret)
 		log_warning("Failed to read DP EDID modes: %d\n", ret);
+
+#ifdef CONFIG_VIDEO_TACHYON_DP_AUDIO
+	/*
+	 * Re-read EDID blocks from the sink to parse CEA-861 audio descriptors
+	 * (Short Audio Descriptors and Speaker Allocation Data Block).
+	 * These are in the CEA-861 extension block (block 1), which the mode
+	 * parser already consumed.  Re-reading from the sink is fast (~2 AUX
+	 * transactions) and keeps the EDID flow self-contained.
+	 */
+	{
+		u8 edid_buf[EDID_EXT_SIZE];
+
+		if (!tachyon_dp_edid_read_block(priv, 0, edid_buf)) {
+			tachyon_dp_parse_cea_audio(priv, edid_buf);
+			if (edid_buf[126] /* extension_flag */) {
+				if (!tachyon_dp_edid_read_block(priv, 1,
+					edid_buf + EDID_SIZE))
+					tachyon_dp_parse_cea_audio(priv,
+						edid_buf + EDID_SIZE);
+			}
+		}
+		tachyon_dp_read_audio_dpcd(priv);
+		if (tachyon_dp_audio_present(priv))
+			log_info("DP audio sink detected: basic_audio=%d num_eps=%u formats=%u\n",
+				 priv->audio.basic_audio,
+				 priv->audio.num_audio_eps,
+				 priv->audio.format_count);
+	}
+#endif
+
 	tachyon_dp_select_mode(priv, &width, &height);
 
 	ret = tachyon_dp_link_train(priv);
@@ -3124,6 +3748,9 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	ret = tachyon_dp_refresh_altmode(priv, &alt_changed);
 	if (ret)
 		return ret;
+
+	/* Advanced hotplug policy: poll DPCD IRQ vector for connect/disconnect */
+	tachyon_dp_hotplug_policy(priv);
 
 	if (alt_changed) {
 		tachyon_dp_aux_hw_init(priv);
@@ -3252,11 +3879,54 @@ static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
 	return 0;
 }
 
+#ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
+static int tachyon_dp_get_max_planes(struct udevice *dev)
+{
+	return 2; /* DMA0 base + DMA1 overlay */
+}
+
+static int tachyon_dp_enable_plane(struct udevice *dev, u32 plane_id,
+				   bool enable)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+
+	if (plane_id != 1)
+		return -EINVAL;
+
+	priv->overlay_active = enable;
+
+	/* Re-flush CTL to apply or remove the overlay plane */
+	tachyon_dpu_program_lm_blend(priv);
+	return tachyon_dpu_program_ctl_multi(priv);
+}
+
+static int tachyon_dp_set_plane_fb(struct udevice *dev, u32 plane_id,
+				   void *fb, u32 width, u32 height,
+				   u32 stride, u32 x, u32 y, u8 alpha)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+
+	if (plane_id != 1)
+		return -EINVAL;
+	if (!priv->dpu_sspp_dma1)
+		return -ENODEV;
+
+	tachyon_dpu_program_sspp_dma1(priv, fb, width, height, stride,
+				      x, y, alpha);
+	return tachyon_dpu_program_ctl_multi(priv);
+}
+#endif
+
 static const struct video_ops tachyon_dp_ops = {
 	.video_sync = tachyon_dp_video_sync,
 	.video_get_mode_count = tachyon_dp_get_mode_count,
 	.video_get_mode_info = tachyon_dp_get_mode_info,
 	.video_set_mode = tachyon_dp_set_mode,
+#ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
+	.video_get_max_planes = tachyon_dp_get_max_planes,
+	.video_enable_plane = tachyon_dp_enable_plane,
+	.video_set_plane_fb = tachyon_dp_set_plane_fb,
+#endif
 };
 
 static int tachyon_dp_bind(struct udevice *dev)

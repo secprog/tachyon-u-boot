@@ -144,6 +144,19 @@ struct video_priv {
  *		After a successful call the driver updates uc_priv->xsize,
  *		uc_priv->ysize, uc_priv->line_length, and uc_priv->fb_size
  *		to reflect the new mode.
+ * @video_get_max_planes: Return the maximum number of overlay planes
+ *		available (0 or 1 = single-plane only).  If NULL, single-plane.
+ * @video_enable_plane: Enable or disable a specific overlay plane.
+ *		@plane_id: 0-based plane index (0 = base plane, always on)
+ *		@enable: true to activate, false to hide
+ * @video_set_plane_fb: Configure an overlay plane's framebuffer and position.
+ *		@plane_id: plane index (0 = base, >=1 = overlay)
+ *		@fb: pointer to plane's framebuffer
+ *		@width, @height: dimensions of the plane in pixels
+ *		@stride: row stride in bytes
+ *		@x, @y: top-left position on screen
+ *		@alpha: global alpha value (0=transparent, 255=opaque)
+ *		Returns 0 on success, negative on error.
  */
 struct video_ops {
 	int (*video_sync)(struct udevice *vid);
@@ -153,6 +166,12 @@ struct video_ops {
 				   enum video_format *format,
 				   enum video_log2_bpp *bpix);
 	int (*video_set_mode)(struct udevice *vid, u32 mode_number);
+	int (*video_get_max_planes)(struct udevice *vid);
+	int (*video_enable_plane)(struct udevice *vid, u32 plane_id,
+				  bool enable);
+	int (*video_set_plane_fb)(struct udevice *vid, u32 plane_id,
+				  void *fb, u32 width, u32 height,
+				  u32 stride, u32 x, u32 y, u8 alpha);
 };
 
 #define video_get_ops(dev)        ((struct video_ops *)(dev)->driver->ops)
