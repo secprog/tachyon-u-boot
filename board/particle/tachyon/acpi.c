@@ -397,49 +397,27 @@ ACPI_WRITER(5bgrt, "BGRT", tachyon_write_bgrt, 0);
  */
 static int tachyon_write_dbg2(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
-	struct acpi_table_header *header;
-	struct acpi_dbg2_device *dbg2;
-	u32 *addr_size;
+	struct acpi_dbg2_header *dbg2 = (struct acpi_dbg2_header *)ctx->current;
+	struct acpi_gen_regaddr address;
 
-	header = ctx->current;
+	/*
+	 * UART5 is a Qualcomm GENI serial engine at 0x994000 (MMIO).
+	 * Port subtype ARM_SBSA_GENERIC is the best fit for a non-standard
+	 * ARM debug UART.  The device path is the fully qualified ACPI
+	 * namespace path.
+	 */
+	memset(&address, '\0', sizeof(address));
+	address.space_id = ACPI_ADDRESS_SPACE_MEMORY;
+	address.bit_width = 32;
+	address.access_size = ACPI_ACCESS_SIZE_DWORD_ACCESS;
+	address.addrl = 0x994000;  /* UART5 base from qcm6490-tachyon-u-boot.dtsi */
 
-	acpi_fill_header(header, "DBG2");
-	header->length = sizeof(struct acpi_dbg2_header) + sizeof(struct acpi_dbg2_device) + 16;
-	header->revision = 0;  /* DBG2 revision 0 */
+	acpi_create_dbg2(dbg2, ACPI_DBG2_SERIAL_PORT,
+			 ACPI_DBG2_ARM_SBSA_GENERIC,
+			 &address, 0x1000, "\\_SB.UART5");
 
-	/* DBG2 header */
-	struct acpi_dbg2_header *dbg2_hdr = (struct acpi_dbg2_header *)header;
-	dbg2_hdr->devices_offset = sizeof(struct acpi_dbg2_header);
-	dbg2_hdr->devices_count = 1;
-
-	/* DBG2 device (UART5 - debug console) */
-	dbg2 = (struct acpi_dbg2_device *)((void *)header + sizeof(struct acpi_dbg2_header));
-	dbg2->revision = 0;
-	dbg2->length = sizeof(struct acpi_dbg2_device) + 16;
-	dbg2->address_count = 1;
-	dbg2->namespace_string_length = 4;
-	dbg2->namespace_string_offset = dbg2->length;
-	dbg2->oem_data_length = 0;
-	dbg2->oem_data_offset = dbg2->length + dbg2->namespace_string_length;
-	dbg2->port_type = ACPI_DBG2_ARM_SBSA_32BIT;
-	dbg2->port_subtype = ACPI_DBG2_ARM_SBSA_GENERIC;
-	dbg2->reserved = 0;
-
-	/* Namespace string: "\_SB_.UART5" */
-	char *ns = (char *)dbg2 + dbg2->namespace_string_offset;
-	memcpy(ns, "\\_SB.UART5", 10);
-
-	/* Address (GICC base from device tree) */
-	addr_size = (u32 *)((void *)dbg2 + dbg2->length);
-	addr_size[0] = 0x994000;  /* UART5 base from qcm6490-tachyon-u-boot.dtsi */
-	addr_size[1] = 0;      /* Base address high */
-	addr_size[2] = 0x1000;  /* Address size */
-	addr_size[3] = 0x1000;  /* Size of address region */
-
-	header->checksum = table_compute_checksum(header, header->length);
-
-	acpi_add_table(ctx, header);
-	acpi_inc(ctx, header->length);
+	acpi_add_table(ctx, dbg2);
+	acpi_inc_align(ctx, dbg2->header.length);
 
 	return 0;
 }
