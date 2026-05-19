@@ -266,12 +266,14 @@ static s64 efi_mem_carve_out(struct efi_mem_list *map,
  * @memory_type:		type of memory added
  * @overlap_conventional:	region may only overlap free(conventional)
  *				memory
+ * @attribute:			explicit attribute (0 = default per memory_type)
  * Return:			status code
  */
 static
 efi_status_t efi_add_memory_map_pg(u64 start, u64 pages,
 				   int memory_type,
-				   bool overlap_conventional)
+				   bool overlap_conventional,
+				   u64 attribute)
 {
 	struct efi_mem_list *lmem;
 	struct efi_mem_list *newlist;
@@ -298,17 +300,21 @@ efi_status_t efi_add_memory_map_pg(u64 start, u64 pages,
 	newlist->desc.virtual_start = start;
 	newlist->desc.num_pages = pages;
 
-	switch (memory_type) {
-	case EFI_RUNTIME_SERVICES_CODE:
-	case EFI_RUNTIME_SERVICES_DATA:
-		newlist->desc.attribute = EFI_MEMORY_WB | EFI_MEMORY_RUNTIME;
-		break;
-	case EFI_MMAP_IO:
-		newlist->desc.attribute = EFI_MEMORY_RUNTIME;
-		break;
-	default:
-		newlist->desc.attribute = EFI_MEMORY_WB;
-		break;
+	if (attribute) {
+		newlist->desc.attribute = attribute;
+	} else {
+		switch (memory_type) {
+		case EFI_RUNTIME_SERVICES_CODE:
+		case EFI_RUNTIME_SERVICES_DATA:
+			newlist->desc.attribute = EFI_MEMORY_WB | EFI_MEMORY_RUNTIME;
+			break;
+		case EFI_MMAP_IO:
+			newlist->desc.attribute = EFI_MEMORY_RUNTIME;
+			break;
+		default:
+			newlist->desc.attribute = EFI_MEMORY_WB;
+			break;
+		}
 	}
 
 	/* Add our new map */
@@ -401,7 +407,33 @@ efi_status_t efi_add_memory_map(u64 start, u64 size, int memory_type)
 	pages = efi_size_in_pages(size + (start & EFI_PAGE_MASK));
 	start &= ~EFI_PAGE_MASK;
 
-	return efi_add_memory_map_pg(start, pages, memory_type, false);
+	return efi_add_memory_map_pg(start, pages, memory_type, false, 0);
+}
+
+/**
+ * efi_add_memory_map_attr() - add memory area to the memory map with explicit
+ *                             attributes
+ *
+ * @start:		start address of the memory area
+ * @size:		length in bytes of the memory area
+ * @memory_type:	type of memory added
+ * @attribute:		EFI memory attributes (EFI_MEMORY_*)
+ *
+ * Return:		status code
+ *
+ * This function automatically aligns the start and size of the memory area
+ * to EFI_PAGE_SIZE.
+ */
+efi_status_t efi_add_memory_map_attr(u64 start, u64 size, int memory_type,
+				     u64 attribute)
+{
+	u64 pages;
+
+	pages = efi_size_in_pages(size + (start & EFI_PAGE_MASK));
+	start &= ~EFI_PAGE_MASK;
+
+	return efi_add_memory_map_pg(start, pages, memory_type, false,
+				     attribute);
 }
 
 /**
@@ -501,7 +533,7 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 
 	efi_addr = (u64)(uintptr_t)map_sysmem(addr, 0);
 	/* Reserve that map in our memory maps */
-	ret = efi_add_memory_map_pg(efi_addr, pages, memory_type, true);
+	ret = efi_add_memory_map_pg(efi_addr, pages, memory_type, true, 0);
 	if (ret != EFI_SUCCESS) {
 		/* Map would overlap, bail out */
 		lmb_free_flags(addr, (u64)pages << EFI_PAGE_SHIFT, flags);
@@ -823,7 +855,7 @@ static void add_u_boot_and_runtime(void)
 	uboot_pages = ((uintptr_t)map_sysmem(gd->ram_top - 1, 0) -
 		       uboot_start + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT;
 	efi_add_memory_map_pg(uboot_start, uboot_pages, EFI_BOOT_SERVICES_CODE,
-			      false);
+			      false, 0);
 #if defined(__aarch64__)
 	/*
 	 * Runtime Services must be 64KiB aligned according to the
@@ -842,7 +874,7 @@ static void add_u_boot_and_runtime(void)
 	runtime_end = (runtime_end + runtime_mask) & ~runtime_mask;
 	runtime_pages = (runtime_end - runtime_start) >> EFI_PAGE_SHIFT;
 	efi_add_memory_map_pg(runtime_start, runtime_pages,
-			      EFI_RUNTIME_SERVICES_CODE, false);
+			      EFI_RUNTIME_SERVICES_CODE, false, 0);
 }
 
 int efi_memory_init(void)
@@ -881,7 +913,7 @@ int efi_map_update_notify(phys_addr_t addr, phys_size_t size,
 				       op == LMB_MAP_OP_RESERVE ?
 				       EFI_BOOT_SERVICES_DATA :
 				       EFI_CONVENTIONAL_MEMORY,
-				       false);
+				       false, 0);
 	if (status != EFI_SUCCESS) {
 		log_err("LMB Map notify failure %lu\n",
 			status & ~EFI_ERROR_MASK);

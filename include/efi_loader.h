@@ -851,6 +851,9 @@ efi_status_t efi_get_memory_map(efi_uintn_t *memory_map_size,
 				uint32_t *descriptor_version);
 /* Adds a range into the EFI memory map */
 efi_status_t efi_add_memory_map(u64 start, u64 size, int memory_type);
+/* Adds a range into the EFI memory map with explicit attributes */
+efi_status_t efi_add_memory_map_attr(u64 start, u64 size, int memory_type,
+				      u64 attribute);
 
 /* Called by board init to initialize the EFI drivers */
 efi_status_t efi_driver_init(void);

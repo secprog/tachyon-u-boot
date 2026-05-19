@@ -424,7 +424,9 @@ static efi_status_t EFIAPI gop_set_mode(struct efi_gop *this, u32 mode_number)
 	gopobj = container_of(this, struct efi_gop_obj, ops);
 	vops = video_get_ops(gopobj->vdev);
 
-	if (vops && vops->video_set_mode) {
+	if (vops && vops->video_set_mode &&
+	    vops->video_get_mode_count &&
+	    vops->video_get_mode_count(gopobj->vdev) > 0) {
 		/* Real hardware mode switch via the video driver */
 		ret = vops->video_set_mode(gopobj->vdev, mode_number);
 		if (ret)
@@ -663,10 +665,13 @@ efi_status_t efi_gop_register(void)
 	 *
 	 * We carve the FB from whatever type it currently is
 	 * (overlap_conventional=false) and re-add it as reserved memory
-	 * with EFI_MEMORY_WC for framebuffer performance.
+	 * with EFI_MEMORY_WC for framebuffer performance and to prevent
+	 * stale cache lines from causing a black/blank display after
+	 * ExitBootServices().
 	 */
-	ret = efi_add_memory_map(fb_base, fb_size,
-				 EFI_RESERVED_MEMORY_TYPE);
+	ret = efi_add_memory_map_attr(fb_base, fb_size,
+				      EFI_RESERVED_MEMORY_TYPE,
+				      EFI_MEMORY_WC);
 	if (ret != EFI_SUCCESS)
 		log_warning("Failed to reserve FB memory map entry: %lx\n",
 			    ret & ~EFI_ERROR_MASK);

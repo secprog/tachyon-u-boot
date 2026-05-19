@@ -2600,6 +2600,43 @@ static void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 		 priv->timing.vsync_len.typ, priv->timing.vback_porch.typ);
 }
 
+/*
+ * Resolve timing for a specific mode index without consulting environment
+ * variables.  Used by GOP SetMode() so the caller-chosen mode is honored
+ * rather than being overridden by tachyon_dp_xres/tachyon_dp_yres.
+ *
+ * Returns true if timing was resolved, false if the index is out of range.
+ */
+static bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
+					   int mode_index)
+{
+	u32 width, height;
+
+	if (mode_index < 0 || mode_index >= priv->mode_count)
+		return false;
+
+	width  = priv->modes[mode_index].width;
+	height = priv->modes[mode_index].height;
+
+	if (priv->modes[mode_index].has_timing) {
+		priv->timing = priv->modes[mode_index].timing;
+		return true;
+	}
+
+	if (tachyon_dp_known_timing(width, height, &priv->timing)) {
+		log_warning("Using built-in timing for DP mode %ux%u\n",
+			    width, height);
+		return true;
+	}
+
+	log_warning("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
+		    width, height);
+	tachyon_dp_default_timing(&priv->timing);
+	tachyon_dp_timing_entry(&priv->timing.hactive, width);
+	tachyon_dp_timing_entry(&priv->timing.vactive, height);
+	return true;
+}
+
 static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
 
 static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
@@ -3839,13 +3876,22 @@ static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
 	u32 width, height;
 	int ret;
 
+	if (priv->mode_count < 1)
+		return -EINVAL;
 	if (mode_number >= (u32)priv->mode_count)
 		return -EINVAL;
 
 	width = priv->modes[mode_number].width;
 	height = priv->modes[mode_number].height;
 
-	tachyon_dp_select_mode(priv, &width, &height);
+	/*
+	 * SetMode() must respect the caller-chosen mode index, not
+	 * tachyon_dp_env_mode().  Resolve timing directly from the
+	 * requested mode, then train link + reprogram DPU/DP.
+	 */
+	if (!tachyon_dp_resolve_mode_timing(priv, mode_number))
+		return -EINVAL;
+
 	tachyon_dp_reset_link_policy(priv);
 	memset(priv->swing, 0, sizeof(priv->swing));
 	memset(priv->pre, 0, sizeof(priv->pre));
