@@ -90,7 +90,7 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
  */
 int acpi_fill_iort(struct acpi_ctx *ctx)
 {
-	u32 its_offset, smmu_offset;
+	u32 its_offset, smmu_offset, ufs_offset;
 
 	/*
 	 * GIC ITS (Interrupt Translation Service) Group node
@@ -150,6 +150,48 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 		NULL,                       /* pmu_irq array */
 		ARRAY_SIZE(map_smmu),       /* num_mappings */
 		map_smmu);                  /* ID mapping array */
+
+	/*
+	 * UFS Named Component node
+	 *
+	 * Type: 0x01 (Named Component)
+	 * Device: \_SB.UFS0 — matches the DSDT UFS0 device HID "QCOM24A5"
+	 *
+	 * The UFS host controller is a named component (non-PCIe device)
+	 * that has its own StreamID and must be explicitly mapped to the
+	 * SMMU.  Without this entry the SMMU may not translate UFS DMA,
+	 * causing storage access failures under Windows.
+	 *
+	 * Hardware details from sc7280.dtsi:
+	 *   Base:      0x01d84000  (ufs_mem_hc)
+	 *   StreamID:  0x80        (iommus = <&apps_smmu 0x80 0x0>)
+	 *   Cache-coherent (dma-coherent)
+	 *
+	 * Flags: STALL_SUPPORTED — UFS supports stall-based SMMU fault
+	 *        recovery.  PASID bits = 0 (no PASID support).
+	 *
+	 * ID mapping: UFS SID 0x80 → SMMU (offset smmu_offset)
+	 *             Single mapping (not a range) — exact SID match
+	 */
+	u32 ufs_flags = ACPI_IORT_NC_STALL_SUPPORTED;
+
+	struct acpi_iort_id_mapping map_ufs[] = {{
+		0x80,                        /* input_base: UFS StreamID */
+		1,                           /* id_count: single SID */
+		0x80,                        /* output_base: same SID at SMMU */
+		smmu_offset,                 /* output_reference: offset to SMMU */
+		ACPI_IORT_ID_SINGLE_MAPPING  /* flags: exact match */
+	}};
+
+	ufs_offset = acpi_iort_add_named_component(ctx,
+		ufs_flags,                  /* node_flags */
+		BIT(0) | BIT(56),           /* memory_properties (CacheCoherent + CPM) */
+		64,                         /* memory_address_limit (64-bit) */
+		"\\_SB.UFS0",               /* device_name (ACPI path from DSDT) */
+		ARRAY_SIZE(map_ufs),        /* num_mappings */
+		map_ufs);                   /* ID mapping array */
+
+	(void)ufs_offset;  /* reference kept for clarity; not chained to */
 
 	/*
 	 * PCIe Root Complex node

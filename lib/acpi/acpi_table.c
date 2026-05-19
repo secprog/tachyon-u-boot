@@ -597,8 +597,11 @@ int acpi_iort_add_named_component(struct acpi_ctx *ctx,
 				  const u32 node_flags,
 				  const u64 memory_properties,
 				  const u8 memory_address_limit,
-				  const char *device_name)
+				  const char *device_name,
+				  const int num_mappings,
+				  const struct acpi_iort_id_mapping *map)
 {
+	struct acpi_iort_id_mapping *mapping;
 	struct acpi_iort_node *node;
 	struct acpi_iort_named_component *comp;
 	int offset;
@@ -610,9 +613,16 @@ int acpi_iort_add_named_component(struct acpi_ctx *ctx,
 
 	node->type = ACPI_IORT_NODE_NAMED_COMPONENT;
 	node->revision = 4;
+
+	node->mapping_count = num_mappings;
+	node->mapping_offset = sizeof(struct acpi_iort_node) +
+			       sizeof(struct acpi_iort_named_component) +
+			       strlen(device_name) + 1;
+
 	node->length = sizeof(struct acpi_iort_node);
 	node->length += sizeof(struct acpi_iort_named_component);
 	node->length += strlen(device_name) + 1;
+	node->length += sizeof(struct acpi_iort_id_mapping) * num_mappings;
 
 	comp = (struct acpi_iort_named_component *)node->node_data;
 
@@ -620,6 +630,14 @@ int acpi_iort_add_named_component(struct acpi_ctx *ctx,
 	comp->memory_properties = memory_properties;
 	comp->memory_address_limit = memory_address_limit;
 	memcpy(comp->device_name, device_name, strlen(device_name) + 1);
+
+	mapping = (struct acpi_iort_id_mapping *)((u8 *)comp +
+			sizeof(struct acpi_iort_named_component) +
+			strlen(device_name) + 1);
+	for (int i = 0; i < num_mappings; i++) {
+		memcpy(mapping, &map[i], sizeof(struct acpi_iort_id_mapping));
+		mapping++;
+	}
 
 	ctx->current += node->length;
 

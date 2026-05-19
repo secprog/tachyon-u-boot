@@ -45,7 +45,11 @@ CONFIG_TEE=y
 CONFIG_OPTEE=y
 
 # EFI Secure Boot (required for Windows 11)
-# Note: PK/KEK/db must be enrolled at first boot or via EFI_VARIABLES_PRESEED
+# StandAloneMM in OP-TEE stores PK/KEK/db/dbx on RPMB (tamper-resistant).
+# This replaces /ubootefi.var file storage and provides authenticated
+# variable support required by EFI spec §32.3.6.
+# Prerequisite: StandAloneMM TA must be loaded in OP-TEE by TF-A.
+CONFIG_EFI_MM_COMM_TEE=y
 CONFIG_EFI_SECURE_BOOT=y
 
 # TPM 2.0 via OP-TEE fTPM (required for Windows 11)
@@ -55,5 +59,8 @@ CONFIG_TPM2_FTPM_TEE=y
 # EFI TCG2 Protocol (measures boot to TPM, required for Windows 11)
 CONFIG_EFI_TCG2_PROTOCOL=y
 
-# Allow OS to write UEFI runtime variables (required for boot updates)
-CONFIG_EFI_RT_VOLATILE_STORE=y
+# Runtime variable access is handled by StandAloneMM/OP-TEE backed storage.
+# At ExitBootServices, runtime-accessible variables are collected from StMM
+# and presented to the OS in DRAM. SetVariable at runtime returns
+# EFI_UNSUPPORTED (OS must use authenticated boot-time paths per spec).
+# CONFIG_EFI_RT_VOLATILE_STORE is incompatible with EFI_MM_COMM_TEE.

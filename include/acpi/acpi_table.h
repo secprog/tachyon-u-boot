@@ -1212,19 +1212,25 @@ int acpi_iort_add_smmu(struct acpi_ctx *ctx,
  * acpi_iort_add_named_component() - Add named component to IORT table
  *
  * Called by SoC specific code within acpi_fill_iort().
+ * Maps the named device's RequesterID/StreamID to an upstream SMMU node
+ * via the provided ID mappings.
  *
  * @ctx: ACPI context to write to
  * @node_flags: Node flags
  * @memory_properties: Memory properties
  * @memory_address_limit: Memory address limit
- * @device_name: ACPI device path
+ * @device_name: ACPI device path (e.g. "\\_SB.UFS0")
+ * @num_mappings: Number of elements in map
+ * @map: ID mappings for this node (device SID → upstream SMMU)
  * @return Offset of table within parent
  */
 int acpi_iort_add_named_component(struct acpi_ctx *ctx,
 				  const u32 node_flags,
 				  const u64 memory_properties,
 				  const u8 memory_address_limit,
-				  const char *device_name);
+				  const char *device_name,
+				  const int num_mappings,
+				  const struct acpi_iort_id_mapping *map);
 
 /**
  * acpi_iort_add_rc() - Add PCI root complex node to IORT table
