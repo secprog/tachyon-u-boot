@@ -18,11 +18,18 @@
  */
 extern const unsigned char AmlCode[];
 
+__weak int acpi_patch_dsdt(struct acpi_ctx *ctx,
+			   struct acpi_table_header *dsdt)
+{
+	return 0;
+}
+
 int acpi_write_dsdt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	const int thl = sizeof(struct acpi_table_header);
 	struct acpi_table_header *dsdt = ctx->current;
 	int aml_len;
+	int ret;
 
 	/* Put the table header first */
 	memcpy(dsdt, &AmlCode, thl);
@@ -33,7 +40,6 @@ int acpi_write_dsdt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 	aml_len = dsdt->length - thl;
 	if (aml_len) {
 		void *base = ctx->current;
-		int ret;
 
 		ret = acpi_inject_dsdt(ctx);
 		if (ret)
@@ -49,6 +55,13 @@ int acpi_write_dsdt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 	ctx->dsdt = dsdt;
 	dsdt->length = ctx->current - (void *)dsdt;
 	log_debug("Updated DSDT length to %x\n", dsdt->length);
+
+	ret = acpi_patch_dsdt(ctx, dsdt);
+	if (ret)
+		return ret;
+
+	dsdt->checksum = 0;
+	dsdt->checksum = table_compute_checksum(dsdt, dsdt->length);
 
 	return 0;
 }

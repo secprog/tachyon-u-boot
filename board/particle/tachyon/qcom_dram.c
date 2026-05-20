@@ -11,6 +11,7 @@
 #include <log.h>
 #include <sort.h>
 #include <smem.h>
+#include <string.h>
 #include <dm/device-internal.h>
 
 int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t nbanks)
@@ -57,4 +58,44 @@ int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t nbanks)
     qcom_sort_memory_banks(banks, j);
 
     return j;
+}
+
+int qcom_find_smem_region(const char *name, qcom_mem_bank *bank)
+{
+	size_t size, name_len;
+	int i, ret;
+	struct smem_ram_ptable *ram_ptable;
+	struct smem_ram_ptn *p;
+	struct udevice *dev = NULL;
+
+	if (!name || !bank)
+		return -EINVAL;
+
+	name_len = strlen(name);
+	if (!name_len || name_len > RAM_PART_NAME_LENGTH)
+		return -EINVAL;
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &dev);
+	if (ret)
+		return ret;
+
+	ram_ptable = smem_get(dev, -1 /* any */,
+			      SMEM_USABLE_RAM_PARTITION_TABLE, &size);
+	if (!ram_ptable)
+		return -ENODEV;
+
+	for (i = 0; i < RAM_NUM_PART_ENTRIES; i++) {
+		p = &ram_ptable->parts[i];
+		if (!p->size && !p->start)
+			break;
+
+		if (strncmp(p->name, name, RAM_PART_NAME_LENGTH))
+			continue;
+
+		bank->start = p->start;
+		bank->size = p->size;
+		return 0;
+	}
+
+	return -ENOENT;
 }

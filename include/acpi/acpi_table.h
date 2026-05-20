@@ -1140,6 +1140,18 @@ void acpi_fill_header(struct acpi_table_header *header, char *signature);
 int acpi_fill_csrt(struct acpi_ctx *ctx);
 
 /**
+ * acpi_patch_dsdt() - Patch board-specific runtime values in the DSDT
+ *
+ * This hook runs after the compiled AML has been copied into the final DSDT
+ * buffer and after the table length has been updated.
+ *
+ * @ctx: ACPI context
+ * @dsdt: DSDT table to patch
+ * @return 0 if OK, -ve on error
+ */
+int acpi_patch_dsdt(struct acpi_ctx *ctx, struct acpi_table_header *dsdt);
+
+/**
  * acpi_fill_fadt() - Fill out the body of the FADT
  *
  * Must be implemented in SoC specific code or in mainboard code.

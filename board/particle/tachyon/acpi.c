@@ -16,6 +16,7 @@
  */
 
 #include <cpu.h>
+#include <log.h>
 #include <tables_csum.h>
 #include <string.h>
 #include <acpi/acpi_table.h>
@@ -25,6 +26,140 @@
 #include <dm/uclass.h>
 #include <dm/device.h>
 #include <mapmem.h>
+
+#include "qcom_dram.h"
+
+#define AML_NAME_OP		0x08
+#define AML_BYTE_PREFIX		0x0a
+#define AML_WORD_PREFIX		0x0b
+#define AML_DWORD_PREFIX	0x0c
+#define AML_STRING_PREFIX	0x0d
+#define AML_QWORD_PREFIX	0x0e
+
+#define QCOM_SMEM_MPSSEFS	"MPSS_EFS"
+#define QCOM_SMEM_ADSPEFS	"ADSP_EFS"
+#define QCOM_SMEM_TGCM		"TGCM"
+
+static int tachyon_acpi_patch_name(struct acpi_table_header *dsdt,
+				   const char name[ACPI_NAME_LEN],
+				   const void *data, size_t data_len)
+{
+	u8 *end = (u8 *)dsdt + dsdt->length;
+	u8 *ptr;
+
+	for (ptr = (u8 *)dsdt + sizeof(*dsdt);
+	     ptr + 6 + data_len <= end; ptr++) {
+		u8 *obj;
+		size_t obj_len;
+
+		if (*ptr != AML_NAME_OP || memcmp(ptr + 1, name, ACPI_NAME_LEN))
+			continue;
+
+		obj = ptr + 1 + ACPI_NAME_LEN;
+
+		switch (*obj) {
+		case AML_BYTE_PREFIX:
+			obj_len = 1;
+			obj++;
+			break;
+		case AML_WORD_PREFIX:
+			obj_len = 2;
+			obj++;
+			break;
+		case AML_DWORD_PREFIX:
+			obj_len = 4;
+			obj++;
+			break;
+		case AML_QWORD_PREFIX:
+			obj_len = 8;
+			obj++;
+			break;
+		case AML_STRING_PREFIX:
+			obj++;
+			obj_len = strnlen((char *)obj, (size_t)(end - obj)) + 1;
+			break;
+		default:
+			log_warning("DSDT Name(%4.4s) uses unsupported AML object 0x%02x\n",
+				    name, *obj);
+			return -EINVAL;
+		}
+
+		if (obj + obj_len > end)
+			return -EINVAL;
+		if (obj_len != data_len) {
+			log_warning("DSDT Name(%4.4s) object is %lu bytes, expected %lu\n",
+				    name, (ulong)obj_len, (ulong)data_len);
+			return -EINVAL;
+		}
+
+		memcpy(obj, data, data_len);
+		return 0;
+	}
+
+	log_warning("DSDT Name(%4.4s) not found\n", name);
+	return -ENOENT;
+}
+
+static int tachyon_acpi_patch_u32(struct acpi_table_header *dsdt,
+				  const char name[ACPI_NAME_LEN], u32 value)
+{
+	return tachyon_acpi_patch_name(dsdt, name, &value, sizeof(value));
+}
+
+static void tachyon_get_smem_region32(const char *name, u32 *base, u32 *size)
+{
+	qcom_mem_bank bank;
+	int ret;
+
+	*base = 0;
+	*size = 0;
+
+	ret = qcom_find_smem_region(name, &bank);
+	if (ret) {
+		log_warning("SMEM region %s not found for ACPI DSDT patching\n",
+			    name);
+		return;
+	}
+
+	if (bank.start > 0xffffffffULL || bank.size > 0xffffffffULL) {
+		log_warning("SMEM region %s does not fit 32-bit ACPI fields\n",
+			    name);
+		return;
+	}
+	if (bank.size && bank.start > 0x100000000ULL - bank.size) {
+		log_warning("SMEM region %s end does not fit 32-bit ACPI fields\n",
+			    name);
+		return;
+	}
+
+	*base = (u32)bank.start;
+	*size = (u32)bank.size;
+}
+
+int acpi_patch_dsdt(struct acpi_ctx *ctx, struct acpi_table_header *dsdt)
+{
+	u32 rmtb, rmtx, adsp_base, adsp_size, adsp_half, tcma, tcml;
+	int ret = 0;
+
+	(void)ctx;
+
+	tachyon_get_smem_region32(QCOM_SMEM_MPSSEFS, &rmtb, &rmtx);
+	tachyon_get_smem_region32(QCOM_SMEM_ADSPEFS, &adsp_base, &adsp_size);
+	tachyon_get_smem_region32(QCOM_SMEM_TGCM, &tcma, &tcml);
+
+	adsp_half = adsp_size / 2;
+
+	ret |= tachyon_acpi_patch_u32(dsdt, "RMTB", rmtb);
+	ret |= tachyon_acpi_patch_u32(dsdt, "RMTX", rmtx);
+	ret |= tachyon_acpi_patch_u32(dsdt, "RFAB", adsp_base);
+	ret |= tachyon_acpi_patch_u32(dsdt, "RFAS", adsp_half);
+	ret |= tachyon_acpi_patch_u32(dsdt, "RFMB", adsp_base + adsp_half);
+	ret |= tachyon_acpi_patch_u32(dsdt, "RFMS", adsp_half);
+	ret |= tachyon_acpi_patch_u32(dsdt, "TCMA", tcma);
+	ret |= tachyon_acpi_patch_u32(dsdt, "TCML", tcml);
+
+	return ret;
+}
 
 /*
  * QCM6490 SoC ACPI Support for Windows ARM64 boot
@@ -914,21 +1049,19 @@ int acpi_fill_csrt(struct acpi_ctx *ctx)
 static int tachyon_write_bgrt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct acpi_table_header *header;
+	struct acpi_bgrt *bgrt;
 
 	header = ctx->current;
+	bgrt = (struct acpi_bgrt *)header;
+	memset(bgrt, 0, sizeof(*bgrt));
 
 	acpi_fill_header(header, "BGRT");
-	header->length = sizeof(struct acpi_bgrt);
+	header->length = sizeof(*bgrt);
 	header->revision = acpi_get_table_revision(ACPITAB_BGRT);
 
-	/* BGRT: Version 1, Status 0 (displayed), Image type 0 (BMP) */
-	struct acpi_bgrt *bgrt = (struct acpi_bgrt *)header;
 	bgrt->version = 1;
-	bgrt->status = 0;  /* Image displayed */
-	bgrt->image_type = 0;  /* BMP format */
-	bgrt->offset_x = 0;
-	bgrt->offset_y = 0;
-	/* image_address is set by firmware if logo is present */
+	bgrt->status = 0;
+	bgrt->image_type = 0;
 
 	header->checksum = table_compute_checksum(header, header->length);
 
