@@ -199,6 +199,38 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
         Name (SKUV, 0xFFFFFFFF)
         Name (SDDR, 0xFFFFFFFF)
         Name (UAON, 0xFFFFFFFF)
+        Device (TPM0)
+        {
+            Name (_HID, "MSFT0101")  // _HID: Hardware ID
+            Name (_CCA, One)  // _CCA: Cache Coherency Attribute
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                Return (0x0F)
+            }
+
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Name (RBUF, ResourceTemplate ()
+                {
+                })
+                Return (RBUF) /* \_SB_.TPM0._CRS.RBUF */
+            }
+        }
+
+        Device (ACAD)
+        {
+            Name (_HID, "ACPI0003")  // _HID: Hardware ID
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                Return (0x0F)
+            }
+
+            Method (_PSR, 0, NotSerialized)  // _PSR: Power Source
+            {
+                Return (One)
+            }
+        }
+
         Device (UFS0)
         {
             Method (_STA, 0, NotSerialized)  // _STA: Status
