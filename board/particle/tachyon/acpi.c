@@ -1000,74 +1000,43 @@ ACPI_WRITER(5dbg2, "DBG2", tachyon_write_dbg2, 0);
 
 /*
  * TPM2 (Trusted Platform Module 2.0) Table
- * Required by Windows 11 to discover the firmware TPM (fTPM in OP-TEE)
- *
- * The EFI TCG2 protocol uses the same bloblist-backed event log published
- * here, so the ACPI TPM2 table and EFI GetEventLog() report one buffer.
- */
+ * Qualcomm Windows firmware publishes this as a legacy/vendor-specific
+ * TPM2 start method table.
 #if IS_ENABLED(CONFIG_TPM_V2)
-static int tachyon_get_tpm2_log(void **logp, int *sizep)
-{
-	int size = CONFIG_TPM2_EVENT_LOG_SIZE;
-	int ret;
+#define TACHYON_TPM2_START_METHOD_QCOM	9
+#define TACHYON_TPM2_QCOM_RESERVED_SIZE	32
 
-	*logp = NULL;
-	*sizep = 0;
-
-#if !CONFIG_IS_ENABLED(BLOBLIST)
-	return -ENXIO;
-#else
-	ret = bloblist_ensure_size_ret(BLOBLISTT_TPM2_TCG_LOG, &size, logp);
-	if (ret)
-		return ret;
-
-	*sizep = size;
-
-	return ret;
-#endif
-}
+struct __packed tachyon_acpi_tpm2_qcom {
+	struct acpi_table_header header;
+	u32 reserved;
+	u64 control_area;
+	u32 start_method;
+	u8 reserved2[TACHYON_TPM2_QCOM_RESERVED_SIZE];
+};
 
 static int tachyon_write_tpm2(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct acpi_table_header *header;
-	struct acpi_tpm2 *tpm2;
-	int log_size;
-	void *log;
-	int ret;
+	struct tachyon_acpi_tpm2_qcom *tpm2;
 
 	if (!IS_ENABLED(CONFIG_TPM_V2))
 		return -ENOENT;
 
-	ret = tachyon_get_tpm2_log(&log, &log_size);
-	if (ret)
-		return ret;
-
 	tpm2 = ctx->current;
 	header = &tpm2->header;
-	memset(tpm2, 0, sizeof(struct acpi_tpm2));
+	memset(tpm2, 0, sizeof(*tpm2));
 
 	acpi_fill_header(header, "TPM2");
-	header->length = sizeof(struct acpi_tpm2);
+	header->length = sizeof(*tpm2);
 	header->revision = acpi_get_table_revision(ACPITAB_TPM2);
 
-	/* Platform class: 1 = client system */
-	tpm2->platform_class = 1;
-
 	/*
-	 * Start method 7 = Command Response Buffer
-	 * The fTPM command transport is provided by platform firmware; the
-	 * TCG event log address is published below and shared with EFI TCG2.
+	 * Qualcomm Windows firmware publishes TPM2 with legacy/vendor-specific
+	 * start method 9 and no generic CRB control area. Do not advertise
+	 * method 11 here unless a real CRB + ARM SMC/HVC ABI is available.
 	 */
 	tpm2->control_area = 0;
-	tpm2->start_method = 7;
-	memset(tpm2->msp, 0, sizeof(tpm2->msp));
-
-	/*
-	 * Log Area Minimum Length (laml) and Log Area Start Address (lasa).
-	 * EFI TCG2 reuses this same bloblist record for its active event log.
-	 */
-	tpm2->laml = log_size;
-	tpm2->lasa = nomap_to_sysmem(log);
+	tpm2->start_method = TACHYON_TPM2_START_METHOD_QCOM;
 
 	header->checksum = table_compute_checksum(tpm2, header->length);
 
