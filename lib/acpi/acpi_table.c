@@ -835,9 +835,9 @@ int acpi_iort_add_smmu(struct acpi_ctx *ctx,
 		irq[1] = pmu_irq[i * 2 + 1];  /* flags */
 	}
 
-	/* ID mappings */
-	mapping = (struct acpi_iort_id_mapping *)((void *)(smmu + 1) +
-		   node->mapping_offset - sizeof(struct acpi_iort_node));
+	/* ID mappings — pointer is relative to start of node, not smmu+1 */
+	mapping = (struct acpi_iort_id_mapping *)((u8 *)node +
+		   node->mapping_offset);
 	for (int i = 0; i < num_mappings; i++) {
 		memcpy(mapping, &map[i], sizeof(struct acpi_iort_id_mapping));
 		mapping++;

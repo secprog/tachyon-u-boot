@@ -360,7 +360,7 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 	 * Model: 0 (generic MMU-500)
 	 *
 	 * Interrupts (from sc7280.dtsi apps_smmu node):
-	 * - Global interrupt: GIC_SPI 65 (level-high, #global-interrupts=1)
+	 * - Global interrupt: GIC_SPI 65 → ACPI GSIV 97 (SPI=65 + 32)
 	 * - Context interrupts: pre-configured by hypervisor, not listed here
 	 *   (SMMU is in bypass for all streams under Gunyah hyp)
 	 *
@@ -370,7 +370,7 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 	 * ID mapping: SMMU control interrupts → ITS Group (offset its_offset)
 	 *             Input range 0-0xFFFF (all SIDs)
 	 */
-	u32 global_gsiv[4] = { 65, 0, 0, 0 };
+	u32 global_gsiv[4] = { 97, 0, 0, 0 };
 	u32 global_flags[4] = { 0, 0, 0, 0 };  /* 0 = level-triggered */
 
 	struct acpi_iort_id_mapping map_smmu[] = {{
