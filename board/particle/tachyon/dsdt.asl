@@ -5,7 +5,7 @@
  * 
  * Disassembling to symbolic ASL+ operators
  *
- * Disassembly of c:/Users/Dani/Downloads/wwww/dsdt.aml
+ * 
  *
  * Original Table Header:
  *     Signature        "DSDT"
