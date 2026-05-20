@@ -169,9 +169,9 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
     {
         Name (PSUB, "IOT06490")
         Name (SOID, 0xFFFFFFFF)
-        Name (STOR, One)       /* UFS storage enabled; 0x02 = SD card */
+        Name (STOR, 0xFFFFFFFF)       /* UFS storage enabled; 0x02 = SD card */
         Name (SIDS, "899800000000000")
-        Name (SIDV, Zero)
+        Name (SIDV, 0xFFFFFFFF)
         Name (SVMJ, 0xFFFF)
         Name (SVMI, 0xFFFF)
         Name (SDFE, 0xFFFF)

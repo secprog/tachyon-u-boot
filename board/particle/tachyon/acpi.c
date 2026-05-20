@@ -21,11 +21,14 @@
 #include <string.h>
 #include <acpi/acpi_table.h>
 #include <bloblist.h>
+#include <linux/err.h>
 #include <asm/acpi_table.h>
 #include <asm/armv8/sec_firmware.h>
+#include <asm/io.h>
 #include <dm/uclass.h>
 #include <dm/device.h>
 #include <mapmem.h>
+#include <smem.h>
 
 #include "qcom_dram.h"
 
@@ -39,6 +42,28 @@
 #define QCOM_SMEM_MPSSEFS	"MPSS_EFS"
 #define QCOM_SMEM_ADSPEFS	"ADSP_EFS"
 #define QCOM_SMEM_TGCM		"TGCM"
+#define QCOM_SMEM_SOCINFO	137
+
+#define TACHYON_QCM6490_SOC_ID		497
+#define TACHYON_QCM6490_FAMILY_ID	118
+#define TACHYON_STORAGE_UFS		1
+#define TACHYON_STORAGE_UFS_SUBTYPE	0
+#define TACHYON_UFS3_ENABLED		1
+#define TACHYON_UFS3_SUBTYPE		0
+#define TACHYON_PLATFORM_SUBTYPE_IOT	1
+#define TACHYON_SKU_VALUE		1
+#define TACHYON_SDDR_REGION		4
+#define TACHYON_UAON_DISABLED		0
+#define TACHYON_QCM6490_JTAG_ID		0x001970e1
+#define TACHYON_QCM6490_DEFAULT_SKU_ID	3
+
+#define TACHYON_QFPROM_FEAT_CONFIG_ROW0	0x00784180
+#define TACHYON_QFPROM_SKU_MASK		0x0ff00000
+#define TACHYON_QFPROM_SKU_SHIFT	20
+#define TACHYON_EMULATION_TYPE_REG	0x01fc8004
+#define TACHYON_EMULATION_TYPE_MASK	0x3
+
+#define QCOM_CSRT_DESC_100C_UID		0x00000001
 
 static int tachyon_acpi_patch_name(struct acpi_table_header *dsdt,
 				   const char name[ACPI_NAME_LEN],
@@ -106,6 +131,18 @@ static int tachyon_acpi_patch_u32(struct acpi_table_header *dsdt,
 	return tachyon_acpi_patch_name(dsdt, name, &value, sizeof(value));
 }
 
+static int tachyon_acpi_patch_u16(struct acpi_table_header *dsdt,
+				  const char name[ACPI_NAME_LEN], u16 value)
+{
+	return tachyon_acpi_patch_name(dsdt, name, &value, sizeof(value));
+}
+
+static int tachyon_acpi_patch_u64(struct acpi_table_header *dsdt,
+				  const char name[ACPI_NAME_LEN], u64 value)
+{
+	return tachyon_acpi_patch_name(dsdt, name, &value, sizeof(value));
+}
+
 static void tachyon_get_smem_region32(const char *name, u32 *base, u32 *size)
 {
 	qcom_mem_bank bank;
@@ -136,9 +173,42 @@ static void tachyon_get_smem_region32(const char *name, u32 *base, u32 *size)
 	*size = (u32)bank.size;
 }
 
+static u64 tachyon_get_smem_item_addr(unsigned int item)
+{
+	struct udevice *dev = NULL;
+	size_t size;
+	void *ptr;
+	int ret;
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &dev);
+	if (ret)
+		return 0;
+
+	ptr = smem_get(dev, -1, item, &size);
+	if (IS_ERR_OR_NULL(ptr) || !size)
+		return 0;
+
+	return (u64)(ulong)ptr;
+}
+
+static u32 tachyon_read_sku_id(void)
+{
+	return (readl((void __iomem *)TACHYON_QFPROM_FEAT_CONFIG_ROW0) &
+		TACHYON_QFPROM_SKU_MASK) >> TACHYON_QFPROM_SKU_SHIFT;
+}
+
+static u32 tachyon_read_emulation_type(void)
+{
+	return readl((void __iomem *)TACHYON_EMULATION_TYPE_REG) &
+		TACHYON_EMULATION_TYPE_MASK;
+}
+
 int acpi_patch_dsdt(struct acpi_ctx *ctx, struct acpi_table_header *dsdt)
 {
 	u32 rmtb, rmtx, adsp_base, adsp_size, adsp_half, tcma, tcml;
+	u32 sidv = 0, sidt, emul;
+	u16 svmj, svmi;
+	u64 sosi;
 	int ret = 0;
 
 	(void)ctx;
@@ -148,6 +218,32 @@ int acpi_patch_dsdt(struct acpi_ctx *ctx, struct acpi_table_header *dsdt)
 	tachyon_get_smem_region32(QCOM_SMEM_TGCM, &tcma, &tcml);
 
 	adsp_half = adsp_size / 2;
+	svmj = (sidv >> 16) & 0xffff;
+	svmi = sidv & 0xffff;
+	sidt = tachyon_read_sku_id();
+	if (!sidt)
+		sidt = TACHYON_QCM6490_DEFAULT_SKU_ID;
+	emul = tachyon_read_emulation_type();
+	sosi = tachyon_get_smem_item_addr(QCOM_SMEM_SOCINFO);
+
+	ret |= tachyon_acpi_patch_u32(dsdt, "SOID", TACHYON_QCM6490_SOC_ID);
+	ret |= tachyon_acpi_patch_u32(dsdt, "STOR", TACHYON_STORAGE_UFS);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SIDV", sidv);
+	ret |= tachyon_acpi_patch_u16(dsdt, "SVMJ", svmj);
+	ret |= tachyon_acpi_patch_u16(dsdt, "SVMI", svmi);
+	ret |= tachyon_acpi_patch_u16(dsdt, "SDFE", TACHYON_QCM6490_FAMILY_ID);
+	ret |= tachyon_acpi_patch_u64(dsdt, "SIDM", 0);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SUFS", TACHYON_STORAGE_UFS_SUBTYPE);
+	ret |= tachyon_acpi_patch_u32(dsdt, "PUS3", TACHYON_UFS3_ENABLED);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SUS3", TACHYON_UFS3_SUBTYPE);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SIDT", sidt);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SJTG", TACHYON_QCM6490_JTAG_ID);
+	ret |= tachyon_acpi_patch_u32(dsdt, "EMUL", emul);
+	ret |= tachyon_acpi_patch_u32(dsdt, "PLST", TACHYON_PLATFORM_SUBTYPE_IOT);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SKUV", TACHYON_SKU_VALUE);
+	ret |= tachyon_acpi_patch_u32(dsdt, "SDDR", TACHYON_SDDR_REGION);
+	ret |= tachyon_acpi_patch_u32(dsdt, "UAON", TACHYON_UAON_DISABLED);
+	ret |= tachyon_acpi_patch_u64(dsdt, "SOSI", sosi);
 
 	ret |= tachyon_acpi_patch_u32(dsdt, "RMTB", rmtb);
 	ret |= tachyon_acpi_patch_u32(dsdt, "RMTX", rmtx);
@@ -228,7 +324,8 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
  *     └── SMMUv2 (ARM MMU-500 @ 0x15000000)
  *           ├── PCIe0 Root Complex (segment 0, SID base 0x1c00)
  *           ├── PCIe1 Root Complex (segment 1, SID base 0x1c80)
- *           └── UFS0 Named Component (SID 0x80)
+ *           ├── UFS0 Named Component (SID 0x80)
+ *           └── USB1 Named Component (SID 0xe0)
  *
  * Without this table:
  * - Windows may fail to boot or use polled I/O
@@ -237,7 +334,7 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
  */
 int acpi_fill_iort(struct acpi_ctx *ctx)
 {
-	u32 its_offset, smmu_offset, ufs_offset;
+	u32 its_offset, smmu_offset, ufs_offset, usb_offset;
 
 	/*
 	 * GIC ITS (Interrupt Translation Service) Group node
@@ -339,6 +436,41 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 		map_ufs);                   /* ID mapping array */
 
 	(void)ufs_offset;  /* reference kept for clarity; not chained to */
+
+	/*
+	 * USB1 Named Component node
+	 *
+	 * Type: 0x01 (Named Component)
+	 * Device: \_SB.USB1 - matches the DSDT USB1 device HID "QCOM0AA1"
+	 *
+	 * The Windows installer commonly boots from this controller, so its
+	 * non-PCI DMA StreamID must be visible in IORT for reliable setup I/O.
+	 *
+	 * Hardware details from sc7280.dtsi:
+	 *   Base:      0x0a600000  (usb_1)
+	 *   StreamID:  0xe0        (iommus = <&apps_smmu 0xe0 0x0>)
+	 *   Cache-coherent (dma-coherent)
+	 *
+	 * ID mapping: USB1 SID 0xe0 -> SMMU (offset smmu_offset)
+	 *             Single mapping (not a range) - exact SID match
+	 */
+	struct acpi_iort_id_mapping map_usb1[] = {{
+		0xe0,                        /* input_base: USB1 StreamID */
+		1,                           /* id_count: single SID */
+		0xe0,                        /* output_base: same SID at SMMU */
+		smmu_offset,                 /* output_reference: offset to SMMU */
+		ACPI_IORT_ID_SINGLE_MAPPING  /* flags: exact match */
+	}};
+
+	usb_offset = acpi_iort_add_named_component(ctx,
+		0,                          /* node_flags */
+		BIT(0) | BIT(56),           /* memory_properties (CacheCoherent + CPM) */
+		64,                         /* memory_address_limit (64-bit) */
+		"\\_SB.USB1",               /* device_name (ACPI path from DSDT) */
+		ARRAY_SIZE(map_usb1),       /* num_mappings */
+		map_usb1);                  /* ID mapping array */
+
+	(void)usb_offset;  /* reference kept for clarity; not chained to */
 
 	/*
 	 * PCIe Root Complex nodes
@@ -1033,7 +1165,7 @@ int acpi_fill_csrt(struct acpi_ctx *ctx)
 
 	qcom_csrt_write_group(ctx, QCOM_CSRT_GROUP_100C_LENGTH, 0x100c, 1);
 	qcom_csrt_write_descriptor(ctx, QCOM_CSRT_DESC_100C_LENGTH,
-				   0x0004, 0x0001, 0xdeadf00d);
+				   0x0004, 0x0001, QCOM_CSRT_DESC_100C_UID);
 	payload = ctx->current;
 	memset(payload, 0, QCOM_CSRT_DESC_100C_PAYLOAD);
 	qcom_csrt_apply_words(payload);
