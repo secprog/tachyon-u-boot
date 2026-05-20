@@ -1267,6 +1267,7 @@ ACPI_WRITER(5dbg2, "DBG2", tachyon_write_dbg2, 0);
  * TPM2 (Trusted Platform Module 2.0) Table
  * Qualcomm Windows firmware publishes this as a legacy/vendor-specific
  * TPM2 start method table.
+ */
 #if IS_ENABLED(CONFIG_TPM_V2)
 #define TACHYON_TPM2_START_METHOD_QCOM	9
 #define TACHYON_TPM2_QCOM_RESERVED_SIZE	32
