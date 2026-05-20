@@ -209,6 +209,13 @@ config RTC_PL031
 	  peripheral based on the Advanced Microcontroller Bus Architecture
 	  (AMBA). It is emulated in QEMU virtual ARM machines.
 
+config RTC_QCOM_PM8XXX
+	bool "Enable Qualcomm PM8xxx/PMK8350 RTC driver"
+	depends on DM_RTC && DM_PMIC && PMIC_QCOM
+	help
+	  Enable support for the RTC found in Qualcomm PM8xxx and PMK8350
+	  PMICs accessed through the Qualcomm SPMI PMIC driver.
+
 config RTC_MV
 	bool "Enable Marvell RTC driver"
 	depends on DM_RTC

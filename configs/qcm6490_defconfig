@@ -33,9 +33,17 @@ CONFIG_GENERATE_ACPI_TABLE=y
 CONFIG_EFI_ACPI_TABLES=y
 CONFIG_GIC_V3_ITS=y
 
-# PSCI support (provided by TF-A at EL3)
-CONFIG_ARMV8_PSCI=y
-CONFIG_SEC_FIRMWARE_ARMV8_PSCI=y
+# PSCI is provided by TF-A at EL3 — U-Boot must NOT implement its own.
+# The upstream DT (sc7280.dtsi) already declares psci { arm,psci-1.0; method = "smc"; }
+# and all 8 CPU nodes have enable-method = "psci". PSCI_RESET (default y) handles
+# system reset via SMC to TF-A independently of ARMV8_PSCI.
+#
+# CONFIG_ARMV8_PSCI is not set — would conflict with SEC_FIRMWARE_ARMV8_PSCI
+# and would compile a redundant U-Boot PSCI that never runs (U-Boot is at EL2).
+# Setting NR_CPUS=4 when SC7280 has 8 CPUs would also undersize per-CPU stacks.
+# CONFIG_SEC_FIRMWARE_ARMV8_PSCI is not set — this framework loads a separate
+# "secure firmware" FIT image (NXP SecMon model), not needed when TF-A provides PSCI.
+
 
 # FIT Signature verification (dependency of EFI Secure Boot)
 CONFIG_FIT_SIGNATURE=y
@@ -61,12 +69,8 @@ CONFIG_TPM2_FTPM_TEE=y
 CONFIG_EFI_TCG2_PROTOCOL=y
 
 # RTC (required for EFI GetTime/SetTime runtime services)
-# PMK8350 RTC has no U-Boot driver; use software-emulated RTC
-# which keeps time via CPU timer ticks. Initialized from build
-# timestamp unless 'rtc_emul_epoch' env var is set.
-# Also use the 'date' or 'sntp' command to set correct time.
 CONFIG_DM_RTC=y
-CONFIG_RTC_EMULATION=y
+CONFIG_RTC_QCOM_PM8XXX=y
 CONFIG_EFI_SET_TIME=y
 
 # Runtime variable access is handled by StandAloneMM/OP-TEE backed storage.

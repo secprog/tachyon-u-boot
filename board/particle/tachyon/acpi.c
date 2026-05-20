@@ -27,10 +27,18 @@
 /*
  * QCM6490 SoC ACPI Support for Windows ARM64 boot
  *
- * PSCI is handled by TF-A (Trusted Firmware-A) at EL3.
- * U-Boot's role is to:
+ * PSCI is provided by TF-A (Trusted Firmware-A) at EL3.
+ * U-Boot runs at EL2 (non-secure) and does NOT implement its own PSCI.
+ * The upstream DT (sc7280.dtsi) already declares:
+ *   psci { compatible = "arm,psci-1.0"; method = "smc"; }
+ * and all 8 CPU nodes have enable-method = "psci".
+ *
+ * U-Boot's only role is to:
  * 1. Declare PSCI compliance in FADT (arm_boot_arch field)
- * 2. Provide correct ACPI tables so Windows can boot and use SMP
+ * 2. Provide correct ACPI tables so Windows can discover CPUs and use SMP
+ *
+ * PSCI_RESET (default y on armv8) handles system reset via SMC to TF-A
+ * independently of the ARMV8_PSCI framework.
  *
  * MADT sub-table generation uses the driver model:
  *   - CPU driver (armv8_cpu.c, compatible "qcom,kryo"): GICC entries
@@ -81,7 +89,9 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
  * QCM6490 (SC7280) IORT topology:
  *   ITS Group (GIC ITS @ 0x17a40000, ID 0)
  *     └── SMMUv2 (ARM MMU-500 @ 0x15000000)
- *           └── PCIe Root Complex (segment 0, bus 0-255)
+ *           ├── PCIe0 Root Complex (segment 0, SID base 0x1c00)
+ *           ├── PCIe1 Root Complex (segment 1, SID base 0x1c80)
+ *           └── UFS0 Named Component (SID 0x80)
  *
  * Without this table:
  * - Windows may fail to boot or use polled I/O
@@ -194,10 +204,9 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 	(void)ufs_offset;  /* reference kept for clarity; not chained to */
 
 	/*
-	 * PCIe Root Complex node
+	 * PCIe Root Complex nodes
 	 *
 	 * Type: 0x02 (PCI Root Complex)
-	 * Segment: 0 (matches MCFG pci_segment_group_number = 0)
 	 * Memory address size limit: 64 (64-bit addressing)
 	 *
 	 * Memory access properties:
@@ -206,22 +215,53 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 	 *
 	 * ID mapping: PCIe Requester ID → SMMU (offset smmu_offset)
 	 *             Input range 0-0xFFFF covers all 16-bit RIDs
+	 *
+	 * The iommu-map from sc7280.dtsi maps per-RC SID bases:
+	 *   PCIe0: <0x0 &apps_smmu 0x1c00 0x1>  (SID base 0x1c00)
+	 *   PCIe1: <0x0 &apps_smmu 0x1c80 0x1>  (SID base 0x1c80)
+	 *
+	 * Windows requires one IORT RC node per PCI segment group.
+	 * Each RC's pci_segment_number must match the corresponding
+	 * MCFG entry and DSDT _SEG value.
 	 */
-	struct acpi_iort_id_mapping map_rc[] = {{
-		0,            /* input_base: lowest RequesterID */
-		0xffff,       /* id_count: number of RequesterIDs */
-		0,            /* output_base: lowest SMMU StreamID */
-		smmu_offset,  /* output_reference: offset to SMMU node */
-		0             /* flags: single-mapping = 0 (range mapping) */
-	}};
 
-	acpi_iort_add_rc(ctx,
-		BIT(0) | BIT(56),       /* mem_access_properties (CacheCoherent + CPM) */
-		0,                      /* ats_attributes (ATS not supported) */
-		0,                      /* pci_segment_number (matches MCFG) */
-		64,                     /* memory_address_size_limit (64-bit) */
-		ARRAY_SIZE(map_rc),     /* num_mappings */
-		map_rc);                /* ID mapping array */
+	/* PCIe0: segment 0, SID base 0x1c00 */
+	{
+		struct acpi_iort_id_mapping map_rc0[] = {{
+			0,            /* input_base: lowest RequesterID */
+			0xffff,       /* id_count: number of RequesterIDs */
+			0x1c00,       /* output_base: SID base for PCIe0 */
+			smmu_offset,  /* output_reference: offset to SMMU node */
+			0             /* flags: range mapping */
+		}};
+
+		acpi_iort_add_rc(ctx,
+			BIT(0) | BIT(56),       /* mem_access_properties */
+			0,                      /* ats_attributes */
+			0,                      /* pci_segment_number (PCIe0 = seg 0) */
+			64,                     /* memory_address_size_limit */
+			ARRAY_SIZE(map_rc0),
+			map_rc0);
+	}
+
+	/* PCIe1: segment 1, SID base 0x1c80 */
+	{
+		struct acpi_iort_id_mapping map_rc1[] = {{
+			0,            /* input_base */
+			0xffff,       /* id_count */
+			0x1c80,       /* output_base: SID base for PCIe1 */
+			smmu_offset,  /* output_reference: offset to SMMU node */
+			0             /* flags: range mapping */
+		}};
+
+		acpi_iort_add_rc(ctx,
+			BIT(0) | BIT(56),       /* mem_access_properties */
+			0,                      /* ats_attributes */
+			1,                      /* pci_segment_number (PCIe1 = seg 1) */
+			64,                     /* memory_address_size_limit */
+			ARRAY_SIZE(map_rc1),
+			map_rc1);
+	}
 
 	return 0;
 }
@@ -385,18 +425,31 @@ int acpi_fill_mcfg(struct acpi_ctx *ctx)
 {
 	/*
 	 * PCIe ECAM (Enhanced Configuration Access Mechanism)
-	 * Base: 0x40000000 (from extracted table)
-	 * Segment: 0
-	 * Start Bus: 0
-	 * End Bus: 255 (full bus range)
+	 *
+	 * SC7280 has two PCIe root complexes:
+	 *   PCIe0 (pcie@1c00000): domain=0, config=0x60100000
+	 *   PCIe1 (pcie@1c08000): domain=1, config=0x40100000
+	 *
+	 * Both support full bus range (0-255) with 1MB ECAM per bus.
+	 * DSDT devices: PCI0._SEG=0, PCI1._SEG=1.  MCFG segments MUST match.
 	 */
-	acpi_create_mcfg_mmconfig(ctx->current,
-		0x40000000,  /* ECAM base from extracted table */
-		0,           /* PCI segment group number */
-		0,           /* Start bus number */
-		255);         /* End bus number */
 
+	/* PCIe0: segment 0, ECAM @ 0x60100000, bus 0-255 */
+	acpi_create_mcfg_mmconfig(ctx->current,
+		0x60100000,  /* ECAM base (pcie0 "config" reg) */
+		0,           /* PCI segment group number (matches PCI0._SEG) */
+		0,           /* Start bus number */
+		255);        /* End bus number */
 	acpi_inc(ctx, sizeof(struct acpi_mcfg_mmconfig));
+
+	/* PCIe1: segment 1, ECAM @ 0x40100000, bus 0-255 */
+	acpi_create_mcfg_mmconfig(ctx->current,
+		0x40100000,  /* ECAM base (pcie1 "config" reg) */
+		1,           /* PCI segment group number (matches PCI1._SEG) */
+		0,           /* Start bus number */
+		255);        /* End bus number */
+	acpi_inc(ctx, sizeof(struct acpi_mcfg_mmconfig));
+
 	return 0;
 }
 
