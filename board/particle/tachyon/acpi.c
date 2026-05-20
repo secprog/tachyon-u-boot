@@ -19,10 +19,12 @@
 #include <tables_csum.h>
 #include <string.h>
 #include <acpi/acpi_table.h>
+#include <bloblist.h>
 #include <asm/acpi_table.h>
 #include <asm/armv8/sec_firmware.h>
 #include <dm/uclass.h>
 #include <dm/device.h>
+#include <mapmem.h>
 
 /*
  * QCM6490 SoC ACPI Support for Windows ARM64 boot
@@ -1000,17 +1002,45 @@ ACPI_WRITER(5dbg2, "DBG2", tachyon_write_dbg2, 0);
  * TPM2 (Trusted Platform Module 2.0) Table
  * Required by Windows 11 to discover the firmware TPM (fTPM in OP-TEE)
  *
- * Uses start_method = 7 (Command Response Buffer) for fTPM over TEE.
- * The EFI TCG2 protocol manages its own event log; we reference the
- * log buffer that EFI TCG2 will allocate.
+ * The EFI TCG2 protocol uses the same bloblist-backed event log published
+ * here, so the ACPI TPM2 table and EFI GetEventLog() report one buffer.
  */
+#if IS_ENABLED(CONFIG_TPM_V2)
+static int tachyon_get_tpm2_log(void **logp, int *sizep)
+{
+	int size = CONFIG_TPM2_EVENT_LOG_SIZE;
+	int ret;
+
+	*logp = NULL;
+	*sizep = 0;
+
+#if !CONFIG_IS_ENABLED(BLOBLIST)
+	return -ENXIO;
+#else
+	ret = bloblist_ensure_size_ret(BLOBLISTT_TPM2_TCG_LOG, &size, logp);
+	if (ret)
+		return ret;
+
+	*sizep = size;
+
+	return ret;
+#endif
+}
+
 static int tachyon_write_tpm2(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct acpi_table_header *header;
 	struct acpi_tpm2 *tpm2;
+	int log_size;
+	void *log;
+	int ret;
 
 	if (!IS_ENABLED(CONFIG_TPM_V2))
 		return -ENOENT;
+
+	ret = tachyon_get_tpm2_log(&log, &log_size);
+	if (ret)
+		return ret;
 
 	tpm2 = ctx->current;
 	header = &tpm2->header;
@@ -1025,23 +1055,19 @@ static int tachyon_write_tpm2(struct acpi_ctx *ctx, const struct acpi_writer *en
 
 	/*
 	 * Start method 7 = Command Response Buffer
-	 * This is the correct method for fTPM running in OP-TEE,
-	 * where the OS communicates via SMC calls through the
-	 * TCG2 protocol rather than direct MMIO.
+	 * The fTPM command transport is provided by platform firmware; the
+	 * TCG event log address is published below and shared with EFI TCG2.
 	 */
 	tpm2->control_area = 0;
 	tpm2->start_method = 7;
 	memset(tpm2->msp, 0, sizeof(tpm2->msp));
 
 	/*
-	 * Log Area Minimum Length (laml) and Log Area Start Address (lasa):
-	 * The EFI TCG2 protocol allocates its own event log buffer at boot.
-	 * Set laml to the configured log size; lasa will be populated by
-	 * the EFI TCG2 protocol at ExitBootServices or left zero if not
-	 * yet available.
+	 * Log Area Minimum Length (laml) and Log Area Start Address (lasa).
+	 * EFI TCG2 reuses this same bloblist record for its active event log.
 	 */
-	tpm2->laml = CONFIG_TPM2_EVENT_LOG_SIZE;
-	tpm2->lasa = 0;
+	tpm2->laml = log_size;
+	tpm2->lasa = nomap_to_sysmem(log);
 
 	header->checksum = table_compute_checksum(tpm2, header->length);
 
@@ -1052,3 +1078,4 @@ static int tachyon_write_tpm2(struct acpi_ctx *ctx, const struct acpi_writer *en
 }
 
 ACPI_WRITER(5tpm2, "TPM2", tachyon_write_tpm2, 0);
+#endif

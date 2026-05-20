@@ -209,8 +209,8 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
             Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
             {
                 /*
-                 * fTPM in OP-TEE uses SMC calls (start_method=7 in TPM2 table).
-                 * No MMIO resources needed; return EndDescriptor only.
+                 * TPM2 table carries the firmware TPM interface and event log.
+                 * No DSDT MMIO resources are described here.
                  */
                 Name (RBUF, Buffer (One)
                 {

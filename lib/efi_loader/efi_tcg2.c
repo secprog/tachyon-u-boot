@@ -9,6 +9,7 @@
 
 #define LOG_CATEGORY LOGC_EFI
 
+#include <bloblist.h>
 #include <dm.h>
 #include <efi_loader.h>
 #include <efi_variable.h>
@@ -41,6 +42,7 @@ struct event_log_buffer {
 	size_t pos; /* eventlog position */
 	size_t final_pos; /* final events config table position */
 	size_t last_event_size;
+	bool buffer_is_pool;
 	bool get_event_called;
 	bool ebs_called;
 	bool truncated;
@@ -795,8 +797,10 @@ static void tcg2_uninit(void)
 	if (ret != EFI_SUCCESS && ret != EFI_NOT_FOUND)
 		log_err("Failed to delete final events config table\n");
 
-	efi_free_pool(event_log.buffer);
+	if (event_log.buffer_is_pool)
+		efi_free_pool(event_log.buffer);
 	event_log.buffer = NULL;
+	event_log.buffer_is_pool = false;
 	efi_free_pool(event_log.final_buffer);
 	event_log.final_buffer = NULL;
 
@@ -914,11 +918,26 @@ static efi_status_t efi_init_event_log(void)
 	if (tcg2_platform_get_tpm2(&dev))
 		return EFI_DEVICE_ERROR;
 
-	ret = efi_allocate_pool(EFI_BOOT_SERVICES_DATA,
-				CONFIG_TPM2_EVENT_LOG_SIZE,
-				(void **)&event_log.buffer);
-	if (ret != EFI_SUCCESS)
-		return ret;
+	event_log.buffer = NULL;
+	event_log.buffer_is_pool = false;
+
+	if (CONFIG_IS_ENABLED(BLOBLIST)) {
+		int log_size;
+		void *log;
+
+		log = bloblist_get_blob(BLOBLISTT_TPM2_TCG_LOG, &log_size);
+		if (log && log_size >= CONFIG_TPM2_EVENT_LOG_SIZE)
+			event_log.buffer = log;
+	}
+
+	if (!event_log.buffer) {
+		ret = efi_allocate_pool(EFI_BOOT_SERVICES_DATA,
+					CONFIG_TPM2_EVENT_LOG_SIZE,
+					(void **)&event_log.buffer);
+		if (ret != EFI_SUCCESS)
+			return ret;
+		event_log.buffer_is_pool = true;
+	}
 
 	/*
 	 * initialize log area as 0xff so the OS can easily figure out the
@@ -967,8 +986,10 @@ static efi_status_t efi_init_event_log(void)
 	return ret;
 
 free_pool:
-	efi_free_pool(event_log.buffer);
+	if (event_log.buffer_is_pool)
+		efi_free_pool(event_log.buffer);
 	event_log.buffer = NULL;
+	event_log.buffer_is_pool = false;
 	return ret;
 }
 
