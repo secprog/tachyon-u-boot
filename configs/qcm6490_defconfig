@@ -59,6 +59,15 @@ CONFIG_TPM2_FTPM_TEE=y
 # EFI TCG2 Protocol (measures boot to TPM, required for Windows 11)
 CONFIG_EFI_TCG2_PROTOCOL=y
 
+# RTC (required for EFI GetTime/SetTime runtime services)
+# PMK8350 RTC has no U-Boot driver; use software-emulated RTC
+# which keeps time via CPU timer ticks. Initialized from build
+# timestamp unless 'rtc_emul_epoch' env var is set.
+# Also use the 'date' or 'sntp' command to set correct time.
+CONFIG_DM_RTC=y
+CONFIG_RTC_EMULATION=y
+CONFIG_EFI_SET_TIME=y
+
 # Runtime variable access is handled by StandAloneMM/OP-TEE backed storage.
 # At ExitBootServices, runtime-accessible variables are collected from StMM
 # and presented to the OS in DRAM. SetVariable at runtime returns

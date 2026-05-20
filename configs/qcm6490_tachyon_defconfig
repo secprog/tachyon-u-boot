@@ -35,7 +35,11 @@ CONFIG_CMD_BOOTI=y
 CONFIG_CMD_PART=y
 CONFIG_CMD_FS_GENERIC=y
 CONFIG_EFI_PARTITION=y
-CONFIG_EFI_VARIABLE_FILE_STORE=y
+# CONFIG_EFI_VARIABLE_FILE_STORE must NOT be set — conflicts with
+# CONFIG_EFI_MM_COMM_TEE=y from qcm6490_defconfig (mutually exclusive
+# Kconfig choice). EFI_MM_COMM_TEE delegates variable storage to
+# StandAloneMM in OP-TEE (RPMB-backed, authenticated — required for
+# Secure Boot key enrollment).
 CONFIG_FASTBOOT_BUF_ADDR=0xA0000000
 
 CONFIG_CMD_PMIC=y
