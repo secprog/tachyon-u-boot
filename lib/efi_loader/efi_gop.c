@@ -104,10 +104,6 @@ static efi_status_t EFIAPI gop_query_mode(struct efi_gop *this, u32 mode_number,
 		(*info)->pixel_bitmask[1] = 0x07e0; /* green */
 		(*info)->pixel_bitmask[2] = 0x001f; /* blue */
 	}
-	(*info)->pixel_information.red_mask = (*info)->pixel_bitmask[0];
-	(*info)->pixel_information.green_mask = (*info)->pixel_bitmask[1];
-	(*info)->pixel_information.blue_mask = (*info)->pixel_bitmask[2];
-	(*info)->pixel_information.reserved_mask = (*info)->pixel_bitmask[3];
 
 	*size_of_info = sizeof(**info);
 
@@ -454,6 +450,7 @@ static efi_status_t EFIAPI gop_set_mode(struct efi_gop *this, u32 mode_number)
 			gopobj->info.pixel_bitmask[1] = 0x07e0;
 			gopobj->info.pixel_bitmask[2] = 0x001f;
 		}
+		gopobj->mode.mode = mode_number;
 		gopobj->fb = map_sysmem(gopobj->mode.fb_base,
 					gopobj->mode.fb_size);
 		video_sync_all();
@@ -462,6 +459,7 @@ static efi_status_t EFIAPI gop_set_mode(struct efi_gop *this, u32 mode_number)
 		if (mode_number)
 			return EFI_EXIT(EFI_UNSUPPORTED);
 		vid_bpp = gop_get_bpp(this);
+		gopobj->mode.mode = 0;
 		ret = gop_blt_video_fill(this, &buffer, EFI_BLT_VIDEO_FILL,
 					 0, 0, 0, 0, gopobj->info.width,
 					 gopobj->info.height, 0, vid_bpp);

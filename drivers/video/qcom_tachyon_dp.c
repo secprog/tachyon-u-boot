@@ -3905,6 +3905,15 @@ static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
 	tachyon_dp_filter_edid_modes(priv);
 	tachyon_dp_publish_edid_modes(priv);
 
+	/*
+	 * After link fallback, the originally requested mode may no longer
+	 * fit within the trained rate/lanes.  Re-check bandwidth here so
+	 * we don't blindly program a mode that exceeds link capacity (which
+	 * would result in a black screen or unstable link).
+	 */
+	if (!tachyon_dp_mode_fits_link(priv, &priv->timing))
+		return -ENOSPC;
+
 	uc_priv->xsize = width;
 	uc_priv->ysize = height;
 	uc_priv->bpix = VIDEO_BPP32;
