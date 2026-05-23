@@ -88,6 +88,7 @@ typedef struct fs_context {
 
 int board_early_init_f(void)
 {
+	printascii("\n@@@ TACHYON: board_early_init_f entry @@@\n");
 	if (IS_ENABLED(CONFIG_DEBUG_UART))
 		printascii("\nTACHYON board_early_init_f\n");
 
@@ -106,11 +107,13 @@ int board_early_init_f(void)
 		gd->ram_size = ram_end - gd->ram_base;
 	}
 
+	printascii("\n@@@ TACHYON: board_early_init_f exit @@@\n");
 	return 0;
 }
 
 phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
 {
+	printascii("\n@@@ TACHYON: board_get_usable_ram_top @@@\n");
 	return TACHYON_UBOOT_RAM_TOP;
 }
 

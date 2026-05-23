@@ -94,10 +94,16 @@ ENTRY(_main)
 
 #if defined(CONFIG_DEBUG_UART) && CONFIG_IS_ENABLED(SERIAL)
 	bl	debug_uart_init
+	ldr	x0, =mark_debug_uart_ok
+	bl	printascii
 #endif
 
+	ldr	x0, =mark_before_board_init_f
+	bl	printascii
 	mov	x0, #0
 	bl	board_init_f
+	ldr	x0, =mark_after_board_init_f
+	bl	printascii
 
 #if !defined(CONFIG_XPL_BUILD)
 /*
@@ -139,6 +145,8 @@ relocation_return:
  * Set up final (full) environment
  */
 	bl	c_runtime_cpu_setup		/* still call old routine */
+	ldr	x0, =mark_after_runtime_setup
+	bl	printascii
 #endif /* !CONFIG_XPL_BUILD */
 #if !defined(CONFIG_XPL_BUILD) || CONFIG_IS_ENABLED(FRAMEWORK)
 #if defined(CONFIG_XPL_BUILD)
@@ -168,6 +176,8 @@ clear_loop:
 	b.lo	clear_loop
 
 	/* call board_init_r(gd_t *id, ulong dest_addr) */
+	ldr	x0, =mark_before_board_init_r
+	bl	printascii
 	mov	x0, x18				/* gd_t */
 	ldr	x1, [x18, #GD_RELOCADDR]	/* dest_addr */
 	b	board_init_r			/* PC relative jump */
@@ -176,3 +186,16 @@ clear_loop:
 #endif
 
 ENDPROC(_main)
+
+
+.section .rodata
+mark_debug_uart_ok:
+    .asciz "\n@@@ CRT0: debug_uart_init OK @@@\n"
+mark_before_board_init_f:
+    .asciz "\n@@@ CRT0: before board_init_f @@@\n"
+mark_after_board_init_f:
+    .asciz "\n@@@ CRT0: after board_init_f @@@\n"
+mark_after_runtime_setup:
+    .asciz "\n@@@ CRT0: after c_runtime_cpu_setup @@@\n"
+mark_before_board_init_r:
+    .asciz "\n@@@ CRT0: before board_init_r @@@\n"

@@ -27,6 +27,7 @@
 #include <hang.h>
 #include <i2c.h>
 #include <init.h>
+#include <debug_uart.h>
 #include <initcall.h>
 #include <log.h>
 #include <malloc.h>
@@ -875,7 +876,21 @@ static int initf_upl(void)
 	return 0;
 }
 
+
+static int mark_f_start(void) { printascii("\n@@@ BOARD_F: start @@@\n"); return 0; }
+static int mark_f_after_dm(void) { printascii("\n@@@ BOARD_F: after initf_dm @@@\n"); return 0; }
+static int mark_f_after_board_early(void) { printascii("\n@@@ BOARD_F: after board_early_init_f @@@\n"); return 0; }
+static int mark_f_after_serial(void) { printascii("\n@@@ BOARD_F: after serial_init @@@\n"); return 0; }
+static int mark_f_after_console(void) { printascii("\n@@@ BOARD_F: after console_init_f @@@\n"); return 0; }
+static int mark_f_before_dram(void) { printascii("\n@@@ BOARD_F: before dram_init @@@\n"); return 0; }
+static int mark_f_after_dram(void) { printascii("\n@@@ BOARD_F: after dram_init @@@\n"); return 0; }
+static int mark_f_after_setup_dest(void) { printascii("\n@@@ BOARD_F: after setup_dest_addr @@@\n"); return 0; }
+static int mark_f_after_reserve_uboot(void) { printascii("\n@@@ BOARD_F: after reserve_uboot @@@\n"); return 0; }
+static int mark_f_after_display_new_sp(void) { printascii("\n@@@ BOARD_F: after display_new_sp @@@\n"); return 0; }
+static int mark_f_before_setup_reloc(void) { printascii("\n@@@ BOARD_F: before setup_reloc @@@\n"); return 0; }
+
 static const init_fnc_t init_sequence_f[] = {
+	mark_f_start,
 	setup_mon_len,
 #ifdef CONFIG_OF_CONTROL
 	fdtdec_setup,
@@ -897,8 +912,10 @@ static const init_fnc_t init_sequence_f[] = {
 	arch_cpu_init,		/* basic arch cpu dependent setup */
 	mach_cpu_init,		/* SoC/machine dependent CPU setup */
 	initf_dm,
+	mark_f_after_dm,
 #if defined(CONFIG_BOARD_EARLY_INIT_F)
 	board_early_init_f,
+	mark_f_after_board_early,
 #endif
 #if defined(CONFIG_PPC) || defined(CONFIG_SYS_FSL_CLK) || defined(CONFIG_M68K)
 	/* get CPU and bus clocks according to the environment variable */
@@ -913,7 +930,9 @@ static const init_fnc_t init_sequence_f[] = {
 	env_init,		/* initialize environment */
 	init_baud_rate,		/* initialze baudrate settings */
 	serial_init,		/* serial communications setup */
+	mark_f_after_serial,
 	console_init_f,		/* stage 1 init of console */
+	mark_f_after_console,
 	display_options,	/* say that we are here */
 	display_text_info,	/* show debugging info if required */
 	checkcpu,
@@ -936,7 +955,9 @@ static const init_fnc_t init_sequence_f[] = {
 	init_func_i2c,
 #endif
 	announce_dram_init,
+	mark_f_before_dram,
 	dram_init,		/* configure available RAM banks */
+	mark_f_after_dram,
 #ifdef CONFIG_POST
 	post_init_f,
 #endif
@@ -963,6 +984,7 @@ static const init_fnc_t init_sequence_f[] = {
 	 *  - board info struct
 	 */
 	setup_dest_addr,
+	mark_f_after_setup_dest,
 #if defined(CONFIG_OF_BOARD_FIXUP) && !defined(CONFIG_OF_INITIAL_DTB_READONLY)
 	fix_fdt,
 #endif
@@ -975,6 +997,7 @@ static const init_fnc_t init_sequence_f[] = {
 	reserve_video,
 	reserve_trace,
 	reserve_uboot,
+	mark_f_after_reserve_uboot,
 	reserve_malloc,
 	reserve_board,
 	reserve_global_data,
@@ -992,12 +1015,14 @@ static const init_fnc_t init_sequence_f[] = {
 	INIT_FUNC_WATCHDOG_RESET
 	setup_bdinfo,
 	display_new_sp,
+	mark_f_after_display_new_sp,
 	INIT_FUNC_WATCHDOG_RESET
 #if !defined(CONFIG_OF_BOARD_FIXUP) || !defined(CONFIG_OF_INITIAL_DTB_READONLY)
 	reloc_fdt,
 #endif
 	reloc_bootstage,
 	reloc_bloblist,
+	mark_f_before_setup_reloc,
 	setup_reloc,
 #if defined(CONFIG_X86) || defined(CONFIG_ARC)
 	copy_uboot_to_ram,
