@@ -16,17 +16,17 @@ CONFIG_TEXT_BASE=0x9fc00000
 CONFIG_REMAKE_ELF=y
 
 # Enable capsule updates
-CONFIG_EFI_RUNTIME_UPDATE_CAPSULE=y
-CONFIG_EFI_CAPSULE_ON_DISK=y
-CONFIG_EFI_IGNORE_OSINDICATIONS=y
-CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
+# CONFIG_EFI_RUNTIME_UPDATE_CAPSULE=y
+# CONFIG_EFI_CAPSULE_ON_DISK=y
+# CONFIG_EFI_IGNORE_OSINDICATIONS=y
+# CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
 
 # ACPI support for Windows ARM64 boot
-CONFIG_ACPI=y
-CONFIG_ACPIGEN=y
-CONFIG_GENERATE_ACPI_TABLE=y
-CONFIG_EFI_ACPI_TABLES=y
-CONFIG_GIC_V3_ITS=y
+# CONFIG_ACPI=y
+# CONFIG_ACPIGEN=y
+# CONFIG_GENERATE_ACPI_TABLE=y
+# CONFIG_EFI_ACPI_TABLES=y
+# CONFIG_GIC_V3_ITS=y
 
 # PSCI is provided by TF-A at EL3 — U-Boot must NOT implement its own.
 # The upstream DT (sc7280.dtsi) already declares psci { arm,psci-1.0; method = "smc"; }
@@ -41,28 +41,28 @@ CONFIG_GIC_V3_ITS=y
 
 
 # FIT Signature verification (dependency of EFI Secure Boot)
-CONFIG_FIT_SIGNATURE=y
+# CONFIG_FIT_SIGNATURE=y
 
 # Trusted Execution Environment (dependency of fTPM in OP-TEE)
-CONFIG_TEE=y
-CONFIG_OPTEE=y
+# CONFIG_TEE=y
+# CONFIG_OPTEE=y
 
 # EFI Secure Boot (required for Windows 11)
 # StandAloneMM in OP-TEE stores PK/KEK/db/dbx on RPMB (tamper-resistant).
 # This replaces /ubootefi.var file storage and provides authenticated
 # variable support required by EFI spec §32.3.6.
 # Prerequisite: StandAloneMM TA must be loaded in OP-TEE by TF-A.
-CONFIG_EFI_MM_COMM_TEE=y
-CONFIG_EFI_SECURE_BOOT=y
+# CONFIG_EFI_MM_COMM_TEE=y
+# CONFIG_EFI_SECURE_BOOT=y
 
 # TPM 2.0 via OP-TEE fTPM (required for Windows 11)
-CONFIG_TPM=y
-CONFIG_TPM_V2=y
-CONFIG_TPM2_FTPM_TEE=y
+# CONFIG_TPM=y
+# CONFIG_TPM_V2=y
+#CONFIG_TPM2_FTPM_TEE=y
 CONFIG_BLOBLIST_SIZE_RELOC=0x40000
 
 # EFI TCG2 Protocol (measures boot to TPM, required for Windows 11)
-CONFIG_EFI_TCG2_PROTOCOL=y
+# CONFIG_EFI_TCG2_PROTOCOL=y
 
 # RTC (required for EFI GetTime/SetTime runtime services)
 CONFIG_DM_RTC=y
