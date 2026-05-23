@@ -1498,13 +1498,14 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		   0x4c : 0x5c;
 	u32 pd_ctl;
 	u32 vco_div;
-	long ret;
+	int ret;
 
 	if (priv->dp_clk_valid[2]) {
-		ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
-		if (ret < 0)
+		long clk_ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
+
+		if (clk_ret < 0)
 			log_warning("Failed to set DP link clock %u kHz: %ld\n",
-				    priv->rate, ret);
+				    priv->rate, clk_ret);
 	}
 
 	setbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_DP_MODE);
@@ -1840,7 +1841,7 @@ static void tachyon_dp_parse_dtd(struct tachyon_dp_mode *modes, int *count,
 	u32 width, height, hblank, vblank, hfp, hsync, vfp, vsync;
 	enum display_flags flags = 0;
 
-	if (!EDID_DETAILED_TIMING_PIXEL_CLOCK(*t))
+	if (EDID_DETAILED_TIMING_PIXEL_CLOCK(*t) == 0)
 		return;
 	if (EDID_DETAILED_TIMING_FLAG_INTERLACED(*t))
 		return;
@@ -1980,13 +1981,6 @@ static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
 		tachyon_dp_add_mode_timing(modes, count, 1024, 768, &timing);
-	}
-	if (EDID1_INFO_ESTABLISHED_TIMING_1280X1024_60(*edid)) {
-		tachyon_dp_fill_timing(&timing, 108000000, 1280, 48, 112, 248,
-				       1024, 1, 3, 38,
-				       DISPLAY_FLAGS_HSYNC_HIGH |
-				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1280, 1024, &timing);
 	}
 }
 
@@ -2216,8 +2210,7 @@ static void tachyon_dp_parse_cea_audio(struct tachyon_dp_priv *priv,
 		(const struct edid_cea861_info *)buf;
 	int offset;
 
-	priv->audio.basic_audio =
-		EDID_CEA861_SUPPORTS_BASIC_AUDIO(cea->dtd_count);
+	priv->audio.basic_audio = EDID_CEA861_SUPPORTS_BASIC_AUDIO(*cea);
 
 	if (cea->extension_tag != EDID_CEA861_EXTENSION_TAG)
 		return;
