@@ -68,6 +68,7 @@ typedef struct fs_context {
 #define TACHYON_RESOLUTION_MENU_MAX 8
 #define TACHYON_BOOTMENU_FASTBOOT "Enable fastboot mode=run fastboot"
 #define TACHYON_BOOTMENU_RESET "Reset device=reset"
+#define TACHYON_UBOOT_RAM_TOP 0x9ff00000
 
 // #define DEBUG
 
@@ -106,6 +107,11 @@ int board_early_init_f(void)
 	}
 
 	return 0;
+}
+
+phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
+{
+	return TACHYON_UBOOT_RAM_TOP;
 }
 
 loff_t fsg_read(void* buf, loff_t offset, loff_t size, void* ctx) {
