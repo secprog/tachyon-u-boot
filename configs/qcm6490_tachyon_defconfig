@@ -26,7 +26,9 @@ CONFIG_OF_SYSTEM_SETUP=y
 
 CONFIG_DEFAULT_ENV_FILE="board/particle/tachyon/default.env"
 CONFIG_OF_LIBFDT_OVERLAY=y
-CONFIG_ENV_IS_IN_EFI=y
+# Ignore persisted EFI env while debugging early boot. This forces default.env.
+# CONFIG_ENV_IS_IN_EFI is not set
+CONFIG_ENV_IS_NOWHERE=y
 CONFIG_ENV_SIZE=0x8000
 # CONFIG_EFI_VARIABLE_FILE_STORE is not set
 CONFIG_BOOTDELAY=-1
