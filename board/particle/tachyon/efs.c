@@ -97,11 +97,12 @@ int efs_open(efs_context* ctx, efs_file** file, const char* path, int flags) {
     if (item->type == EFS_INODE_ITEM_REF) {
         EFS_CHECK(efs_read_inode(ctx, &impl->inode_it.inode, efs_dir_entry_inode_ref(efs_iterator_dir_entry(&it))));
     } else if (item->type == EFS_INODE_ITEM_INLINE) {
-        memcpy(&impl->inode_it.inln, item->data, sizeof(impl->inode_it.inln) + efs_inode_item_data_size(efs_iterator_dir_entry(&impl->it)));
+        memcpy(&impl->inode_it.inln, item->data, sizeof(impl->inode_it.inln));
     } else if (item->type == EFS_INODE_ITEM_INLINE_EXT) {
-        memcpy(&impl->inode_it.inln_ext, item->data, sizeof(impl->inode_it.inln_ext) + efs_inode_item_data_size(efs_iterator_dir_entry(&impl->it)));
+        memcpy(&impl->inode_it.inln_ext, item->data, sizeof(impl->inode_it.inln_ext));
     } else {
-        free(file);
+        free(*file);
+        *file = NULL;
         return EFS_ERROR_GENERIC;
     }
     return 0;
@@ -137,14 +138,20 @@ int efs_read(efs_context* ctx, efs_file* file, void* buffer, loff_t offset, loff
     if (item->type == EFS_INODE_ITEM_REF) {
         return efs_inode_read(ctx, &impl->inode_it, buffer, offset, size);
     } else if (item->type == EFS_INODE_ITEM_INLINE) {
-        offset = min(offset, efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it)));
-        size = min(size, efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it)) - offset);
-        memcpy(buffer, impl->inode_it.inln.data + offset, size);
+        efs_inode_item_inline *inln = (efs_inode_item_inline *)item->data;
+        loff_t fsize = efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it));
+
+        offset = min(offset, fsize);
+        size = min(size, fsize - offset);
+        memcpy(buffer, inln->data + offset, size);
         return size;
     } else if (item->type == EFS_INODE_ITEM_INLINE_EXT) {
-        offset = min(offset, efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it)));
-        size = min(size, efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it)) - offset);
-        memcpy(buffer, impl->inode_it.inln_ext.data + offset, size);
+        efs_inode_item_inline_ext *inln_ext = (efs_inode_item_inline_ext *)item->data;
+        loff_t fsize = efs_inode_size(ctx, efs_iterator_dir_entry(&impl->it));
+
+        offset = min(offset, fsize);
+        size = min(size, fsize - offset);
+        memcpy(buffer, inln_ext->data + offset, size);
         return size;
     }
     return EFS_ERROR_GENERIC;
