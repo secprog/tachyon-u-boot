@@ -66,7 +66,7 @@
 };
 
 /* Enable USB-C Display (DP Alt Mode) */
-&usb_1_dwc3 {
+&usb_1 {
 	dr_mode = "host";
 	/* Enable DisplayPort Alternate Mode for USB-C video out */
 	snps,dis_u2_entry_quirk;
