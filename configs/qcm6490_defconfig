@@ -74,3 +74,7 @@ CONFIG_EFI_SET_TIME=y
 # and presented to the OS in DRAM. SetVariable at runtime returns
 # EFI_UNSUPPORTED (OS must use authenticated boot-time paths per spec).
 # CONFIG_EFI_RT_VOLATILE_STORE is incompatible with EFI_MM_COMM_TEE.
+
+# Move early stack above Tachyon low reserved-memory window.
+# 0x180000 lands at ~0x81800170, inside cdsp_secure_heap@81800000.
+CONFIG_SYS_INIT_SP_BSS_OFFSET=50331648
