@@ -5,6 +5,7 @@
 
 #include <dm.h>
 #include <i2c.h>
+#include <linux/errno.h>
 #include <log.h>
 #include <acpi/acpi_device.h>
 #include <acpi/acpigen.h>
@@ -53,17 +54,9 @@ int acpi_i2c_fill_ssdt(const struct udevice *dev, struct acpi_ctx *ctx)
 	struct acpi_dp *dsd = NULL;
 	char scope[ACPI_PATH_MAX];
 	char name[ACPI_NAME_MAX];
-	int tx_state_val;
 	int curindex = 0;
 	int ret;
 
-#ifdef CONFIG_X86
-	tx_state_val = PAD_CFG0_TX_STATE;
-#elif defined(CONFIG_SANDBOX)
-	tx_state_val = BIT(7);  /* test value */
-#else
-#error "Not supported on this architecture"
-#endif
 	ret = acpi_get_name(dev, name);
 	if (ret)
 		return log_msg_ret("name", ret);
@@ -150,6 +143,15 @@ int acpi_i2c_fill_ssdt(const struct udevice *dev, struct acpi_ctx *ctx)
 
 	/* Power Resource */
 	if (priv->has_power_resource) {
+		int tx_state_val;
+
+#ifdef CONFIG_X86
+		tx_state_val = PAD_CFG0_TX_STATE;
+#elif defined(CONFIG_SANDBOX)
+		tx_state_val = BIT(7);  /* test value */
+#else
+		return log_msg_ret("power_arch", -EOPNOTSUPP);
+#endif
 		ret = acpi_device_add_power_res(ctx, tx_state_val,
 			"\\_SB.GPC0", "\\_SB.SPC0",
 			&priv->reset_gpio, priv->reset_delay_ms,
