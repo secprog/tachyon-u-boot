@@ -172,7 +172,9 @@ pie_fixup_done:
 	 */
 
 	/* Processor specific initialization */
+#if !CONFIG_IS_ENABLED(SKIP_LOWLEVEL_INIT)
 	bl	lowlevel_init
+#endif
 
 #if defined(CONFIG_ARMV8_SPIN_TABLE) && !defined(CONFIG_XPL_BUILD)
 	branch_if_master x0, master_cpu
