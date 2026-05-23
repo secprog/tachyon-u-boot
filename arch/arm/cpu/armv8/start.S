@@ -207,14 +207,6 @@ slave_cpu:
 #endif /* CONFIG_ARMV8_MULTIENTRY */
 master_cpu:
 	msr	SPSel, #1		/* make sure we use SP_ELx */
-	/*
-	 * Tachyon diagnostic: stop immediately before C runtime startup.
-	 * If the repeated 'C' stream or 0x817ffff0 abort returns with this
-	 * patch, the trigger is before _main. If it stops, move forward into
-	 * arch/arm/lib/crt0_64.S.
-	 */
-0:	wfi
-	b	0b
 	bl	_main
 
 /*-----------------------------------------------------------------------*/
