@@ -53,14 +53,6 @@ _bss_end_ofs:
 	.quad	__bss_end - _start
 
 reset:
-	/*
-	 * Tachyon diagnostic: stop at the first ARM64 reset-vector code.
-	 * If serial still emits repeated 'C' with this patch, the stream is
-	 * not produced by code reached through U-Boot's normal reset path.
-	 */
-0:	wfi
-	b	0b
-
 	/* Allow the board to save important registers */
 	b	save_boot_params
 .globl	save_boot_params_ret
@@ -215,6 +207,14 @@ slave_cpu:
 #endif /* CONFIG_ARMV8_MULTIENTRY */
 master_cpu:
 	msr	SPSel, #1		/* make sure we use SP_ELx */
+	/*
+	 * Tachyon diagnostic: stop immediately before C runtime startup.
+	 * If the repeated 'C' stream or 0x817ffff0 abort returns with this
+	 * patch, the trigger is before _main. If it stops, move forward into
+	 * arch/arm/lib/crt0_64.S.
+	 */
+0:	wfi
+	b	0b
 	bl	_main
 
 /*-----------------------------------------------------------------------*/
