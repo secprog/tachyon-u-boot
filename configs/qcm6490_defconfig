@@ -65,9 +65,9 @@ CONFIG_BLOBLIST_SIZE_RELOC=0x40000
 # CONFIG_EFI_TCG2_PROTOCOL=y
 
 # RTC (required for EFI GetTime/SetTime runtime services)
-CONFIG_DM_RTC=y
-CONFIG_RTC_QCOM_PM8XXX=y
-CONFIG_EFI_SET_TIME=y
+# CONFIG_DM_RTC=y
+# CONFIG_RTC_QCOM_PM8XXX=y
+# CONFIG_EFI_SET_TIME=y
 
 # Runtime variable access is handled by StandAloneMM/OP-TEE backed storage.
 # At ExitBootServices, runtime-accessible variables are collected from StMM
