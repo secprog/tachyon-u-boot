@@ -2,6 +2,9 @@
 /*
  * Copyright (c) 2024 Linaro Ltd.
  */
+
+/delete-node/ &xbl_mem;
+
 / {
 	/* When running as the primary bootloader there is no prior
 	 * stage to populate the memory layout for us. We *should*
@@ -47,7 +50,7 @@
 		};
 
 		/* Video memory (firmware) */
-		video_mem: video@8ad00000 {
+		video@8ad00000 {
 			reg = <0 0x8ad00000 0 0x900000>;
 			no-map;
 		};
