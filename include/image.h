@@ -2028,6 +2028,13 @@ void set_abootimg_addr(ulong addr);
 ulong get_ainit_bootimg_addr(void);
 
 /**
+ * set_ainit_bootimg_addr() - Set Android init boot image address
+ *
+ * Return: no returned results
+ */
+void set_ainit_bootimg_addr(ulong addr);
+
+/**
  * get_avendor_bootimg_addr() - Get Android vendor boot image address
  *
  * Return: Android vendor boot image address
@@ -2035,7 +2042,7 @@ ulong get_ainit_bootimg_addr(void);
 ulong get_avendor_bootimg_addr(void);
 
 /**
- * set_abootimg_addr() - Set Android vendor boot image address
+ * set_avendor_bootimg_addr() - Set Android vendor boot image address
  *
  * Return: no returned results
  */

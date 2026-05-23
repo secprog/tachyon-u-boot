@@ -8,7 +8,6 @@
  * and the USB portion defaults to USB 2.0 (or is initialized by earlier firmware).
  */
 
-#include <common.h>
 #include <dm.h>
 #include <generic-phy.h>
 

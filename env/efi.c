@@ -11,6 +11,7 @@
 #include <efi_variable.h>
 #include <errno.h>
 #include <linux/stddef.h>
+#include <memalign.h>
 #include <asm/cache.h>
 #include <asm/global_data.h>
 
