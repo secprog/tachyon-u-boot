@@ -15,6 +15,7 @@
 #include <dm/util.h>
 #include <blk.h>
 #include <command.h>
+#include <debug_uart.h>
 #include <env.h>
 #include <part.h>
 #include <scsi.h>
@@ -86,6 +87,9 @@ typedef struct fs_context {
 
 int board_early_init_f(void)
 {
+	if (IS_ENABLED(CONFIG_DEBUG_UART))
+		printascii("\nTACHYON board_early_init_f\n");
+
 	qcom_mem_bank banks[CONFIG_NR_DRAM_BANKS] = {};
 	int num = qcom_parse_memory_smem(banks, CONFIG_NR_DRAM_BANKS);
 
