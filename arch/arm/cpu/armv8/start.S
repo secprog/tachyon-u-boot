@@ -53,6 +53,14 @@ _bss_end_ofs:
 	.quad	__bss_end - _start
 
 reset:
+	/*
+	 * Tachyon diagnostic: stop at the first ARM64 reset-vector code.
+	 * If serial still emits repeated 'C' with this patch, the stream is
+	 * not produced by code reached through U-Boot's normal reset path.
+	 */
+0:	wfi
+	b	0b
+
 	/* Allow the board to save important registers */
 	b	save_boot_params
 .globl	save_boot_params_ret
