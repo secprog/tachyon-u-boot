@@ -39,6 +39,7 @@
 #define ACK 0x06
 #define BSP 0x08
 #define NAK 0x15
+#define CRC_REQ 'Q'		/* Tachyon diagnostic: normally 'C' */
 #define CAN 0x18
 #define EOF 0x1A		/* ^Z for DOS officionados */
 
@@ -459,7 +460,7 @@ xyzModem_stream_open (connection_info_t * info, int *err)
   xyz.initial_time = get_timer(0);
   xyz.timeout = xyzModem_get_initial_timeout();
 
-  CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? 'C' : NAK));
+  CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? CRC_REQ : NAK));
 
   if (xyz.mode == xyzModem_xmodem)
     {
@@ -499,7 +500,7 @@ xyzModem_stream_open (connection_info_t * info, int *err)
 	  if (--crc_retries <= 0)
 	    xyz.crc_mode = false;
 	  CYGACC_CALL_IF_DELAY_US (5 * 100000);	/* Extra delay for startup */
-	  CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? 'C' : NAK));
+	  CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? CRC_REQ : NAK));
 	  xyz.total_retries++;
 	  ZM_DEBUG (zm_dprintf ("NAK (%d)\n", __LINE__));
 	}
@@ -603,7 +604,7 @@ xyzModem_stream_read (char *buf, int size, int *err)
 		  if (xyz.mode == xyzModem_ymodem)
 		    {
 		      CYGACC_COMM_IF_PUTC (*xyz.__chan,
-					   (xyz.crc_mode ? 'C' : NAK));
+					   (xyz.crc_mode ? CRC_REQ : NAK));
 		      xyz.total_retries++;
 		      ZM_DEBUG (zm_dprintf ("Reading Final Header\n"));
 		      stat = xyzModem_get_hdr ();
@@ -615,7 +616,7 @@ xyzModem_stream_read (char *buf, int size, int *err)
 		  xyz.at_eof = true;
 		  break;
 		}
-	      CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? 'C' : NAK));
+	      CYGACC_COMM_IF_PUTC (*xyz.__chan, (xyz.crc_mode ? CRC_REQ : NAK));
 	      xyz.total_retries++;
 	      ZM_DEBUG (zm_dprintf ("NAK (%d)\n", __LINE__));
 	    }
