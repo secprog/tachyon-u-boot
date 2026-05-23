@@ -5,9 +5,6 @@
 
 #include "qcom_defconfig"
 
-# Otherwise buildman thinks this isn't an ARM platform
-CONFIG_ARM=y
-
 CONFIG_DEBUG_UART=y
 CONFIG_DEBUG_UART_ANNOUNCE=y
 CONFIG_DEBUG_UART_BASE=0x994000

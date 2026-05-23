@@ -116,6 +116,8 @@ int acpi_get_table_revision(enum acpi_tables table)
 		return 5;
 	case ACPITAB_BERT:
 		return 1;
+	case ACPITAB_BGRT:
+		return 1;
 	case ACPITAB_SPCR:
 		return 2;
 	case ACPITAB_PPTT: /* ACPI 6.2: 1 */
