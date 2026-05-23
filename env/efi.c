@@ -25,6 +25,15 @@ DECLARE_GLOBAL_DATA_PTR;
 
 static const efi_guid_t env_efi_guid = ENV_EFI_VARIABLE_GUID;
 
+static efi_status_t env_efi_sync_variables(void)
+{
+#if defined(CONFIG_EFI_VARIABLE_FILE_STORE) && !defined(CONFIG_EFI_MM_COMM_TEE)
+	return efi_var_to_file();
+#else
+	return EFI_SUCCESS;
+#endif
+}
+
 static int env_efi_init_variables(void)
 {
 	efi_status_t ret;
@@ -96,7 +105,7 @@ static int env_efi_save(void)
 	if (ret != EFI_SUCCESS)
 		return -EIO;
 
-	ret = efi_var_to_file();
+	ret = env_efi_sync_variables();
 	if (ret != EFI_SUCCESS)
 		return -EIO;
 
@@ -119,7 +128,7 @@ static int env_efi_erase(void)
 	if (ret != EFI_SUCCESS && ret != EFI_NOT_FOUND)
 		return -EIO;
 
-	ret = efi_var_to_file();
+	ret = env_efi_sync_variables();
 	if (ret != EFI_SUCCESS)
 		return -EIO;
 
