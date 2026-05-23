@@ -15,6 +15,21 @@
 #include <linux/linkage.h>
 #include <system-constants.h>
 
+#if defined(CONFIG_DEBUG_UART) && CONFIG_IS_ENABLED(SERIAL)
+.macro	debug_mark label
+#if CONFIG_POSITION_INDEPENDENT
+	adrp	x0, \label
+	add	x0, x0, #:lo12:\label
+#else
+	ldr	x0, =\label
+#endif
+	bl	printascii
+.endm
+#else
+.macro	debug_mark label
+.endm
+#endif
+
 /*
  * This file handles the target-independent stages of the U-Boot
  * start-up where a C runtime environment is needed. Its entry point
@@ -94,16 +109,13 @@ ENTRY(_main)
 
 #if defined(CONFIG_DEBUG_UART) && CONFIG_IS_ENABLED(SERIAL)
 	bl	debug_uart_init
-	ldr	x0, =mark_debug_uart_ok
-	bl	printascii
+	debug_mark mark_debug_uart_ok
 #endif
 
-	ldr	x0, =mark_before_board_init_f
-	bl	printascii
+	debug_mark mark_before_board_init_f
 	mov	x0, #0
 	bl	board_init_f
-	ldr	x0, =mark_after_board_init_f
-	bl	printascii
+	debug_mark mark_after_board_init_f
 
 #if !defined(CONFIG_XPL_BUILD)
 /*
@@ -145,8 +157,7 @@ relocation_return:
  * Set up final (full) environment
  */
 	bl	c_runtime_cpu_setup		/* still call old routine */
-	ldr	x0, =mark_after_runtime_setup
-	bl	printascii
+	debug_mark mark_after_runtime_setup
 #endif /* !CONFIG_XPL_BUILD */
 #if !defined(CONFIG_XPL_BUILD) || CONFIG_IS_ENABLED(FRAMEWORK)
 #if defined(CONFIG_XPL_BUILD)
@@ -176,8 +187,7 @@ clear_loop:
 	b.lo	clear_loop
 
 	/* call board_init_r(gd_t *id, ulong dest_addr) */
-	ldr	x0, =mark_before_board_init_r
-	bl	printascii
+	debug_mark mark_before_board_init_r
 	mov	x0, x18				/* gd_t */
 	ldr	x1, [x18, #GD_RELOCADDR]	/* dest_addr */
 	b	board_init_r			/* PC relative jump */
