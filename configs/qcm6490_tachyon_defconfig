@@ -26,3 +26,12 @@ CONFIG_OF_LIBFDT_OVERLAY=y
 CONFIG_BOOTDELAY=-1
 
 CONFIG_CMD_PMIC=y
+
+# Minimal USB-C DisplayPort bring-up path. Keep optional DP features off
+# until the base link-training and framebuffer path are confirmed stable.
+CONFIG_QCOM_PMIC_GLINK=y
+CONFIG_CLK_QCOM_SC7280_DISPCC=y
+CONFIG_VIDEO_QCOM_TACHYON_DP=y
+# CONFIG_VIDEO_TACHYON_DP_AUDIO is not set
+# CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG is not set
+# CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE is not set
