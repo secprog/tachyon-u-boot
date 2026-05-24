@@ -4263,13 +4263,13 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
 
-	if (ret == -ETIMEDOUT) {
-			log_warning("DP minimal AUX orientation retry failed: %d; running full QMP pre-DPCD path\n",
-						ret);
+	if (ret) {
+		log_warning("DP minimal AUX orientation retry failed: %d; running full QMP pre-DPCD path\n",
+					ret);
 
-			ret = tachyon_dp_prepare_full_qmp_for_dpcd(priv);
-			if (!ret)
-					ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+		ret = tachyon_dp_prepare_full_qmp_for_dpcd(priv);
+		if (!ret)
+				ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
 	}
 
 	log_warning("DP wait sink done ret=%d final_orientation=%u\n",
