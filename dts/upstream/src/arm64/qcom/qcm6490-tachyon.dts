@@ -1597,9 +1597,14 @@
 		pinctrl-0 = <&usb1_sbu_default>;
 		mode-switch;
 		orientation-switch;
-		port {
-			usb1_sbu_mux: endpoint {
-				remote-endpoint = <&pmic_glink_sbu>;
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				usb1_sbu_mux: endpoint {
+					remote-endpoint = <&pmic_glink_sbu>;
+				};
 			};
 		};
 	};

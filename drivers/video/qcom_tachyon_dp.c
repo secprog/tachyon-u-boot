@@ -1168,7 +1168,7 @@ static bool tachyon_dp_apply_env_typec_override(struct tachyon_dp_priv *priv)
 	const char *orientation = env_get("tachyon_dp_force_orientation");
 	u32 pin;
 
-	if (!orientation)
+	if (!orientation || !*orientation)
 		return false;
 
 	if (!strcmp(orientation, "reverse"))
@@ -1179,7 +1179,7 @@ static bool tachyon_dp_apply_env_typec_override(struct tachyon_dp_priv *priv)
 	pin = tachyon_dp_env_u32("tachyon_dp_force_pin", 4);
 	priv->pin_assignment = pin;
 
-	log_warning("DP forced Type-C state: orientation=%u pin=%u\n",
+	log_warning("DP forced Type-C override active: orientation=%u pin=%u\n",
 		    priv->orientation, priv->pin_assignment);
 
 	return true;
@@ -1257,7 +1257,21 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 	if (!ofnode_valid(mux))
 		return -ENOENT;
 
-	log_warning("SBU mux request start\n");
+	log_warning("SBU mux request start: node=%s\n",
+		    ofnode_get_name(mux));
+
+	/* Debug: dump SBU mux node structure */
+	{
+		ofnode ports = ofnode_find_subnode(mux, "ports");
+		log_warning("SBU ports valid=%d name=%s\n",
+			    ofnode_valid(ports),
+			    ofnode_valid(ports) ? ofnode_get_name(ports) : "<none>");
+		if (ofnode_valid(ports)) {
+			ofnode port0 = ofnode_find_subnode(ports, "port@0");
+			log_warning("SBU port@0 valid=%d\n",
+				    ofnode_valid(port0));
+		}
+	}
 
 	ep = tachyon_dp_find_endpoint(mux, 0);
 	if (ofnode_valid(ep)) {
@@ -1301,6 +1315,50 @@ static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 		dm_gpio_set_value(&priv->sbu_enable, 1);
 
 	log_warning("SBU mux program done\n");
+}
+
+/*
+ * Release SBU mux GPIOs so repeated probe attempts succeed.
+ * Without this, a failed probe leaves GPIOs held and the next
+ * probe gets -EBUSY (-16).
+ */
+static void tachyon_dp_release_sbu_mux(struct tachyon_dp_priv *priv)
+{
+	if (dm_gpio_is_valid(&priv->sbu_enable)) {
+		dm_gpio_free(NULL, &priv->sbu_enable);
+		memset(&priv->sbu_enable, 0, sizeof(priv->sbu_enable));
+	}
+
+	if (dm_gpio_is_valid(&priv->sbu_select)) {
+		dm_gpio_free(NULL, &priv->sbu_select);
+		memset(&priv->sbu_select, 0, sizeof(priv->sbu_select));
+	}
+}
+
+/*
+ * Program QMP combo PHY Type-C select and DP mode before AUX init.
+ * On the SC7280/QCM6490, the QMP USB3-DP combo PHY must be told:
+ *   - DP mode (not USB3)
+ *   - Type-C orientation (which lanes map to which AUX/SBU pins)
+ * If this is not done, AUX transactions may never reach the sink.
+ */
+static void tachyon_dp_qmp_typec_dp_select(struct tachyon_dp_priv *priv)
+{
+	setbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL,
+		     QMP_DP_COM_DP_MODE);
+	clrbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL,
+		     QMP_DP_COM_USB3_MODE);
+
+	clrsetbits_le32(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL,
+			QMP_DP_COM_SW_PORTSELECT_VAL |
+			QMP_DP_COM_SW_PORTSELECT_MUX,
+			QMP_DP_COM_SW_PORTSELECT_MUX |
+			(priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+			 QMP_DP_COM_SW_PORTSELECT_VAL : 0));
+
+	log_warning("QMP Type-C after select: TYPEC_CTRL=%08x PHY_MODE_CTRL=%08x\n",
+		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL),
+		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL));
 }
 
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
@@ -1717,7 +1775,26 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	if (mot)
 		ctrl |= DP_AUX_TRANS_CTRL_NO_SEND_STOP;
 
+	/*
+	 * Log pre-GO state for diagnostics.  If the controller is not
+	 * idle (non-zero TRANS_CTRL) or STATUS already shows errors,
+	 * the transaction will likely fail before it begins.
+	 */
+	log_warning("AUX start: addr=%x i2c=%d read=%d mot=%d len=%zu ctrl=%08x status=%08x trans=%08x\n",
+		    addr, i2c, read, mot, len,
+		    readl(priv->aux + REG_DP_AUX_CTRL),
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
+
 	writel(ctrl, priv->aux + REG_DP_AUX_TRANS_CTRL);
+
+	/*
+	 * Confirm the GO bit was accepted.  If it doesn't read back as
+	 * set, the controller may be in reset or the clock may be gated.
+	 */
+	log_warning("AUX go: trans=%08x status=%08x\n",
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
+		    readl(priv->aux + REG_DP_AUX_STATUS));
 
 	for (i = 0; i < 250; i++) {
 		reg = readl(priv->aux + REG_DP_AUX_STATUS);
@@ -1729,8 +1806,9 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 
 	if (i == 250) {
 		priv->aux_timeouts++;
-		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu status=%08x trans=%08x\n",
+		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu ctrl=%08x status=%08x trans=%08x\n",
 			    addr, i2c, read, len,
+			    readl(priv->aux + REG_DP_AUX_CTRL),
 			    readl(priv->aux + REG_DP_AUX_STATUS),
 			    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
 		return -ETIMEDOUT;
@@ -3780,31 +3858,61 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
+	/* Print QMP base addresses for offset verification */
+	log_warning("DP QMP base: phy=%p phy_dp=%p\n",
+		    priv->phy, priv->phy_dp);
+	log_warning("DP QMP offsets: TYPEC_CTRL=%x PHY_MODE_CTRL=%x DP_PD_CTL=%x DP_STATUS=%x\n",
+		    (u32)QMP_V3_DP_COM_TYPEC_CTRL,
+		    (u32)QMP_V3_DP_COM_PHY_MODE_CTRL,
+		    (u32)(QMP_OFF_DP_PHY + QMP_DP_PHY_PD_CTL),
+		    (u32)(QMP_OFF_DP_PHY + QMP_V4_DP_PHY_STATUS));
+
+	/* Print DP core clock validity before any AUX/PHY work */
+	{
+		int ci;
+
+		for (ci = 0; ci < TACHYON_DP_CORE_CLK_COUNT; ci++)
+			log_warning("DP clk[%d] valid=%d\n",
+				    ci, priv->dp_clk_valid[ci]);
+	}
+
 	/*
-	 * Try env override first for bring-up. If set, skip PMIC-GLINK
-	 * entirely so we can test orientation/routing independently.
+	 * Try PMIC-GLINK first. If it fails, fall back to env override
+	 * or hardcoded default orientation.
 	 */
-	if (!tachyon_dp_apply_env_typec_override(priv)) {
-		ret = tachyon_dp_read_altmode(priv);
-		if (!ret) {
-			while (!ret && timeout > 0) {
-				mdelay(100);
-				timeout--;
-				ret = tachyon_dp_read_altmode(priv);
-			}
+	ret = tachyon_dp_read_altmode(priv);
+	if (!ret) {
+		while (!ret && timeout > 0) {
+			mdelay(100);
+			timeout--;
+			ret = tachyon_dp_read_altmode(priv);
 		}
 	}
 
 	if (ret <= 0) {
-		if (ret < 0)
-			log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
-				    ret);
-		else
-			log_warning("DP Alt-Mode timeout\n");
-		log_warning("DP falling back to default orientation\n");
-		priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
-		priv->pin_assignment = 4; /* Pin assignment E, 4 lanes */
+		/*
+		 * PMIC-GLINK failed. Try the env override as a user-
+		 * controlled fallback before resorting to hardcoded
+		 * defaults.
+		 */
+		if (!tachyon_dp_apply_env_typec_override(priv)) {
+			if (ret < 0)
+				log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
+					    ret);
+			else
+				log_warning("DP Alt-Mode timeout\n");
+			log_warning("DP falling back to default orientation\n");
+			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+			priv->pin_assignment = 4; /* Pin assignment E, 4 lanes */
+		}
 	}
+
+	/*
+	 * Program QMP Type-C select and DP mode BEFORE AUX init.
+	 * Without this, AUX may never be routed to the correct
+	 * Type-C lanes.
+	 */
+	tachyon_dp_qmp_typec_dp_select(priv);
 
 	/* Debug: print orientation and Type-C state before SBU mux */
 	log_warning("DP orientation=%u pin_assignment=%u lane_map=0x%x max_lanes=%u\n",
@@ -3837,16 +3945,44 @@ static int tachyon_dp_probe(struct udevice *dev)
 	 * Print QMP Type-C / DP PHY state before AUX init to verify
 	 * the PHY is in the correct mode for DP operation.
 	 */
-	log_warning("QMP TYPEC_CTRL=%08x PHY_MODE_CTRL=%08x\n",
+	log_warning("QMP before AUX init: TYPEC_CTRL=%08x PHY_MODE_CTRL=%08x\n",
 		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL),
 		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL));
-	log_warning("QMP DP PHY: PD_CTL=%08x STATUS=%08x\n",
+	log_warning("QMP before AUX init: PD_CTL=%08x STATUS=%08x\n",
 		    readl(priv->phy_dp + QMP_DP_PHY_PD_CTL),
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS));
 
 	log_warning("DP QMP/AUX init start\n");
 	tachyon_dp_qmp_aux_init(priv);
 	tachyon_dp_aux_hw_init(priv);
+
+	/*
+	 * Verify QMP DP PHY powerdown and clamp state after AUX init.
+	 * AUX requires:
+	 *   - AUX_PWRDN = 0  (not powered down)
+	 *   - DP_CLAMP_EN = 0 (clamp released)
+	 */
+	{
+		u32 pd = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+
+		log_warning("DP PHY after AUX init: PD_CTL=%08x STATUS=%08x AUX_PWRDN=%u CLAMP=%u\n",
+			    pd,
+			    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS),
+			    !!(pd & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
+			    !!(pd & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN));
+
+		/*
+		 * If AUX_PWRDN or DP_CLAMP_EN are still asserted, AUX will
+		 * never complete. Clear them explicitly.
+		 */
+		if (pd & (QMP_DP_PHY_PD_CTL_AUX_PWRDN |
+			  QMP_DP_PHY_PD_CTL_DP_CLAMP_EN)) {
+			log_warning("DP PHY: clearing AUX_PWRDN and/or DP_CLAMP_EN\n");
+			clrbits_le32(priv->phy_dp + QMP_DP_PHY_PD_CTL,
+				     QMP_DP_PHY_PD_CTL_AUX_PWRDN |
+				     QMP_DP_PHY_PD_CTL_DP_CLAMP_EN);
+		}
+	}
 
 	/* Print AUX controller state after init */
 	log_warning("DP AUX: CTRL=%08x STATUS=%08x TRANS_CTRL=%08x\n",
@@ -3859,8 +3995,10 @@ static int tachyon_dp_probe(struct udevice *dev)
 	log_warning("DP wait sink start\n");
 	ret = tachyon_dp_wait_sink(priv);
 	log_warning("DP wait sink done ret=%d\n", ret);
-	if (ret)
+	if (ret) {
+		tachyon_dp_release_sbu_mux(priv);
 		return ret;
+	}
 
 	ret = tachyon_dp_read_edid_modes(priv);
 	if (ret)
