@@ -22,49 +22,7 @@ CONFIG_OF_SYSTEM_SETUP=y
 
 CONFIG_DEFAULT_ENV_FILE="board/particle/tachyon/default.env"
 CONFIG_OF_LIBFDT_OVERLAY=y
-# Ignore persisted EFI env while debugging early boot. This forces default.env.
-# CONFIG_ENV_IS_IN_EFI is not set
-CONFIG_ENV_IS_NOWHERE=y
-CONFIG_ENV_SIZE=0x8000
-# CONFIG_EFI_VARIABLE_FILE_STORE is not set
-CONFIG_BOOTDELAY=-1
-# CONFIG_CMD_LOADB is not set
-# CONFIG_CMD_LOADS is not set
-# CONFIG_DEBUG_UART is not set
-# CONFIG_DEBUG_UART_ANNOUNCE is not set
-# CONFIG_DEBUG_UART_MSM_GENI is not set
 
-# CONFIG_BOOTMETH_ANDROID is not set
-# CONFIG_ANDROID_BOOT_IMAGE is not set
-# CONFIG_ANDROID_AB is not set
-# CONFIG_AVB_VERIFY is not set
-# CONFIG_CMD_ADTIMG is not set
-# CONFIG_CMD_ABOOTIMG is not set
-# CONFIG_CMD_BOOTI is not set
-# CONFIG_CMD_PART is not set
-# CONFIG_CMD_FS_GENERIC=y
-# CONFIG_EFI_PARTITION is not set
-# CONFIG_EFI_VARIABLE_FILE_STORE must NOT be set — conflicts with
-# CONFIG_EFI_MM_COMM_TEE=y from qcm6490_defconfig (mutually exclusive
-# Kconfig choice). EFI_MM_COMM_TEE delegates variable storage to
-# StandAloneMM in OP-TEE (RPMB-backed, authenticated — required for
-# Secure Boot key enrollment).
+CONFIG_BOOTDELAY=-1
 
 CONFIG_CMD_PMIC=y
-# CONFIG_CMD_SMBIOS is not set
-
-# CONFIG_QCOM_PMIC_GLINK is not set
-# CONFIG_VIDEO_QCOM_TACHYON_DP is not set
-# CONFIG_VIDEO_TACHYON_DP_AUDIO is not set
-# CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG is not set
-# CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE is not set
-# CONFIG_VIDEO_BPP32 is not set
-# CONFIG_CONSOLE_NORMAL is not set
-# CONFIG_VIDEO_ANSI is not set
-
-# CONFIG_SYS_ARCH_TIMER is not set
-# CONFIG_TIMER is not set
-
-# CONFIG_CLK_QCOM_SC7280_DISPCC is not set
-
-# CONFIG_USB_QCOM_DWC3_STUB is not set
