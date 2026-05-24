@@ -612,7 +612,12 @@ static bool qpg_done_pan_ack(struct qpg *pg,
 static bool qpg_done_altmode(struct qpg *pg,
 			     struct qcom_pmic_glink_altmode *altmode)
 {
-	return altmode->dp && altmode->hpd &&
+	/*
+	 * Accept DP Alt Mode entry regardless of HPD state.
+	 * HPD can assert later; the display driver polls DPCD
+	 * until the sink responds.
+	 */
+	return altmode->dp &&
 	       altmode->orientation != QCOM_PMIC_GLINK_ORIENTATION_NONE;
 }
 
