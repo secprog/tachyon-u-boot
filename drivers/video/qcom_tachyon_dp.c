@@ -337,6 +337,22 @@
 #define QMP_DP_PHY_PD_CTL_PLL_PWRDN	BIT(5)
 #define QMP_DP_PHY_PD_CTL_DP_CLAMP_EN	BIT(6)
 
+/* QMP COM control registers — from Linux phy-qcom-qmp-dp-com-v3.h model */
+#define QMP_V3_DP_COM_POWER_DOWN_CTRL	0x004
+#define QMP_V3_DP_COM_RESET_OVRD_CTRL	0x01c
+#define QMP_V3_DP_COM_SWI_CTRL		0x020
+#define QMP_V3_DP_COM_SW_RESET		0x038
+
+#define QMP_DP_COM_SW_PWRDN		BIT(0)
+
+#define QMP_DP_COM_SW_DPPHY_RESET	BIT(0)
+#define QMP_DP_COM_SW_DPPHY_RESET_MUX	BIT(1)
+#define QMP_DP_COM_SW_USB3PHY_RESET	BIT(2)
+#define QMP_DP_COM_SW_USB3PHY_RESET_MUX BIT(3)
+
+#define QMP_DP_COM_SW_RESET		BIT(0)
+#define QMP_DP_COM_SWI_CTRL_MASK	GENMASK(1, 0)
+
 #define TACHYON_DP_AUX_DEBOUNCE_TRIES	20
 #define TACHYON_DP_CORE_CLK_COUNT	4
 #define TACHYON_DPU_CLK_COUNT		6
@@ -455,6 +471,9 @@ static int tachyon_dp_request_core_clocks(struct udevice *dev,
 
 static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
 {
+	static const char * const names[TACHYON_DP_CORE_CLK_COUNT] = {
+		"core_iface", "core_aux", "ctrl_link", "ctrl_link_iface",
+	};
 	int i, ret;
 
 	for (i = 0; i < TACHYON_DP_CORE_CLK_COUNT; i++) {
@@ -462,10 +481,11 @@ static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
 			continue;
 		ret = clk_enable(&priv->dp_clks[i]);
 		if (ret && ret != -ENOSYS) {
-			log_warning("Failed to enable DP core clock %d: %d\n",
-				    i, ret);
+			log_warning("Failed to enable DP core clock %s: %d\n",
+				    names[i], ret);
 			return ret;
 		}
+		log_warning("DP clk %s enable ret=%d\n", names[i], ret);
 	}
 
 	return 0;
@@ -1374,6 +1394,110 @@ static void tachyon_dp_release_sbu_mux(struct tachyon_dp_priv *priv)
  * read path returns replicated bytes.  Use direct writel() with the
  * fully-computed value instead.
  */
+
+/*
+ * Helper to read the low byte of a QMP COM register.
+ * QMP COM registers are byte-style — only bits [7:0] are meaningful.
+ */
+static u8 tachyon_dp_qmp_com_readb(struct tachyon_dp_priv *priv, u32 reg)
+{
+	return readl(priv->phy + reg) & 0xff;
+}
+
+/*
+ * Dump the QMP COM control and status register set for diagnostics.
+ */
+static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
+				    const char *tag)
+{
+	log_warning("QMP COM %s: PWR=%02x RESET_OVRD=%02x SW_RESET=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x\n",
+		    tag,
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
+		    readl(priv->phy + QMP_OFF_DP_SERDES +
+			  QMP_V4_COM_C_READY_STATUS) & 0xff,
+		    readl(priv->phy + QMP_OFF_DP_SERDES +
+			  QMP_V4_COM_CMN_STATUS) & 0xff);
+}
+
+/*
+ * Initialize the QMP COM (common SerDes) block before DP AUX bring-up.
+ * This is the minimal subset of Linux's qmp_combo_com_init() needed for
+ * the SC7280/QCM6490 QMP USB3-DP combo PHY.
+ *
+ * The sequence:
+ *   1. Power the COM block
+ *   2. Take software control of DP and USB3 PHY resets (assert both)
+ *   3. Program Type-C orientation and DP-only mode
+ *   4. Release DP PHY reset (keep USB3 reset asserted for DP-only)
+ *   5. Release COM software reset / SWI hold
+ */
+static void tachyon_dp_qmp_com_init(struct tachyon_dp_priv *priv)
+{
+	u32 typec;
+
+	log_warning("QMP bases: phy=%p serdes=%p tx0=%p tx1=%p dp=%p\n",
+		    priv->phy,
+		    (u8 __iomem *)priv->phy + QMP_OFF_DP_SERDES,
+		    (u8 __iomem *)priv->phy + QMP_OFF_DP_TX0,
+		    (u8 __iomem *)priv->phy + QMP_OFF_DP_TX1,
+		    priv->phy_dp);
+
+	tachyon_dp_qmp_com_dump(priv, "before-init");
+
+	/*
+	 * Power the COM block and take software control of PHY resets.
+	 * Match Linux qmp_combo_com_init() order: power first, then
+	 * override resets so the reset controls are owned by software.
+	 */
+	writel(QMP_DP_COM_SW_PWRDN,
+	       priv->phy + QMP_V3_DP_COM_POWER_DOWN_CTRL);
+
+	writel(QMP_DP_COM_SW_DPPHY_RESET_MUX |
+	       QMP_DP_COM_SW_DPPHY_RESET |
+	       QMP_DP_COM_SW_USB3PHY_RESET_MUX |
+	       QMP_DP_COM_SW_USB3PHY_RESET,
+	       priv->phy + QMP_V3_DP_COM_RESET_OVRD_CTRL);
+
+	/* Program Type-C orientation */
+	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
+	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
+		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
+
+	writel(typec, priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+
+	/*
+	 * DP-only mode for pre-DPCD bring-up.
+	 * Later, if USB3+DP concurrent mode is required, this can become
+	 * QMP_DP_COM_USB3_MODE | QMP_DP_COM_DP_MODE depending on the
+	 * negotiated Type-C pin assignment.
+	 */
+	writel(QMP_DP_COM_DP_MODE,
+	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+
+	/*
+	 * Release DP PHY reset.
+	 * Keep USB3 reset asserted for this DP-only pre-DPCD test.
+	 */
+	writel(QMP_DP_COM_SW_USB3PHY_RESET_MUX |
+	       QMP_DP_COM_SW_USB3PHY_RESET,
+	       priv->phy + QMP_V3_DP_COM_RESET_OVRD_CTRL);
+
+	/*
+	 * Release COM software reset / SWI hold.
+	 */
+	writel(0x00, priv->phy + QMP_V3_DP_COM_SWI_CTRL);
+	writel(0x00, priv->phy + QMP_V3_DP_COM_SW_RESET);
+
+	udelay(100);
+
+	tachyon_dp_qmp_com_dump(priv, "after-init");
+}
+
 static void tachyon_dp_qmp_typec_dp_select(struct tachyon_dp_priv *priv)
 {
 	u32 typec;
@@ -3710,6 +3834,9 @@ static void tachyon_dp_prepare_aux_for_orientation(
 	log_warning("DP prepare AUX orientation=%u pin=%u\n",
 		    priv->orientation, priv->pin_assignment);
 
+	/* Initialize QMP COM block (resets, mode, Type-C) before AUX */
+	tachyon_dp_qmp_com_init(priv);
+
 	/* Reprogram QMP Type-C select and DP mode */
 	tachyon_dp_qmp_typec_dp_select(priv);
 
@@ -3810,6 +3937,10 @@ static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
 
 	log_warning("DP full QMP pre-DPCD configure: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
+
+	tachyon_dp_qmp_com_dump(priv, "probe-before-com-init");
+
+	tachyon_dp_qmp_com_init(priv);
 
 	ret = tachyon_dp_qmp_configure(priv);
 
