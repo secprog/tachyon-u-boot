@@ -12,6 +12,17 @@ config PHY_QCOM_IPQ4019_USB
 	help
 	  Support for the USB PHY-s on Qualcomm IPQ40xx SoC-s.
 
+config PHY_QCOM_QMP_COMBO
+	bool "Qualcomm QMP USB3-DP Combo PHY driver"
+	depends on PHY && ARCH_SNAPDRAGON
+	help
+	  Enable this to support the USB3-DP Combo QMP PHY on Qualcomm
+	  SC7280/QCS6490/QCM6490 class SoCs.
+
+	  This downstream backport accepts both USB3 and DP PHY slots. The
+	  DP slot currently performs common QMP COM clock/reset/regulator
+	  bring-up; Tachyon DP still handles board-specific AUX/link setup.
+
 config PHY_QCOM_QMP_PCIE
 	tristate "Qualcomm QMP PCIe PHY driver"
 	depends on PHY && ARCH_SNAPDRAGON
@@ -64,8 +75,9 @@ config PHY_QCOM_USB_SS
 	  Qualcomm chipsets.
 
 config USB_QCOM_DWC3_STUB
-	bool "Qualcomm SC7280 QMP USB PHY stub"
+	bool "Qualcomm SC7280 QMP USB PHY stub compatibility option"
 	depends on PHY && ARCH_SNAPDRAGON
+	select PHY_QCOM_QMP_COMBO
 	help
 	  Enable this to support the QMP USB PHY stub on the Snapdragon
 	  SC7280/QCM6490 SoC. This provides the minimal PHY initialization

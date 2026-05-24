@@ -283,7 +283,7 @@ static int qmp_combo_com_exit(struct qmp_combo *qmp)
 	return 0;
 }
 
-static int qmp_combo_com_init(struct qmp_combo *qmp)
+static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 {
 	void __iomem *com = qmp->com;
 	void __iomem *pcs = qmp->pcs;
@@ -335,11 +335,23 @@ static int qmp_combo_com_init(struct qmp_combo *qmp)
 	val = SW_PORTSELECT_MUX;
 	writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
 
-	writel(USB3_MODE | DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+	if (phy_id == QMP_USB43DP_DP_PHY) {
+		/*
+		 * DP consumer path: only initialize the QMP common block
+		 * and release DP reset. The Tachyon DP driver still owns
+		 * DP AUX/link/PHY programming during bring-up.
+		 */
+		writel(DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
 
-	qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
-		     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
-		     SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+			     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET);
+	} else {
+		writel(USB3_MODE | DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+
+		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+			     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
+			     SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+	}
 
 	qphy_clrbits(com, QPHY_V3_DP_COM_SWI_CTRL, 0x03);
 
@@ -416,12 +428,16 @@ static int qmp_combo_power_on(struct phy *phy)
 	struct qmp_combo *qmp = dev_get_priv(phy->dev);
 	int ret;
 
-	/* Initialize common block */
-	ret = qmp_combo_com_init(qmp);
+	ret = qmp_combo_com_init(qmp, phy->id);
 	if (ret)
 		return ret;
 
-	/* Initialize USB3-specific configuration */
+	if (phy->id == QMP_USB43DP_DP_PHY) {
+		dev_info(qmp->dev, "QMP combo DP slot: COM init only
+");
+		return 0;
+	}
+
 	ret = qmp_combo_usb_power_on(qmp);
 	if (ret) {
 		qmp_combo_com_exit(qmp);
@@ -436,19 +452,18 @@ static int qmp_combo_power_off(struct phy *phy)
 	struct qmp_combo *qmp = dev_get_priv(phy->dev);
 	void __iomem *com = qmp->com;
 
-	clk_disable(qmp->pipe_clk);
+	if (phy->id != QMP_USB43DP_DP_PHY) {
+		clk_disable(qmp->pipe_clk);
 
-	/* PHY reset */
-	qphy_setbits(qmp->pcs, QPHY_V4_PCS_SW_RESET, SW_RESET);
+		qphy_setbits(qmp->pcs, QPHY_V4_PCS_SW_RESET, SW_RESET);
 
-	/* Stop SerDes and Phy-Coding-Sublayer */
-	qphy_clrbits(qmp->pcs, QPHY_V4_PCS_START_CONTROL,
-		     SERDES_START | PCS_START);
+		qphy_clrbits(qmp->pcs, QPHY_V4_PCS_START_CONTROL,
+			     SERDES_START | PCS_START);
 
-	/* Put PHY into POWER DOWN state: active low */
-	qphy_clrbits(qmp->pcs, QPHY_V4_PCS_POWER_DOWN_CONTROL, SW_PWRDN);
+		qphy_clrbits(qmp->pcs, QPHY_V4_PCS_POWER_DOWN_CONTROL,
+			     SW_PWRDN);
+	}
 
-	/* Power down common block */
 	qphy_clrbits(com, QPHY_V3_DP_COM_POWER_DOWN_CTRL, SW_PWRDN);
 
 	return qmp_combo_com_exit(qmp);
@@ -509,15 +524,22 @@ static int qmp_combo_vreg_init(struct qmp_combo *qmp)
 
 	for (i = 0; i < num; i++) {
 		ret = device_get_supply_regulator(dev, cfg->vreg_list[i],
-						  &qmp->vregs[i]);
+						  &qmp->vregs[qmp->num_vregs]);
 		if (ret) {
-			dev_err(dev, "failed to get regulator %s: %d\n",
-				cfg->vreg_list[i], ret);
-			return ret;
+			/*
+			 * Some downstream SC7280/QCS6490 device trees omit
+			 * QMP supply phandles. Keep this non-fatal for DP
+			 * bring-up so reset/clock/COM init can still be tested.
+			 */
+			dev_warn(dev, "regulator %s unavailable: %d
+",
+				 cfg->vreg_list[i], ret);
+			continue;
 		}
+
+		qmp->num_vregs++;
 	}
 
-	qmp->num_vregs = num;
 	return 0;
 }
 
@@ -606,15 +628,16 @@ static const struct qmp_phy_cfg sc7280_usb3dpphy_cfg = {
 static int qmp_combo_xlate(struct phy *phy, struct ofnode_phandle_args *args)
 {
 	if (args->args_count != 1) {
-		debug("Invalid args_count: %d\n", args->args_count);
+		debug("Invalid args_count: %d
+", args->args_count);
 		return -EINVAL;
 	}
 
-	/* We only support the USB3 phy at slot 0 */
-	if (args->args[0] == QMP_USB43DP_DP_PHY)
+	if (args->args[0] != QMP_USB43DP_USB3_PHY &&
+	    args->args[0] != QMP_USB43DP_DP_PHY)
 		return -EINVAL;
 
-	phy->id = QMP_USB43DP_USB3_PHY;
+	phy->id = args->args[0];
 
 	return 0;
 }

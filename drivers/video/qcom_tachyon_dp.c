@@ -18,6 +18,7 @@
 #include <edid.h>
 #include <env.h>
 #include <fdtdec.h>
+#include <generic-phy.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/kernel.h>
@@ -410,9 +411,11 @@ struct tachyon_dp_priv {
 	struct clk pixel_clk;
 	struct clk dp_clks[TACHYON_DP_CORE_CLK_COUNT];
 	struct clk dpu_clks[TACHYON_DPU_CLK_COUNT];
+	struct phy qmp_phy;
 	bool has_pixel_clk;
 	bool dp_clk_valid[TACHYON_DP_CORE_CLK_COUNT];
 	bool dpu_clk_valid[TACHYON_DPU_CLK_COUNT];
+	bool has_qmp_phy;
 	struct gpio_desc sbu_enable;
 	struct gpio_desc sbu_select;
 	struct tachyon_dp_caps caps;
@@ -1604,7 +1607,8 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 	fdt_size_t size;
 	int ret;
 
-	ret = dev_read_phandle_with_args(dev, "phys", "#phy-cells", 0, 0, &args);
+	ret = dev_read_phandle_with_args(dev, "phys", "#phy-cells", 0, 0,
+					 &args);
 	if (ret)
 		return ret;
 
@@ -1614,6 +1618,26 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 
 	priv->phy = map_sysmem(addr, size);
 	priv->phy_dp = (void __iomem *)((u8 __iomem *)priv->phy + QMP_OFF_DP_PHY);
+
+	/*
+	 * Let the QMP combo PHY provider perform the common Linux-style
+	 * clock/reset/regulator/COM bring-up before this board driver directly
+	 * programs DP AUX/link registers.
+	 */
+	ret = generic_phy_get_by_index(dev, 0, &priv->qmp_phy);
+	if (ret) {
+		log_warning("QMP generic PHY get failed: %d
+", ret);
+	} else {
+		priv->has_qmp_phy = true;
+
+		ret = generic_phy_init(&priv->qmp_phy);
+		log_warning("QMP generic PHY init ret=%d id=%lu
+",
+			    ret, priv->qmp_phy.id);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
