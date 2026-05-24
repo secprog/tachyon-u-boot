@@ -1137,12 +1137,15 @@ static bool tachyon_dp_known_timing(u32 width, u32 height,
 
 static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv);
 
-static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
+static int tachyon_dp_read_altmode(struct tachyon_dp_priv *priv)
 {
 	struct qcom_pmic_glink_altmode glink_altmode;
 	int ret;
 
 	ret = qcom_pmic_glink_get_altmode(&glink_altmode);
+	if (ret)
+		return ret;
+
 	if (!ret && glink_altmode.dp && glink_altmode.hpd) {
 		priv->orientation =
 			glink_altmode.orientation ==
@@ -1152,11 +1155,15 @@ static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
 		priv->pin_assignment = glink_altmode.pin_assignment;
 		log_info("DP Alt-Mode confirmed via PMIC-GLINK: orientation=%u pin=%u\n",
 			 priv->orientation, priv->pin_assignment);
-		return true;
+		return 1;
 	}
 
-	log_warning("DP Alt-Mode not confirmed by PMIC-GLINK: %d\n", ret);
-	return false;
+	return 0;
+}
+
+static bool tachyon_dp_altmode_ready(struct tachyon_dp_priv *priv)
+{
+	return tachyon_dp_read_altmode(priv) > 0;
 }
 
 static int tachyon_dp_refresh_altmode(struct tachyon_dp_priv *priv,
@@ -1195,6 +1202,8 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 	if (!ofnode_valid(mux))
 		return -ENOENT;
 
+	log_warning("SBU mux request start\n");
+
 	ep = tachyon_dp_find_endpoint(mux, 0);
 	if (ofnode_valid(ep)) {
 		remote = ofnode_parse_phandle(ep, "remote-endpoint", 0);
@@ -1206,19 +1215,26 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 
 	ret = gpio_request_by_name_nodev(mux, "enable-gpios", 0,
 					 &priv->sbu_enable, GPIOD_IS_OUT);
+	log_warning("SBU enable GPIO request ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = gpio_request_by_name_nodev(mux, "select-gpios", 0,
 					 &priv->sbu_select, GPIOD_IS_OUT);
+	log_warning("SBU select GPIO request ret=%d\n", ret);
 	if (ret)
 		return ret;
+
+	log_warning("SBU mux request done\n");
 
 	return 0;
 }
 
 static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 {
+	log_warning("SBU mux program start orientation=%u pin=%u\n",
+		    priv->orientation, priv->pin_assignment);
+
 	if (dm_gpio_is_valid(&priv->sbu_select))
 		dm_gpio_set_value(&priv->sbu_select,
 				  priv->orientation ==
@@ -1228,6 +1244,8 @@ static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 
 	if (dm_gpio_is_valid(&priv->sbu_enable))
 		dm_gpio_set_value(&priv->sbu_enable, 1);
+
+	log_warning("SBU mux program done\n");
 }
 
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
@@ -3673,13 +3691,22 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
-	while (!tachyon_dp_altmode_ready(priv) && timeout > 0) {
-		mdelay(100);
-		timeout--;
+	ret = tachyon_dp_read_altmode(priv);
+	if (!ret) {
+		while (!ret && timeout > 0) {
+			mdelay(100);
+			timeout--;
+			ret = tachyon_dp_read_altmode(priv);
+		}
 	}
 
-	if (!timeout) {
-		log_warning("DP Alt-Mode timeout, falling back to default orientation\n");
+	if (ret <= 0) {
+		if (ret < 0)
+			log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
+				    ret);
+		else
+			log_warning("DP Alt-Mode timeout\n");
+		log_warning("DP falling back to default orientation\n");
 		priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
 		priv->pin_assignment = 4; /* Pin assignment E, 4 lanes */
 	}
@@ -3690,10 +3717,14 @@ static int tachyon_dp_probe(struct udevice *dev)
 	else
 		tachyon_dp_program_sbu_mux(priv);
 
+	log_warning("DP QMP/AUX init start\n");
 	tachyon_dp_qmp_aux_init(priv);
 	tachyon_dp_aux_hw_init(priv);
+	log_warning("DP QMP/AUX init done\n");
 
+	log_warning("DP wait sink start\n");
 	ret = tachyon_dp_wait_sink(priv);
+	log_warning("DP wait sink done ret=%d\n", ret);
 	if (ret)
 		return ret;
 

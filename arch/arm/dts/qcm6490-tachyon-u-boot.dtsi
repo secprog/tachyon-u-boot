@@ -51,6 +51,14 @@
 	bootph-all;
 };
 
+&{/smem} {
+	bootph-all;
+};
+
+&smem_mem {
+	bootph-all;
+};
+
 &usb_1_qmpphy {
 	bootph-all;
 };
