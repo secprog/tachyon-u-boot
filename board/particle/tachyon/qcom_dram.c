@@ -11,7 +11,6 @@
 #include <log.h>
 #include <sort.h>
 #include <smem.h>
-#include <string.h>
 #include <dm/device-internal.h>
 
 int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t nbanks)
