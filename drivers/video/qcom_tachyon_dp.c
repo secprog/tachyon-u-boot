@@ -3801,6 +3801,32 @@ static int tachyon_dp_wait_sink_auto_orientation(
 	return ret;
 }
 
+static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
+{
+	int ret;
+
+	priv->rate = DP_LINK_RATE_RBR;
+	priv->lanes = priv->max_lanes ? priv->max_lanes : 4;
+
+	log_warning("DP full QMP pre-DPCD configure: rate=%u lanes=%u orientation=%u\n",
+		    priv->rate, priv->lanes, priv->orientation);
+
+	ret = tachyon_dp_qmp_configure(priv);
+
+	log_warning("DP full QMP pre-DPCD configure ret=%d PD=%02x STATUS=%02x\n",
+		    ret,
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+
+	if (ret)
+		return ret;
+
+	tachyon_dp_qmp_force_aux_on(priv);
+	tachyon_dp_aux_hw_init(priv);
+	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+
+	return 0;
+}
 
 #ifdef CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG
 
@@ -4235,7 +4261,13 @@ static int tachyon_dp_probe(struct udevice *dev)
 	 */
 	log_warning("DP wait sink start with auto-orientation\n");
 
-	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+	if (tachyon_dp_env_bool("tachyon_dp_pre_dpcd_full_qmp")) {
+		ret = tachyon_dp_prepare_full_qmp_for_dpcd(priv);
+		if (!ret)
+			ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+	} else {
+		ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+	}
 
 	log_warning("DP wait sink done ret=%d final_orientation=%u\n",
 		    ret, priv->orientation);
