@@ -37,6 +37,10 @@
 	// RAM Entry 3 : Base 0x0100000000  Size 0x0100000000
 };
 
+&mdss {
+	compatible = "qcom,sc7280-mdss", "simple-bus";
+};
+
 /* Enable USB-C Display (DP Alt Mode) */
 &usb_1 {
 	dr_mode = "host";
