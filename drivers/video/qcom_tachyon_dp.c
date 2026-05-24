@@ -338,10 +338,11 @@
 #define QMP_DP_PHY_PD_CTL_DP_CLAMP_EN	BIT(6)
 
 /* QMP COM control registers — from Linux phy-qcom-qmp-dp-com-v3.h model */
-#define QMP_V3_DP_COM_POWER_DOWN_CTRL	0x004
+#define QMP_V3_DP_COM_SW_RESET		0x004
+#define QMP_V3_DP_COM_POWER_DOWN_CTRL	0x008
+#define QMP_V3_DP_COM_SWI_CTRL		0x00c
+#define QMP_V3_DP_COM_TYPEC_PWRDN_CTRL	0x014
 #define QMP_V3_DP_COM_RESET_OVRD_CTRL	0x01c
-#define QMP_V3_DP_COM_SWI_CTRL		0x020
-#define QMP_V3_DP_COM_SW_RESET		0x038
 
 #define QMP_DP_COM_SW_PWRDN		BIT(0)
 
