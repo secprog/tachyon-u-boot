@@ -4001,4 +4001,5 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.ops		= &tachyon_dp_ops,
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
+	.flags		= DM_FLAG_PRE_RELOC,
 };
