@@ -11,14 +11,6 @@
 
 #define CFG_SYS_BAUDRATE_TABLE	{ 115200, 230400, 460800, 921600 }
 
-/*
- * Snapdragon boards supported by this shared config currently use the
- * APSS GICv3 block at the same base addresses. ARMv8 start.S needs these
- * constants when CONFIG_GICV3 is enabled.
- */
-#define GICD_BASE			0x17a00000
-#define GICR_BASE			0x17a60000
-
 // 2a5aa852-b856-4d97-baa9-5c5f4421551f
 #define QUALCOMM_UBOOT_BOOT_IMAGE_GUID \
 	EFI_GUID(0x2a5aa852, 0xb856, 0x4d97, 0xba, 0xa9, \
