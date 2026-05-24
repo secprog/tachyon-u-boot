@@ -12,7 +12,6 @@
 #include <net.h>
 #include <net6.h>
 #include <vsprintf.h>
-#include <debug_uart.h>
 
 struct in_addr string_to_ip(const char *s)
 {
