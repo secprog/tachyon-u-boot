@@ -3637,14 +3637,19 @@ static int tachyon_dp_probe(struct udevice *dev)
 	u32 width, height;
 	int ret, timeout = 50;
 
+	log_warning("DP probe start\n");
+
 	priv->ctrl = dev_remap_addr_index(dev, 0);
 	priv->aux = dev_remap_addr_index(dev, 1);
 	priv->link = dev_remap_addr_index(dev, 2);
 	priv->p0 = dev_remap_addr_name(dev, "p0");
 	if (!priv->p0)
 		priv->p0 = dev_remap_addr_index(dev, 3);
-	if (!priv->ctrl || !priv->aux || !priv->link)
+	if (!priv->ctrl || !priv->aux || !priv->link) {
+		log_warning("DP register remap failed ctrl=%p aux=%p link=%p\n",
+			    priv->ctrl, priv->aux, priv->link);
 		return -EINVAL;
+	}
 
 	tachyon_dp_parse_graph(dev, priv);
 	tachyon_dp_request_core_clocks(dev, priv);
@@ -3758,6 +3763,10 @@ static int tachyon_dp_probe(struct udevice *dev)
 	ret = tachyon_dp_program_mainlink(priv);
 	if (ret)
 		return ret;
+
+	log_warning("DP ready: %ux%u fb=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
+		    width, height, (ulong)plat->base, (ulong)plat->size,
+		    priv->aux_timeouts, priv->aux_nacks, priv->aux_retries);
 
 	log_info("DP framebuffer base=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
 		 (ulong)plat->base, (ulong)plat->size, priv->aux_timeouts,
