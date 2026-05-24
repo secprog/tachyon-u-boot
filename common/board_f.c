@@ -27,7 +27,6 @@
 #include <hang.h>
 #include <i2c.h>
 #include <init.h>
-#include <debug_uart.h>
 #include <initcall.h>
 #include <log.h>
 #include <malloc.h>
