@@ -3737,70 +3737,6 @@ static int tachyon_dp_wait_sink_auto_orientation(
 	return ret;
 }
 
-/*
- * Full QMP DP PHY pre-configuration fallback.
- * If minimal AUX init isn't enough, bring up the full QMP DP PHY
- * (same sequence used for link training) before retrying orientation.
- */
-static int __maybe_unused tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
-{
-	int ret;
-
-	/* DPCD caps are unknown — use conservative defaults */
-	priv->rate = DP_LINK_RATE_RBR;
-	priv->lanes = priv->max_lanes ? priv->max_lanes : 4;
-
-	log_warning("DP full QMP pre-DPCD configure: rate=%u lanes=%u orientation=%u\n",
-		    priv->rate, priv->lanes, priv->orientation);
-
-	ret = tachyon_dp_qmp_configure(priv);
-
-	log_warning("DP full QMP pre-DPCD configure ret=%d STATUS=%02x PD=%02x\n",
-		    ret,
-		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff,
-		    readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff);
-
-	if (ret)
-		return ret;
-
-	/*
-	 * qmp_configure() may rewrite PD_CTL.  Force AUX path open again
-	 * and reset the AUX controller.
-	 */
-	tachyon_dp_qmp_force_aux_on(priv);
-	tachyon_dp_aux_hw_init(priv);
-	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
-
-	return 0;
-}
-
-/* Two-level fallback: orientation retry, then full QMP + orientation retry. */
-static int __maybe_unused tachyon_dp_wait_sink_auto_orientation_full_qmp_fallback(
-		struct tachyon_dp_priv *priv)
-{
-	enum tachyon_dp_orientation saved = priv->orientation;
-	int ret;
-
-	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
-	if (!ret)
-		return 0;
-
-	log_warning("DP minimal AUX orientation retry failed: %d; trying full QMP pre-DPCD fallback\n",
-		    ret);
-
-	priv->orientation = saved;
-
-	ret = tachyon_dp_prepare_full_qmp_for_dpcd(priv);
-	if (ret)
-		return ret;
-
-	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
-	if (!ret)
-		return 0;
-
-	log_warning("DP full QMP pre-DPCD fallback failed: %d\n", ret);
-	return ret;
-}
 
 #ifdef CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG
 
@@ -4229,12 +4165,9 @@ static int tachyon_dp_probe(struct udevice *dev)
 	tachyon_dp_program_sbu_mux(priv);
 
 	/*
-	 * Wait for DPCD using automatic orientation retry.
-	 * If the first orientation times out, the opposite orientation
-	 * is tried automatically.  Keep full mainlink PHY bring-up out of
-	 * this pre-DPCD path; the current QMP configure sequence powers down
-	 * and clamps the DP PHY when link status is unavailable, which hides
-	 * the real AUX routing/power state.
+	 * Wait for DPCD using minimal AUX bring-up and automatic Type-C
+	 * orientation retry. Do not run the full QMP mainlink configure
+	 * sequence here; DPCD must work before link-training policy is known.
 	 */
 	log_warning("DP wait sink start with auto-orientation\n");
 
