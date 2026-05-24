@@ -1429,6 +1429,49 @@ static void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv)
 		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN));
 }
 
+static u8 tachyon_dp_qmp_pd_low(struct tachyon_dp_priv *priv)
+{
+	return readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
+}
+
+static u8 tachyon_dp_qmp_status_low(struct tachyon_dp_priv *priv)
+{
+	return readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff;
+}
+
+static void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
+{
+	u8 pd = QMP_DP_PHY_PD_CTL_PWRDN |
+		QMP_DP_PHY_PD_CTL_PSR_PWRDN |
+		QMP_DP_PHY_PD_CTL_AUX_PWRDN |
+		QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN |
+		QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN |
+		QMP_DP_PHY_PD_CTL_PLL_PWRDN |
+		QMP_DP_PHY_PD_CTL_DP_CLAMP_EN;
+
+	writel(pd, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+
+	log_warning("QMP DP power-down: PD=%02x STATUS=%02x\n",
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+}
+
+static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
+{
+	/*
+	 * Bring the DP PHY out of powerdown/clamp. For first bring-up,
+	 * power all lanes and AUX. Lane-specific power gating can be
+	 * restored after AUX and DPCD work.
+	 */
+	writel(0x00, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+
+	log_warning("QMP DP power-up all lanes: PD=%02x STATUS=%02x\n",
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+}
+
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
 {
 	struct ofnode_phandle_args args;
@@ -1463,6 +1506,27 @@ static int tachyon_dp_read_poll(void __iomem *base, u32 reg, u32 mask,
 	}
 
 	return -ETIMEDOUT;
+}
+
+static int tachyon_dp_qmp_poll(struct tachyon_dp_priv *priv,
+			       void __iomem *base, u32 reg,
+			       u32 mask, u32 value,
+			       const char *name)
+{
+	int ret;
+
+	ret = tachyon_dp_read_poll(base, reg, mask, value, 10000);
+
+	log_warning("QMP poll %-18s ret=%d val=%02x mask=%02x want=%02x PD=%02x DP_STATUS=%02x\n",
+		    name,
+		    ret,
+		    readl(base + reg) & 0xff,
+		    mask & 0xff,
+		    value & 0xff,
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+
+	return ret;
 }
 
 static void tachyon_qmp_write_table(void __iomem *base,
@@ -1696,7 +1760,6 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	u32 mode = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
 		   0x4c : 0x5c;
 	u32 typec;
-	u32 pd_ctl;
 	u32 vco_div;
 	int ret;
 
@@ -1720,16 +1783,7 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 
 	tachyon_dp_qmp_aux_init(priv);
 
-	pd_ctl = QMP_DP_PHY_PD_CTL_PWRDN | QMP_DP_PHY_PD_CTL_PSR_PWRDN |
-		 QMP_DP_PHY_PD_CTL_AUX_PWRDN | QMP_DP_PHY_PD_CTL_PLL_PWRDN |
-		 QMP_DP_PHY_PD_CTL_DP_CLAMP_EN;
-	if (priv->lanes == 4 ||
-	    priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
-		pd_ctl |= QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN;
-	if (priv->lanes == 4 ||
-	    priv->orientation == TACHYON_DP_ORIENTATION_NORMAL)
-		pd_ctl |= QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN;
-	writel(pd_ctl, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	tachyon_dp_qmp_power_down(priv);
 
 	ret = tachyon_dp_qmp_program_tx(priv);
 	if (ret)
@@ -1763,38 +1817,48 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x09, priv->phy_dp + QMP_DP_PHY_CFG);
 
+	/* Critical: do not poll QMP readiness while PD_CTL is 0x7f. */
+	tachyon_dp_qmp_power_up_all_lanes(priv);
+
 	writel(0x20, priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_RESETSM_CNTRL);
-	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
-				   QMP_V4_COM_C_READY_STATUS, BIT(0), BIT(0),
-				   10000);
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_C_READY_STATUS,
+				  BIT(0), BIT(0), "C_READY");
 	if (ret)
 		return ret;
-	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
-				   QMP_V4_COM_CMN_STATUS, BIT(0), BIT(0),
-				   10000);
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_CMN_STATUS,
+				  BIT(0), BIT(0), "CMN_STATUS bit0");
 	if (ret)
 		return ret;
-	ret = tachyon_dp_read_poll(priv->phy + QMP_OFF_DP_SERDES,
-				   QMP_V4_COM_CMN_STATUS, BIT(1), BIT(1),
-				   10000);
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_CMN_STATUS,
+				  BIT(1), BIT(1), "CMN_STATUS bit1");
 	if (ret)
 		return ret;
 
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
-	ret = tachyon_dp_read_poll(priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				   BIT(0) | BIT(1), BIT(0) | BIT(1), 10000);
-	if (ret)
-		log_warning("DP PHY did not report full lock: %d\n", ret);
-	if (ret)
+	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				  BIT(0) | BIT(1), BIT(0) | BIT(1),
+				  "DP_PHY_STATUS");
+	if (ret) {
+		log_warning("DP PHY full lock failed: ret=%d PD=%02x STATUS=%02x\n",
+			    ret,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
 		return ret;
+	}
 
 	writel(0x18, priv->phy_dp + QMP_DP_PHY_CFG);
 	udelay(2000);
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
-	return tachyon_dp_read_poll(priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				    BIT(1), BIT(1), 10000);
+	return tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				   BIT(1), BIT(1), "DP_PHY_STATUS bit1");
 }
 
 static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
