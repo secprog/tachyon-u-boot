@@ -27,11 +27,11 @@ CONFIG_EFI_IGNORE_OSINDICATIONS=y
 CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
 
 # ACPI support for Windows ARM64 boot
-# CONFIG_ACPI=y
-# CONFIG_ACPIGEN=y
-# CONFIG_GENERATE_ACPI_TABLE=y
-# CONFIG_EFI_ACPI_TABLES=y
-# CONFIG_GIC_V3_ITS=y
+# CONFIG_ACPI is not set
+# CONFIG_ACPIGEN is not sey
+# CONFIG_GENERATE_ACPI_TABLE is not set
+# CONFIG_EFI_ACPI_TABLES is not set
+# CONFIG_GIC_V3_ITS is not set
 
 # PSCI is provided by TF-A at EL3 — U-Boot must NOT implement its own.
 # The upstream DT (sc7280.dtsi) already declares psci { arm,psci-1.0; method = "smc"; }
@@ -46,40 +46,25 @@ CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
 
 
 # FIT Signature verification (dependency of EFI Secure Boot)
-# CONFIG_FIT_SIGNATURE=y
+# CONFIG_FIT_SIGNATURE is not set
 
 # Trusted Execution Environment (dependency of fTPM in OP-TEE)
-# CONFIG_TEE=y
-# CONFIG_OPTEE=y
+# CONFIG_TEE is not set
+# CONFIG_OPTEE is not set
 
 # EFI Secure Boot (required for Windows 11)
 # StandAloneMM in OP-TEE stores PK/KEK/db/dbx on RPMB (tamper-resistant).
 # This replaces /ubootefi.var file storage and provides authenticated
 # variable support required by EFI spec §32.3.6.
 # Prerequisite: StandAloneMM TA must be loaded in OP-TEE by TF-A.
-# CONFIG_EFI_MM_COMM_TEE=y
-# CONFIG_EFI_SECURE_BOOT=y
+# CONFIG_EFI_MM_COMM_TEE is not set
+# CONFIG_EFI_SECURE_BOOT is not set
 
 # TPM 2.0 via OP-TEE fTPM (required for Windows 11)
-# CONFIG_TPM=y
-# CONFIG_TPM_V2=y
-# CONFIG_TPM2_FTPM_TEE=y
-# CONFIG_BLOBLIST_SIZE_RELOC=0x40000
+# CONFIG_TPM is not set
+# CONFIG_TPM_V2 is not set
+# CONFIG_TPM2_FTPM_TEE is not set
+# CONFIG_BLOBLIST_SIZE_RELOC is not set
 
 # EFI TCG2 Protocol (measures boot to TPM, required for Windows 11)
-# CONFIG_EFI_TCG2_PROTOCOL=y
-
-# RTC (required for EFI GetTime/SetTime runtime services)
-# CONFIG_DM_RTC=y
-# CONFIG_RTC_QCOM_PM8XXX=y
-# CONFIG_EFI_SET_TIME=y
-
-# Runtime variable access is handled by StandAloneMM/OP-TEE backed storage.
-# At ExitBootServices, runtime-accessible variables are collected from StMM
-# and presented to the OS in DRAM. SetVariable at runtime returns
-# EFI_UNSUPPORTED (OS must use authenticated boot-time paths per spec).
-# CONFIG_EFI_RT_VOLATILE_STORE is incompatible with EFI_MM_COMM_TEE.
-
-# Move early stack above Tachyon low reserved-memory window.
-# 0x180000 lands at ~0x81800170, inside cdsp_secure_heap@81800000.
-# CONFIG_SYS_INIT_SP_BSS_OFFSET=50331648
+# CONFIG_EFI_TCG2_PROTOCOL is not set

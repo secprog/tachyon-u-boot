@@ -49,7 +49,6 @@ CONFIG_BOOTDELAY=-1
 # Kconfig choice). EFI_MM_COMM_TEE delegates variable storage to
 # StandAloneMM in OP-TEE (RPMB-backed, authenticated — required for
 # Secure Boot key enrollment).
-# CONFIG_FASTBOOT_BUF_ADDR=0xA0000000
 
 CONFIG_CMD_PMIC=y
 # CONFIG_CMD_SMBIOS is not set
