@@ -24,40 +24,9 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* SMEM (Shared Memory Manager) */
-		smem@c0000000 {
-			compatible = "qcom,smem";
-			reg = <0 0xc0000000 0 0x200000>;
-			no-map;
-		};
-
-		/* TZ (TrustZone) stat memory */
-		tz_stat_mem: tz-stat@c0000000 {
-			reg = <0 0xc0000000 0 0x1800000>;
-			no-map;
-		};
-
 		/* XBL (eXtensible Boot Loader) region */
 		xbl_mem: xbl@80700000 {
 			reg = <0 0x80700000 0 0x100000>;
-			no-map;
-		};
-
-		/* CDSP secure heap (firmware) */
-		cdsp_secure_heap@81800000 {
-			reg = <0 0x81800000 0 0x1e0000>;
-			no-map;
-		};
-
-		/* Video memory (firmware) */
-		video@8ad00000 {
-			reg = <0 0x8ad00000 0 0x900000>;
-			no-map;
-		};
-
-		/* PIL trusted VM region (firmware) */
-		pil_trustedvm_region@d0800000 {
-			reg = <0 0xd0800000 0 0x76f7000>;
 			no-map;
 		};
 	};
