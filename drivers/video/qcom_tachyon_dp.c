@@ -1341,24 +1341,66 @@ static void tachyon_dp_release_sbu_mux(struct tachyon_dp_priv *priv)
  *   - DP mode (not USB3)
  *   - Type-C orientation (which lanes map to which AUX/SBU pins)
  * If this is not done, AUX transactions may never reach the sink.
+ *
+ * IMPORTANT: These QMP registers use byte-style access (only the low byte
+ * is meaningful).  Using setbits/clrbits/clrsetbits_le32() read-modify-write
+ * on them produces byte-replicated garbage (0x02020202 etc.) because the
+ * read path returns replicated bytes.  Use direct writel() with the
+ * fully-computed value instead.
  */
 static void tachyon_dp_qmp_typec_dp_select(struct tachyon_dp_priv *priv)
 {
-	setbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL,
-		     QMP_DP_COM_DP_MODE);
-	clrbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL,
-		     QMP_DP_COM_USB3_MODE);
+	u32 typec;
 
-	clrsetbits_le32(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL,
-			QMP_DP_COM_SW_PORTSELECT_VAL |
-			QMP_DP_COM_SW_PORTSELECT_MUX,
-			QMP_DP_COM_SW_PORTSELECT_MUX |
-			(priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			 QMP_DP_COM_SW_PORTSELECT_VAL : 0));
+	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
+	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
+		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
-	log_warning("QMP Type-C after select: TYPEC_CTRL=%08x PHY_MODE_CTRL=%08x\n",
+	writel(QMP_DP_COM_DP_MODE,
+	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+
+	writel(typec,
+	       priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+
+	log_warning("QMP Type-C low after select: TYPEC=%02x PHY_MODE=%02x raw_typec=%08x raw_mode=%08x\n",
+		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
+		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL) & 0xff,
 		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL),
 		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL));
+}
+
+/*
+ * Force-clear AUX powerdown/clamp bits in the QMP DP PHY PD_CTL register.
+ * The debug log shows AUX_PWRDN=1 CLAMP=1 after tachyon_dp_qmp_aux_init(),
+ * which would prevent any AUX transaction from completing.
+ *
+ * IMPORTANT: Like other QMP byte-style registers, use direct writel()
+ * with a fully-computed low-byte value.  Do NOT use clrbits_le32() here;
+ * it reads back byte-replicated garbage and the RMW may not work.
+ */
+static void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv)
+{
+	u32 before, after;
+
+	before = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+
+	/*
+	 * Temporary bring-up: write 0x00 to the PD_CTL low byte.
+	 * This clears ALL powerdown/clamp bits including AUX_PWRDN
+	 * and DP_CLAMP_EN.  Once AUX works, restore lane-specific
+	 * powerdown control.
+	 */
+	writel(0x00, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+
+	after = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+
+	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x AUX_PWRDN=%u CLAMP=%u\n",
+		    before,
+		    after,
+		    after & 0xff,
+		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
+		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN));
 }
 
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
@@ -1627,6 +1669,7 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 {
 	u32 mode = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
 		   0x4c : 0x5c;
+	u32 typec;
 	u32 pd_ctl;
 	u32 vco_div;
 	int ret;
@@ -1639,14 +1682,15 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 				    priv->rate, clk_ret);
 	}
 
-	setbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_DP_MODE);
-	clrbits_le32(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_USB3_MODE);
+	/* Direct writel: QMP COM registers are byte-style, RMW corrupts */
+	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
+	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
+		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
-	clrsetbits_le32(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL,
-			QMP_DP_COM_SW_PORTSELECT_VAL | QMP_DP_COM_SW_PORTSELECT_MUX,
-			QMP_DP_COM_SW_PORTSELECT_MUX |
-			(priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			 QMP_DP_COM_SW_PORTSELECT_VAL : 0));
+	writel(QMP_DP_COM_DP_MODE,
+	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+	writel(typec,
+	       priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
 
 	tachyon_dp_qmp_aux_init(priv);
 
@@ -3491,7 +3535,40 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 		    TACHYON_DP_AUX_DEBOUNCE_TRIES, 20000);
 
 	for (i = 0; i < TACHYON_DP_AUX_DEBOUNCE_TRIES; i++) {
-		ret = tachyon_dp_read_dpcd_caps(priv);
+		/*
+		 * Hard-reset the AUX controller before every DPCD retry.
+		 * The GO bit was observed stuck at 0x200 after timeouts;
+		 * a full AUX reset ensures a clean transaction state each
+		 * attempt.
+		 */
+		writel(DP_AUX_CTRL_RESET, priv->aux + REG_DP_AUX_CTRL);
+		udelay(1000);
+		writel(DP_AUX_CTRL_ENABLE, priv->aux + REG_DP_AUX_CTRL);
+		writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+		writel(0xffff, priv->aux + REG_DP_TIMEOUT_COUNT);
+		writel(0xffff, priv->aux + REG_DP_AUX_LIMITS);
+		udelay(100);
+
+		/*
+		 * Try a 1-byte native DPCD_REV read first.  If a 1-byte
+		 * read succeeds but 16-byte fails, the AUX length handling
+		 * is wrong.  If 1-byte also times out, the problem is still
+		 * physical AUX/QMP routing.
+		 */
+		{
+			u8 dpcd_rev;
+
+			ret = tachyon_dp_aux_retry(priv, false, true,
+						   DP_DPCD_REV, &dpcd_rev, 1);
+			log_warning("DPCD_REV 1-byte read ret=%d val=%02x\n",
+				    ret, dpcd_rev);
+		}
+
+		if (!ret) {
+			/* 1-byte succeeded — now do the full 16-byte caps */
+			ret = tachyon_dp_read_dpcd_caps(priv);
+		}
+
 		if (!ret) {
 			log_info("DP sink DPCD read OK on try %d/%d\n",
 				 i + 1, TACHYON_DP_AUX_DEBOUNCE_TRIES);
@@ -3880,37 +3957,48 @@ static int tachyon_dp_probe(struct udevice *dev)
 	 * Try PMIC-GLINK first. If it fails, fall back to env override
 	 * or hardcoded default orientation.
 	 */
-	ret = tachyon_dp_read_altmode(priv);
-	if (!ret) {
-		while (!ret && timeout > 0) {
-			mdelay(100);
-			timeout--;
-			ret = tachyon_dp_read_altmode(priv);
-		}
-	}
+	{
+		bool forced = false;
 
-	if (ret <= 0) {
-		/*
-		 * PMIC-GLINK failed. Try the env override as a user-
-		 * controlled fallback before resorting to hardcoded
-		 * defaults.
-		 */
-		if (!tachyon_dp_apply_env_typec_override(priv)) {
-			if (ret < 0)
-				log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
-					    ret);
-			else
-				log_warning("DP Alt-Mode timeout\n");
-			log_warning("DP falling back to default orientation\n");
-			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
-			priv->pin_assignment = 4; /* Pin assignment E, 4 lanes */
+		ret = tachyon_dp_read_altmode(priv);
+		if (!ret) {
+			while (!ret && timeout > 0) {
+				mdelay(100);
+				timeout--;
+				ret = tachyon_dp_read_altmode(priv);
+			}
 		}
+
+		if (ret <= 0) {
+			/*
+			 * PMIC-GLINK failed. Try the env override as a
+			 * user-controlled fallback before resorting to
+			 * hardcoded defaults.
+			 */
+			forced = tachyon_dp_apply_env_typec_override(priv);
+			if (!forced) {
+				if (ret < 0)
+					log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
+						    ret);
+				else
+					log_warning("DP Alt-Mode timeout\n");
+				log_warning("DP falling back to default orientation\n");
+				priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+				priv->pin_assignment = 4;
+			}
+		}
+
+		log_warning("DP TYPEC FINAL: forced=%d orientation=%u pin=%u\n",
+			    forced ? 1 : 0,
+			    priv->orientation,
+			    priv->pin_assignment);
 	}
 
 	/*
 	 * Program QMP Type-C select and DP mode BEFORE AUX init.
 	 * Without this, AUX may never be routed to the correct
-	 * Type-C lanes.
+	 * Type-C lanes.  Uses direct writel() because QMP COM
+	 * registers are byte-style (low byte only meaningful).
 	 */
 	tachyon_dp_qmp_typec_dp_select(priv);
 
@@ -3942,46 +4030,45 @@ static int tachyon_dp_probe(struct udevice *dev)
 		log_warning("SBU select GPIO invalid\n");
 
 	/*
-	 * Print QMP Type-C / DP PHY state before AUX init to verify
-	 * the PHY is in the correct mode for DP operation.
+	 * Print QMP state before AUX init.  For byte-style QMP registers,
+	 * the low byte is the meaningful field; full raw values like
+	 * 0x02020202 are byte-replicated and only diagnostic.
 	 */
-	log_warning("QMP before AUX init: TYPEC_CTRL=%08x PHY_MODE_CTRL=%08x\n",
-		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL),
-		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL));
-	log_warning("QMP before AUX init: PD_CTL=%08x STATUS=%08x\n",
-		    readl(priv->phy_dp + QMP_DP_PHY_PD_CTL),
-		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS));
+	{
+		u32 typec_raw = readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+		u32 mode_raw = readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+		u32 pd_raw = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+		u32 status_raw = readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS);
+
+		log_warning("QMP low before AUX init: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x\n",
+			    typec_raw & 0xff, mode_raw & 0xff,
+			    pd_raw & 0xff, status_raw & 0xff);
+	}
 
 	log_warning("DP QMP/AUX init start\n");
 	tachyon_dp_qmp_aux_init(priv);
+
+	/*
+	 * Force-clear AUX powerdown and clamp in the QMP DP PHY.
+	 * Without this, AUX_PWRDN=1 and CLAMP=1 prevent the AUX
+	 * controller from transmitting.
+	 */
+	tachyon_dp_qmp_force_aux_on(priv);
+
 	tachyon_dp_aux_hw_init(priv);
 
 	/*
-	 * Verify QMP DP PHY powerdown and clamp state after AUX init.
-	 * AUX requires:
-	 *   - AUX_PWRDN = 0  (not powered down)
-	 *   - DP_CLAMP_EN = 0 (clamp released)
+	 * Verify the force_aux_on() took effect.  The low byte of PD_CTL
+	 * should now show AUX_PWRDN=0 and CLAMP=0.
 	 */
 	{
-		u32 pd = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+		u32 pd_low = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
 
-		log_warning("DP PHY after AUX init: PD_CTL=%08x STATUS=%08x AUX_PWRDN=%u CLAMP=%u\n",
-			    pd,
-			    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS),
-			    !!(pd & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
-			    !!(pd & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN));
-
-		/*
-		 * If AUX_PWRDN or DP_CLAMP_EN are still asserted, AUX will
-		 * never complete. Clear them explicitly.
-		 */
-		if (pd & (QMP_DP_PHY_PD_CTL_AUX_PWRDN |
-			  QMP_DP_PHY_PD_CTL_DP_CLAMP_EN)) {
-			log_warning("DP PHY: clearing AUX_PWRDN and/or DP_CLAMP_EN\n");
-			clrbits_le32(priv->phy_dp + QMP_DP_PHY_PD_CTL,
-				     QMP_DP_PHY_PD_CTL_AUX_PWRDN |
-				     QMP_DP_PHY_PD_CTL_DP_CLAMP_EN);
-		}
+		log_warning("DP PHY after force-aux-on: PD_CTL low=%02x AUX_PWRDN=%u CLAMP=%u STATUS=%02x\n",
+			    pd_low,
+			    !!(pd_low & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
+			    !!(pd_low & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN),
+			    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff);
 	}
 
 	/* Print AUX controller state after init */
