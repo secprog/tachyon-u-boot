@@ -45,4 +45,3 @@ struct smem_ram_ptable {
 } __attribute__ ((__packed__));
 
 int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t size);
-int qcom_find_smem_region(const char *name, qcom_mem_bank *bank);
