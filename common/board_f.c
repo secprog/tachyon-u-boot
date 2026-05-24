@@ -876,19 +876,6 @@ static int initf_upl(void)
 	return 0;
 }
 
-
-static int mark_f_start(void) { printascii("\n@@@ BOARD_F: start @@@\n"); return 0; }
-static int mark_f_after_dm(void) { printascii("\n@@@ BOARD_F: after initf_dm @@@\n"); return 0; }
-static int mark_f_after_board_early(void) { printascii("\n@@@ BOARD_F: after board_early_init_f @@@\n"); return 0; }
-static int mark_f_after_serial(void) { printascii("\n@@@ BOARD_F: after serial_init @@@\n"); return 0; }
-static int mark_f_after_console(void) { printascii("\n@@@ BOARD_F: after console_init_f @@@\n"); return 0; }
-static int mark_f_before_dram(void) { printascii("\n@@@ BOARD_F: before dram_init @@@\n"); return 0; }
-static int mark_f_after_dram(void) { printascii("\n@@@ BOARD_F: after dram_init @@@\n"); return 0; }
-static int mark_f_after_setup_dest(void) { printascii("\n@@@ BOARD_F: after setup_dest_addr @@@\n"); return 0; }
-static int mark_f_after_reserve_uboot(void) { printascii("\n@@@ BOARD_F: after reserve_uboot @@@\n"); return 0; }
-static int mark_f_after_display_new_sp(void) { printascii("\n@@@ BOARD_F: after display_new_sp @@@\n"); return 0; }
-static int mark_f_before_setup_reloc(void) { printascii("\n@@@ BOARD_F: before setup_reloc @@@\n"); return 0; }
-
 static const init_fnc_t init_sequence_f[] = {
 	mark_f_start,
 	setup_mon_len,

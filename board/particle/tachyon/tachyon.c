@@ -87,9 +87,6 @@ typedef struct fs_context {
 
 int board_early_init_f(void)
 {
-	printascii("\n@@@ TACHYON: board_early_init_f entry @@@\n");
-	if (IS_ENABLED(CONFIG_DEBUG_UART))
-		printascii("\nTACHYON board_early_init_f\n");
 
 	qcom_mem_bank banks[CONFIG_NR_DRAM_BANKS] = {};
 	int num = qcom_parse_memory_smem(banks, CONFIG_NR_DRAM_BANKS);
@@ -106,7 +103,6 @@ int board_early_init_f(void)
 		gd->ram_size = ram_end - gd->ram_base;
 	}
 
-	printascii("\n@@@ TACHYON: board_early_init_f exit @@@\n");
 	return 0;
 }
 
