@@ -206,8 +206,8 @@ static int sc7280_enable(struct clk *clk)
 		clk_rcg_set_rate_mnd(priv->base, 0x18140, 1, 0, 0, CFG_CLK_SRC_CXO, 16);
 		break;
 	}
-
-	return qcom_gate_clk_en(priv, clk->id);
+	qcom_gate_clk_en(priv, clk->id);
+	return 0;
 }
 
 static const struct qcom_reset_map sc7280_gcc_resets[] = {
