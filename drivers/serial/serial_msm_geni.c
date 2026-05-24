@@ -191,7 +191,10 @@ static int geni_serial_set_clock_rate(struct udevice *dev, u64 rate)
 		return PTR_ERR(clk);
 
 	ret = clk_set_rate(clk, rate);
-	return ret;
+	if (ret < 0)
+		return ret;
+
+	return clk_enable(clk);
 }
 
 /**
