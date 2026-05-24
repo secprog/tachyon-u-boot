@@ -1626,15 +1626,13 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 	 */
 	ret = generic_phy_get_by_index(dev, 0, &priv->qmp_phy);
 	if (ret) {
-		log_warning("QMP generic PHY get failed: %d
-", ret);
+		log_warning("QMP generic PHY get failed: %d\n", ret);
 	} else {
 		priv->has_qmp_phy = true;
 
 		ret = generic_phy_init(&priv->qmp_phy);
-		log_warning("QMP generic PHY init ret=%d id=%lu
-",
-			    ret, priv->qmp_phy.id);
+		log_warning("QMP generic PHY init ret=%d id=%lu\n",
+            ret, priv->qmp_phy.id);
 		if (ret)
 			return ret;
 	}
