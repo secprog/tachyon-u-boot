@@ -1604,8 +1604,3 @@
 		};
 	};
 };
-
-/* Enable GIC ITS (Interrupt Translation Service) for IORT/MSI support */
-&its_0 {
-	status = "okay";
-};
