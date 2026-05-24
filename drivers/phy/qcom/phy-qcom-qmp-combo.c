@@ -433,8 +433,7 @@ static int qmp_combo_power_on(struct phy *phy)
 		return ret;
 
 	if (phy->id == QMP_USB43DP_DP_PHY) {
-		dev_info(qmp->dev, "QMP combo DP slot: COM init only
-");
+		dev_info(qmp->dev, "QMP combo DP slot: COM init only\n");
 		return 0;
 	}
 
@@ -531,8 +530,7 @@ static int qmp_combo_vreg_init(struct qmp_combo *qmp)
 			 * QMP supply phandles. Keep this non-fatal for DP
 			 * bring-up so reset/clock/COM init can still be tested.
 			 */
-			dev_warn(dev, "regulator %s unavailable: %d
-",
+			dev_warn(dev, "regulator %s unavailable: %d\n",
 				 cfg->vreg_list[i], ret);
 			continue;
 		}
@@ -628,8 +626,7 @@ static const struct qmp_phy_cfg sc7280_usb3dpphy_cfg = {
 static int qmp_combo_xlate(struct phy *phy, struct ofnode_phandle_args *args)
 {
 	if (args->args_count != 1) {
-		debug("Invalid args_count: %d
-", args->args_count);
+		debug("Invalid args_count: %d\n", args->args_count);
 		return -EINVAL;
 	}
 
