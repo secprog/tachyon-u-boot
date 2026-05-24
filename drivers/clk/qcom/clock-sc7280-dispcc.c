@@ -95,7 +95,7 @@ static const struct udevice_id dispcc_sc7280_of_match[] = {
 
 U_BOOT_DRIVER(dispcc_sc7280) = {
 	.name		= "dispcc_sc7280",
-	.id		= UCLASS_CLK,
+	.id		= UCLASS_NOP,
 	.of_match	= dispcc_sc7280_of_match,
 	.bind		= qcom_cc_bind,
 	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_DEFAULT_PD_CTRL_OFF,
