@@ -5,6 +5,9 @@
 
 #include "qcom_defconfig"
 
+# Otherwise buildman thinks this isn't an ARM platform
+CONFIG_ARM=y
+
 CONFIG_DEBUG_UART=y
 CONFIG_DEBUG_UART_ANNOUNCE=y
 CONFIG_DEBUG_UART_BASE=0x994000
@@ -14,6 +17,8 @@ CONFIG_DEBUG_UART_CLOCK=14745600
 # Address where U-Boot will be loaded
 CONFIG_TEXT_BASE=0x9fc00000
 CONFIG_REMAKE_ELF=y
+
+CONFIG_DEFAULT_DEVICE_TREE="qcom/qcs6490-rb3gen2"
 
 # Enable capsule updates
 CONFIG_EFI_RUNTIME_UPDATE_CAPSULE=y
@@ -58,8 +63,8 @@ CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
 # TPM 2.0 via OP-TEE fTPM (required for Windows 11)
 # CONFIG_TPM=y
 # CONFIG_TPM_V2=y
-#CONFIG_TPM2_FTPM_TEE=y
-CONFIG_BLOBLIST_SIZE_RELOC=0x40000
+# CONFIG_TPM2_FTPM_TEE=y
+# CONFIG_BLOBLIST_SIZE_RELOC=0x40000
 
 # EFI TCG2 Protocol (measures boot to TPM, required for Windows 11)
 # CONFIG_EFI_TCG2_PROTOCOL=y
@@ -77,4 +82,4 @@ CONFIG_BLOBLIST_SIZE_RELOC=0x40000
 
 # Move early stack above Tachyon low reserved-memory window.
 # 0x180000 lands at ~0x81800170, inside cdsp_secure_heap@81800000.
-CONFIG_SYS_INIT_SP_BSS_OFFSET=50331648
+# CONFIG_SYS_INIT_SP_BSS_OFFSET=50331648
