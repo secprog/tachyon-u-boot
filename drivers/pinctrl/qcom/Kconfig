@@ -48,6 +48,13 @@ config PINCTRL_QCOM_SDM845
 	  Say Y here to enable support for pinctrl on the Snapdragon 845 SoC,
 	  as well as the associated GPIO driver.
 
+config PINCTRL_QCOM_SC7280
+	bool "Qualcomm SC7280 TLMM"
+	select PINCTRL_QCOM
+	help
+	  Say Y here to enable basic TLMM GPIO support on the Snapdragon
+	  SC7280 / QCM6490 SoC.
+
 config PINCTRL_QCOM_SM6115
 	bool "Qualcomm SM6115 GCC"
 	select PINCTRL_QCOM

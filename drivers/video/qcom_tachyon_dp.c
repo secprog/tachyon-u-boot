@@ -3324,6 +3324,7 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 		udelay(20000);
 	}
 
+	log_warning("DP sink DPCD read failed after AUX debounce: %d\n", ret);
 	return ret;
 }
 

@@ -39,6 +39,27 @@
 
 &mdss {
 	compatible = "qcom,sc7280-mdss", "simple-bus";
+	bootph-all;
+};
+
+&mdss_dp {
+	bootph-all;
+};
+
+&dispcc {
+	bootph-all;
+};
+
+&usb_1_qmpphy {
+	bootph-all;
+};
+
+&tlmm {
+	bootph-all;
+};
+
+&{/usb1-sbu-mux} {
+	bootph-all;
 };
 
 /* Enable USB-C Display (DP Alt Mode) */
