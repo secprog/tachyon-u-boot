@@ -184,18 +184,6 @@ uint compute_ip_checksum(const void *vptr, uint nbytes)
 	int sum, oddbyte;
 	const unsigned short *ptr = vptr;
 
-	if (IS_ENABLED(CONFIG_DEBUG_UART) && (ulong)vptr < 0x1000) {
-		printascii("\n@@@ BAD IP CHECKSUM ptr=0x");
-		printhex8((ulong)vptr);
-		printascii(" len=0x");
-		printhex8(nbytes);
-		printascii(" lr=0x");
-		printhex8((ulong)__builtin_return_address(0));
-		printascii(" @@@\n");
-		for (;;)
-			;
-	}
-
 	sum = 0;
 	while (nbytes > 1) {
 		sum += *ptr++;
