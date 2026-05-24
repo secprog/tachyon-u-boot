@@ -62,3 +62,12 @@ config PHY_QCOM_USB_SS
 	help
 	  Enable this to support the Super-Speed USB transceiver on various
 	  Qualcomm chipsets.
+
+config USB_QCOM_DWC3_STUB
+	bool "Qualcomm SC7280 QMP USB PHY stub"
+	depends on PHY && ARCH_SNAPDRAGON
+	help
+	  Enable this to support the QMP USB PHY stub on the Snapdragon
+	  SC7280/QCM6490 SoC. This provides the minimal PHY initialization
+	  needed for DWC3 USB to operate when the full USB PHY is already
+	  configured by a prior boot stage.
