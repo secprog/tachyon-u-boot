@@ -597,6 +597,15 @@ static bool tachyon_dp_env_has_u32(const char *name)
 	return val && *val;
 }
 
+static bool tachyon_dp_env_bool(const char *name)
+{
+	const char *val = env_get(name);
+
+	return val && (!strcmp(val, "1") ||
+		       !strcmp(val, "true") ||
+		       !strcmp(val, "yes"));
+}
+
 static bool tachyon_dp_edid_mode_supported(u32 width, u32 height)
 {
 	const char *modes = env_get("tachyon_dp_edid_modes");
@@ -1301,20 +1310,37 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 {
-	log_warning("SBU mux program start orientation=%u pin=%u\n",
-		    priv->orientation, priv->pin_assignment);
+	bool invert_select = tachyon_dp_env_bool("tachyon_dp_invert_sbu_select");
+	bool invert_enable = tachyon_dp_env_bool("tachyon_dp_invert_sbu_enable");
+	int select;
+	int enable;
+
+	log_warning("SBU mux program start orientation=%u pin=%u invert_select=%d invert_enable=%d\n",
+		    priv->orientation, priv->pin_assignment,
+		    invert_select ? 1 : 0,
+		    invert_enable ? 1 : 0);
+
+	select = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE;
+	if (invert_select)
+		select = !select;
+
+	enable = 1;
+	if (invert_enable)
+		enable = 0;
 
 	if (dm_gpio_is_valid(&priv->sbu_select))
-		dm_gpio_set_value(&priv->sbu_select,
-				  priv->orientation ==
-				  TACHYON_DP_ORIENTATION_REVERSE);
+		dm_gpio_set_value(&priv->sbu_select, select);
 
 	udelay(1000);
 
 	if (dm_gpio_is_valid(&priv->sbu_enable))
-		dm_gpio_set_value(&priv->sbu_enable, 1);
+		dm_gpio_set_value(&priv->sbu_enable, enable);
 
-	log_warning("SBU mux program done\n");
+	log_warning("SBU mux program done: enable=%d select=%d\n",
+		    dm_gpio_is_valid(&priv->sbu_enable) ?
+			    dm_gpio_get_value(&priv->sbu_enable) : -1,
+		    dm_gpio_is_valid(&priv->sbu_select) ?
+			    dm_gpio_get_value(&priv->sbu_select) : -1);
 }
 
 /*
@@ -3590,6 +3616,192 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 	return ret;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Automatic USB-C orientation retry
+ * ---------------------------------------------------------------------------
+ * When PMIC-GLINK does not provide valid Type-C DP Alt Mode state, the
+ * driver falls back to a default orientation.  If the cable is flipped,
+ * AUX is routed over the wrong SBU line and DPCD reads time out.
+ *
+ * These helpers prepare QMP / SBU / AUX state for a given orientation,
+ * try DPCD, and automatically flip orientation on AUX timeout before
+ * giving up.  Full QMP PHY pre-configuration is available as a second
+ * fallback level.
+ */
+
+/*
+ * Reset QMP Type-C select, reprogram SBU mux GPIOs, reinitialize QMP AUX
+ * settings, force AUX out of powerdown/clamp, and reset the DP AUX
+ * controller — all for a single orientation choice.
+ */
+static void tachyon_dp_prepare_aux_for_orientation(
+		struct tachyon_dp_priv *priv,
+		enum tachyon_dp_orientation orientation)
+{
+	u32 pd_low;
+
+	priv->orientation = orientation;
+
+	log_warning("DP prepare AUX orientation=%u pin=%u\n",
+		    priv->orientation, priv->pin_assignment);
+
+	/* Reprogram QMP Type-C select and DP mode */
+	tachyon_dp_qmp_typec_dp_select(priv);
+
+	/* Reprogram the external SBU mux */
+	tachyon_dp_program_sbu_mux(priv);
+
+	/* Reinitialize QMP AUX + force AUX path out of powerdown/clamp */
+	tachyon_dp_qmp_aux_init(priv);
+	tachyon_dp_qmp_force_aux_on(priv);
+
+	/* Reset the DP AUX controller */
+	tachyon_dp_aux_hw_init(priv);
+	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+	udelay(100);
+
+	pd_low = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
+
+	log_warning("DP AUX orientation state: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x SBU_EN=%d SBU_SEL=%d AUX_CTRL=%08x AUX_STATUS=%08x AUX_TRANS=%08x\n",
+		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
+		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL) & 0xff,
+		    pd_low,
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff,
+		    dm_gpio_is_valid(&priv->sbu_enable) ?
+			    dm_gpio_get_value(&priv->sbu_enable) : -1,
+		    dm_gpio_is_valid(&priv->sbu_select) ?
+			    dm_gpio_get_value(&priv->sbu_select) : -1,
+		    readl(priv->aux + REG_DP_AUX_CTRL),
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
+}
+
+/* Try one full orientation: prepare QMP/SBU/AUX, then run DPCD wait loop. */
+static int tachyon_dp_try_sink_with_orientation(
+		struct tachyon_dp_priv *priv,
+		enum tachyon_dp_orientation orientation)
+{
+	int ret;
+
+	log_warning("DP auto-orientation try begin: orientation=%u\n",
+		    orientation);
+
+	tachyon_dp_prepare_aux_for_orientation(priv, orientation);
+
+	ret = tachyon_dp_wait_sink(priv);
+
+	log_warning("DP auto-orientation try done: orientation=%u ret=%d\n",
+		    orientation, ret);
+
+	return ret;
+}
+
+/* Try current orientation; on AUX timeout flip and retry before failing. */
+static int tachyon_dp_wait_sink_auto_orientation(
+		struct tachyon_dp_priv *priv,
+		bool allow_flip)
+{
+	enum tachyon_dp_orientation first = priv->orientation;
+	enum tachyon_dp_orientation second;
+	int ret;
+
+	second = first == TACHYON_DP_ORIENTATION_NORMAL ?
+		 TACHYON_DP_ORIENTATION_REVERSE :
+		 TACHYON_DP_ORIENTATION_NORMAL;
+
+	ret = tachyon_dp_try_sink_with_orientation(priv, first);
+	if (!ret)
+		return 0;
+
+	/*
+	 * Only flip automatically on timeout.  If the sink returns a real
+	 * AUX NACK/DEFER/error, orientation is less likely to be the issue.
+	 */
+	if (!allow_flip || ret != -ETIMEDOUT)
+		return ret;
+
+	log_warning("DP orientation %u timed out; trying opposite orientation %u\n",
+		    first, second);
+
+	ret = tachyon_dp_try_sink_with_orientation(priv, second);
+	if (!ret) {
+		log_warning("DP opposite orientation succeeded: orientation=%u\n",
+			    second);
+		return 0;
+	}
+
+	log_warning("DP both orientations failed: first=%u second=%u ret=%d\n",
+		    first, second, ret);
+
+	return ret;
+}
+
+/*
+ * Full QMP DP PHY pre-configuration fallback.
+ * If minimal AUX init isn't enough, bring up the full QMP DP PHY
+ * (same sequence used for link training) before retrying orientation.
+ */
+static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
+{
+	int ret;
+
+	/* DPCD caps are unknown — use conservative defaults */
+	priv->rate = DP_LINK_RATE_RBR;
+	priv->lanes = priv->max_lanes ? priv->max_lanes : 4;
+
+	log_warning("DP full QMP pre-DPCD configure: rate=%u lanes=%u orientation=%u\n",
+		    priv->rate, priv->lanes, priv->orientation);
+
+	ret = tachyon_dp_qmp_configure(priv);
+
+	log_warning("DP full QMP pre-DPCD configure ret=%d STATUS=%02x PD=%02x\n",
+		    ret,
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff,
+		    readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff);
+
+	if (ret)
+		return ret;
+
+	/*
+	 * qmp_configure() may rewrite PD_CTL.  Force AUX path open again
+	 * and reset the AUX controller.
+	 */
+	tachyon_dp_qmp_force_aux_on(priv);
+	tachyon_dp_aux_hw_init(priv);
+	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+
+	return 0;
+}
+
+/* Two-level fallback: orientation retry, then full QMP + orientation retry. */
+static int tachyon_dp_wait_sink_auto_orientation_full_qmp_fallback(
+		struct tachyon_dp_priv *priv)
+{
+	enum tachyon_dp_orientation saved = priv->orientation;
+	int ret;
+
+	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+	if (!ret)
+		return 0;
+
+	log_warning("DP minimal AUX orientation retry failed: %d; trying full QMP pre-DPCD fallback\n",
+		    ret);
+
+	priv->orientation = saved;
+
+	ret = tachyon_dp_prepare_full_qmp_for_dpcd(priv);
+	if (ret)
+		return ret;
+
+	ret = tachyon_dp_wait_sink_auto_orientation(priv, true);
+	if (!ret)
+		return 0;
+
+	log_warning("DP full QMP pre-DPCD fallback failed: %d\n", ret);
+	return ret;
+}
+
 #ifdef CONFIG_VIDEO_TACHYON_DP_ADVANCED_HOTPLUG
 
 #define TACHYON_DP_HPD_FAST_MS		100
@@ -3897,7 +4109,10 @@ static int tachyon_dp_probe(struct udevice *dev)
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
 	u32 width, height;
-	int ret, timeout = 50;
+	int ret, altmode_ret, timeout = 50;
+	bool typec_forced = false;
+	bool typec_from_altmode = false;
+	bool has_sbu_mux;
 
 	log_warning("DP probe start\n");
 
@@ -3954,134 +4169,78 @@ static int tachyon_dp_probe(struct udevice *dev)
 	}
 
 	/*
-	 * Try PMIC-GLINK first. If it fails, fall back to env override
-	 * or hardcoded default orientation.
+	 * Resolve Type-C state.
+	 * 1. Try PMIC-GLINK.
+	 * 2. Fall back to env override.
+	 * 3. Resort to hardcoded default.
 	 */
-	{
-		bool forced = false;
-
-		ret = tachyon_dp_read_altmode(priv);
-		if (!ret) {
-			while (!ret && timeout > 0) {
-				mdelay(100);
-				timeout--;
-				ret = tachyon_dp_read_altmode(priv);
-			}
+	ret = tachyon_dp_read_altmode(priv);
+	if (!ret) {
+		while (!ret && timeout > 0) {
+			mdelay(100);
+			timeout--;
+			ret = tachyon_dp_read_altmode(priv);
 		}
-
-		if (ret <= 0) {
-			/*
-			 * PMIC-GLINK failed. Try the env override as a
-			 * user-controlled fallback before resorting to
-			 * hardcoded defaults.
-			 */
-			forced = tachyon_dp_apply_env_typec_override(priv);
-			if (!forced) {
-				if (ret < 0)
-					log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
-						    ret);
-				else
-					log_warning("DP Alt-Mode timeout\n");
-				log_warning("DP falling back to default orientation\n");
-				priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
-				priv->pin_assignment = 4;
-			}
-		}
-
-		log_warning("DP TYPEC FINAL: forced=%d orientation=%u pin=%u\n",
-			    forced ? 1 : 0,
-			    priv->orientation,
-			    priv->pin_assignment);
 	}
 
+	altmode_ret = ret;
+
+	if (altmode_ret > 0) {
+		typec_from_altmode = true;
+	} else {
+		typec_forced = tachyon_dp_apply_env_typec_override(priv);
+
+		if (!typec_forced) {
+			if (altmode_ret < 0)
+				log_warning("DP Alt-Mode unavailable via PMIC-GLINK: %d\n",
+					    altmode_ret);
+			else
+				log_warning("DP Alt-Mode timeout\n");
+
+			log_warning("DP falling back to default orientation\n");
+			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+			priv->pin_assignment = 4;
+		}
+	}
+
+	log_warning("DP TYPEC FINAL: altmode=%d forced=%d orientation=%u pin=%u\n",
+		    typec_from_altmode ? 1 : 0,
+		    typec_forced ? 1 : 0,
+		    priv->orientation,
+		    priv->pin_assignment);
+
 	/*
-	 * Program QMP Type-C select and DP mode BEFORE AUX init.
-	 * Without this, AUX may never be routed to the correct
-	 * Type-C lanes.  Uses direct writel() because QMP COM
-	 * registers are byte-style (low byte only meaningful).
+	 * Request SBU mux GPIOs ONCE.  The automatic orientation retry
+	 * below will reprogram GPIO values per orientation but will not
+	 * re-request them.
 	 */
-	tachyon_dp_qmp_typec_dp_select(priv);
-
-	/* Debug: print orientation and Type-C state before SBU mux */
-	log_warning("DP orientation=%u pin_assignment=%u lane_map=0x%x max_lanes=%u\n",
-		    priv->orientation, priv->pin_assignment,
-		    priv->lane_map, priv->max_lanes);
-
 	ret = tachyon_dp_request_sbu_mux(priv);
 	if (ret)
 		log_warning("SBU mux unavailable: %d\n", ret);
-	else
-		tachyon_dp_program_sbu_mux(priv);
+
+	has_sbu_mux = dm_gpio_is_valid(&priv->sbu_enable) &&
+		      dm_gpio_is_valid(&priv->sbu_select);
+	log_warning("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
 
 	/*
-	 * Print SBU GPIO state for diagnostics:
-	 *   - sbu_enable: should be 1 after program_sbu_mux
-	 *   - sbu_select: 0 = normal, 1 = reverse orientation
+	 * Do the initial SBU mux program for the resolved orientation.
+	 * The automatic retry will reprogram it if orientation flips.
 	 */
-	if (dm_gpio_is_valid(&priv->sbu_enable))
-		log_warning("SBU enable GPIO valid, value=%d\n",
-			    dm_gpio_get_value(&priv->sbu_enable));
-	else
-		log_warning("SBU enable GPIO invalid\n");
-	if (dm_gpio_is_valid(&priv->sbu_select))
-		log_warning("SBU select GPIO valid, value=%d\n",
-			    dm_gpio_get_value(&priv->sbu_select));
-	else
-		log_warning("SBU select GPIO invalid\n");
+	tachyon_dp_program_sbu_mux(priv);
 
 	/*
-	 * Print QMP state before AUX init.  For byte-style QMP registers,
-	 * the low byte is the meaningful field; full raw values like
-	 * 0x02020202 are byte-replicated and only diagnostic.
+	 * Wait for DPCD using automatic orientation retry.
+	 * If the first orientation times out, the opposite orientation
+	 * is tried automatically.  If both fail, full QMP PHY
+	 * pre-configuration is attempted as a second fallback.
 	 */
-	{
-		u32 typec_raw = readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
-		u32 mode_raw = readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
-		u32 pd_raw = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
-		u32 status_raw = readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS);
+	log_warning("DP wait sink start with auto-orientation\n");
 
-		log_warning("QMP low before AUX init: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x\n",
-			    typec_raw & 0xff, mode_raw & 0xff,
-			    pd_raw & 0xff, status_raw & 0xff);
-	}
+	ret = tachyon_dp_wait_sink_auto_orientation_full_qmp_fallback(priv);
 
-	log_warning("DP QMP/AUX init start\n");
-	tachyon_dp_qmp_aux_init(priv);
+	log_warning("DP wait sink done ret=%d final_orientation=%u\n",
+		    ret, priv->orientation);
 
-	/*
-	 * Force-clear AUX powerdown and clamp in the QMP DP PHY.
-	 * Without this, AUX_PWRDN=1 and CLAMP=1 prevent the AUX
-	 * controller from transmitting.
-	 */
-	tachyon_dp_qmp_force_aux_on(priv);
-
-	tachyon_dp_aux_hw_init(priv);
-
-	/*
-	 * Verify the force_aux_on() took effect.  The low byte of PD_CTL
-	 * should now show AUX_PWRDN=0 and CLAMP=0.
-	 */
-	{
-		u32 pd_low = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
-
-		log_warning("DP PHY after force-aux-on: PD_CTL low=%02x AUX_PWRDN=%u CLAMP=%u STATUS=%02x\n",
-			    pd_low,
-			    !!(pd_low & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
-			    !!(pd_low & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN),
-			    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff);
-	}
-
-	/* Print AUX controller state after init */
-	log_warning("DP AUX: CTRL=%08x STATUS=%08x TRANS_CTRL=%08x\n",
-		    readl(priv->aux + REG_DP_AUX_CTRL),
-		    readl(priv->aux + REG_DP_AUX_STATUS),
-		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
-
-	log_warning("DP QMP/AUX init done\n");
-
-	log_warning("DP wait sink start\n");
-	ret = tachyon_dp_wait_sink(priv);
-	log_warning("DP wait sink done ret=%d\n", ret);
 	if (ret) {
 		tachyon_dp_release_sbu_mux(priv);
 		return ret;
