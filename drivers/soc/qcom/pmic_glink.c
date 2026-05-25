@@ -806,8 +806,8 @@ static int qpg_init(struct qpg *pg)
 			       QPG_SMEM_XPRT_FIFO_1, &pg->rx_len);
 	log_warning("pmic-glink: tx_fifo=%p tx_len=%zu rx_fifo=%p rx_len=%zu\n",
 		    pg->tx_fifo, pg->tx_len, pg->rx_fifo, pg->rx_len);
-	if (!pg->tx_fifo || !pg->rx_fifo)
-		return -ENOENT;
+	if (IS_ERR_OR_NULL(pg->tx_fifo) || IS_ERR_OR_NULL(pg->rx_fifo))
+ 		return -ENOENT;
 
 	*pg->rx_tail = 0;
 	*pg->tx_head = 0;
