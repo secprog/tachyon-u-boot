@@ -2320,7 +2320,7 @@ static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
 /*
  * Linux-aligned DP PHY programming:
  *   power_down -> program_serdes -> program_tx_table ->
- *   deassert_serdes_reset -> program_tx (swing/pre) ->
+ *   deassert_serdes_reset ->
  *   v4_configure_dp_phy (V456 start + polls + V4 bias + re-lock + TX levels)
  */
 static int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
@@ -2341,11 +2341,7 @@ static int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
 	log_warning("QMP DP TX table start\n");
 	tachyon_dp_qmp_program_tx_table(priv);
 	tachyon_dp_qmp_deassert_serdes_reset(priv);
-
-	ret = tachyon_dp_qmp_program_tx(priv);
-	log_warning("QMP DP TX table done ret=%d\n", ret);
-	if (ret)
-		return ret;
+	log_warning("QMP DP TX table done\n");
 
 	/*
 	 * Linux-aligned V4 DP PHY configure:
@@ -3826,6 +3822,14 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	u8 link[2], pattern, status[6], adj[2];
 	int ret, tries;
 	u8 lane;
+
+#if TACHYON_DP_FORCE_TRAIN_RBR_X4
+	if (rate != DP_LINK_RATE_RBR || lanes != 4)
+		log_warning("DP force RBR x4 overrides requested %u kHz x %u lanes\n",
+			    rate, lanes);
+	rate = DP_LINK_RATE_RBR;
+	lanes = 4;
+#endif
 
 	priv->rate = rate;
 	priv->lanes = lanes;
