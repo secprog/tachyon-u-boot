@@ -1301,6 +1301,10 @@ static int tachyon_dp_read_altmode(struct tachyon_dp_priv *priv)
 	int ret;
 
 	ret = qcom_pmic_glink_get_altmode(&glink_altmode);
+	log_warning("DP PMIC-GLINK raw altmode: ret=%d dp=%d port=%u orientation=%u pin=%u hpd=%d hpd_irq=%d\n",
+		    ret, glink_altmode.dp, glink_altmode.port,
+		    glink_altmode.orientation, glink_altmode.pin_assignment,
+		    glink_altmode.hpd, glink_altmode.hpd_irq);
 	if (ret)
 		return ret;
 

@@ -223,6 +223,10 @@ static u32 qpg_tx_write_one(struct qpg *pg, u32 head, const void *data,
 
 static void qpg_kick(struct qpg *pg)
 {
+	log_warning("pmic-glink: kick hwirq=%08x client=%u signal=%u\n",
+		    qpg_hwirq(pg->ipcc_client, pg->ipcc_signal),
+		    pg->ipcc_client, pg->ipcc_signal);
+
 	writel(qpg_hwirq(pg->ipcc_client, pg->ipcc_signal),
 	       pg->ipcc + QPG_IPCC_REG_SEND_ID);
 }
@@ -232,19 +236,23 @@ static int qpg_tx(struct qpg *pg, const void *hdr, size_t hlen,
 {
 	size_t len = ALIGN(hlen + dlen, 8);
 	u32 head, next;
+	size_t avail;
 
-	if (len > pg->tx_len || qpg_tx_avail(pg) < len)
-		return -EAGAIN;
-
+	avail = qpg_tx_avail(pg);
 	head = le32_to_cpu(*pg->tx_head);
 	next = head + len;
+	if (next >= pg->tx_len)
+		next %= pg->tx_len;
+
+	log_warning("pmic-glink: TX hlen=%zu dlen=%zu aligned=%zu head=%u next=%u avail=%zu\n",
+		    hlen, dlen, len, head, next, avail);
+
+	if (len > pg->tx_len || avail < len)
+		return -EAGAIN;
 
 	head = qpg_tx_write_one(pg, head, hdr, hlen);
 	if (dlen)
 		head = qpg_tx_write_one(pg, head, data, dlen);
-
-	if (next >= pg->tx_len)
-		next %= pg->tx_len;
 
 	wmb();
 	*pg->tx_head = cpu_to_le32(next);
@@ -350,13 +358,23 @@ static void qpg_parse_sc8280xp_notify(struct qcom_pmic_glink_altmode *altmode,
 				      const void *data, size_t len)
 {
 	const struct qpg_usbc_notify *notify = data;
+	enum qcom_pmic_glink_orientation orientation;
 	u8 mode;
 	u16 svid;
+
+	log_warning("pmic-glink: SC8280XP notify len=%zu expected=%zu\n",
+		    len, sizeof(*notify));
 
 	if (len != sizeof(*notify))
 		return;
 
 	svid = le32_to_cpu(notify->hdr.opcode) >> 16;
+	log_warning("pmic-glink: SC8280XP port=%u orientation=%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
+		    notify->payload[0], notify->payload[1],
+		    notify->payload[2], svid,
+		    notify->payload[8] & SC8280XP_DPAM_MASK,
+		    !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK),
+		    !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK));
 	if (svid != USB_TYPEC_DP_SID)
 		return;
 
@@ -364,8 +382,14 @@ static void qpg_parse_sc8280xp_notify(struct qcom_pmic_glink_altmode *altmode,
 	if (mode < DPAM_HPD_A)
 		return;
 
+	orientation = qpg_orientation(notify->payload[1]);
+	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
+		    notify->payload[1], orientation);
+	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
+		    mode, mode - DPAM_HPD_A);
+
 	altmode->port = notify->payload[0];
-	altmode->orientation = qpg_orientation(notify->payload[1]);
+	altmode->orientation = orientation;
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
 	altmode->hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
@@ -376,25 +400,42 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 				     const void *data, size_t len)
 {
 	const struct qpg_usbc_sc8180x_notify *msg = data;
+	enum qcom_pmic_glink_orientation orientation;
 	u32 notification;
 	u8 mode;
 	u8 mux;
+	u8 raw_orientation;
+	u8 port;
+
+	log_warning("pmic-glink: SC8180X notify len=%zu expected=%zu\n",
+		    len, sizeof(*msg));
 
 	if (len != sizeof(*msg))
 		return;
 
 	notification = le32_to_cpu(msg->notification);
+	port = notification & SC8180X_PORT_MASK;
+	raw_orientation = (notification & SC8180X_ORIENTATION_MASK) >> 8;
 	mux = (notification & SC8180X_MUX_MASK) >> 16;
+	mode = (notification & SC8180X_MODE_MASK) >> 24;
+	log_warning("pmic-glink: SC8180X notification=%08x port=%u orientation=%u mux=%u mode=%u hpd=%u irq=%u\n",
+		    notification, port, raw_orientation, mux, mode,
+		    !!(notification & SC8180X_HPD_STATE_MASK),
+		    !!(notification & SC8180X_HPD_IRQ_MASK));
 	if (mux != 2)
 		return;
 
-	mode = (notification & SC8180X_MODE_MASK) >> 24;
 	if (mode < DPAM_HPD_A)
 		return;
 
-	altmode->port = notification & SC8180X_PORT_MASK;
-	altmode->orientation =
-		qpg_orientation((notification & SC8180X_ORIENTATION_MASK) >> 8);
+	orientation = qpg_orientation(raw_orientation);
+	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
+		    raw_orientation, orientation);
+	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
+		    mode, mode - DPAM_HPD_A);
+
+	altmode->port = port;
+	altmode->orientation = orientation;
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->hpd = !!(notification & SC8180X_HPD_STATE_MASK);
 	altmode->hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
@@ -405,12 +446,23 @@ static void qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmo
 			   const void *data, size_t len)
 {
 	const struct qpg_pmic_hdr *hdr = data;
+	u32 owner, type, raw_opcode;
 	u16 opcode;
+	u16 svid;
 
-	if (len < sizeof(*hdr))
+	if (len < sizeof(*hdr)) {
+		log_warning("pmic-glink: PMIC msg too short len=%zu\n", len);
 		return;
+	}
 
-	opcode = le32_to_cpu(hdr->opcode) & 0xff;
+	owner = le32_to_cpu(hdr->owner);
+	type = le32_to_cpu(hdr->type);
+	raw_opcode = le32_to_cpu(hdr->opcode);
+	opcode = raw_opcode & 0xff;
+	svid = raw_opcode >> 16;
+
+	log_warning("pmic-glink: PMIC msg owner=%u type=%u opcode=%02x raw_opcode=%08x svid=%04x len=%zu\n",
+		    owner, type, opcode, raw_opcode, svid, len);
 
 	switch (opcode) {
 	case USBC_CMD_WRITE_REQ:
@@ -519,6 +571,9 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	param1 = le16_to_cpu(msg.param1);
 	param2 = le32_to_cpu(msg.param2);
 
+	log_warning("pmic-glink: RX cmd=%u param1=%u param2=%u avail=%zu\n",
+		    cmd, param1, param2, avail);
+
 	switch (cmd) {
 	case GLINK_CMD_VERSION:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
@@ -555,7 +610,8 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		qpg_kick(pg);
 		break;
 	default:
-		log_debug("pmic-glink: unhandled cmd %u\n", cmd);
+		log_warning("pmic-glink: unhandled RX cmd=%u param1=%u param2=%u\n",
+			    cmd, param1, param2);
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		break;
 	}
@@ -640,6 +696,9 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 
 	pg->pan_acked = false;
 
+	log_warning("pmic-glink: owner=%u channel=%s altmode_cmd=%u arg=%u\n",
+		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME, cmd, arg);
+
 	return qpg_send_data(pg, &req, sizeof(req));
 }
 
@@ -655,12 +714,16 @@ static int qpg_init(struct qpg *pg)
 	int ret;
 
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
+	log_warning("pmic-glink: smem lookup ret=%d smem=%p\n",
+		    ret, pg->smem);
 	if (ret)
 		return ret;
 
 	pg->remote_pid = 2;
 	pg->ipcc_client = QPG_IPCC_CLIENT_LPASS;
 	pg->ipcc_signal = QPG_IPCC_SIGNAL_GLINK_QMP;
+	log_warning("pmic-glink: defaults remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
+		    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
 
 	adsp = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-adsp-pas");
 	if (ofnode_valid(adsp))
@@ -670,6 +733,8 @@ static int qpg_init(struct qpg *pg)
 			if (label && !strcmp(label, "lpass"))
 				break;
 		}
+	log_warning("pmic-glink: adsp node valid=%d glink node valid=%d\n",
+		    ofnode_valid(adsp), ofnode_valid(glink));
 
 	if (ofnode_valid(glink)) {
 		u32 remote_pid;
@@ -687,6 +752,8 @@ static int qpg_init(struct qpg *pg)
 		} else {
 			ipcc = ofnode_null();
 		}
+		log_warning("pmic-glink: DT remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
+			    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
 	} else {
 		ipcc = ofnode_null();
 	}
@@ -695,22 +762,30 @@ static int qpg_init(struct qpg *pg)
 		ipcc = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-ipcc");
 	if (!ofnode_valid(ipcc))
 		ipcc = ofnode_by_compatible(ofnode_null(), "qcom,ipcc");
+	log_warning("pmic-glink: ipcc node valid=%d name=%s\n",
+		    ofnode_valid(ipcc),
+		    ofnode_valid(ipcc) ? ofnode_get_name(ipcc) : "<none>");
 	if (!ofnode_valid(ipcc))
 		return -ENOENT;
 
 	addr = ofnode_get_addr(ipcc);
+	log_warning("pmic-glink: ipcc addr=%llx\n",
+		    (unsigned long long)addr);
 	if (addr == FDT_ADDR_T_NONE)
 		return -EINVAL;
 
 	pg->ipcc = map_sysmem(addr, 0x1000);
+	log_warning("pmic-glink: ipcc mapped=%p\n", pg->ipcc);
 
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 32);
+	log_warning("pmic-glink: smem_alloc desc ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
 
 	descs = smem_get(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 &size);
+	log_warning("pmic-glink: descs=%p size=%zu\n", descs, size);
 	if (!descs || size != 32)
 		return -EINVAL;
 
@@ -721,6 +796,7 @@ static int qpg_init(struct qpg *pg)
 
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_FIFO_0,
 			 SZ_16K);
+	log_warning("pmic-glink: smem_alloc tx fifo ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
 
@@ -728,12 +804,17 @@ static int qpg_init(struct qpg *pg)
 			       QPG_SMEM_XPRT_FIFO_0, &pg->tx_len);
 	pg->rx_fifo = smem_get(pg->smem, pg->remote_pid,
 			       QPG_SMEM_XPRT_FIFO_1, &pg->rx_len);
+	log_warning("pmic-glink: tx_fifo=%p tx_len=%zu rx_fifo=%p rx_len=%zu\n",
+		    pg->tx_fifo, pg->tx_len, pg->rx_fifo, pg->rx_len);
 	if (!pg->tx_fifo || !pg->rx_fifo)
 		return -ENOENT;
 
 	*pg->rx_tail = 0;
 	*pg->tx_head = 0;
 	pg->lcid = 1;
+	log_warning("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
+		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
+		    le32_to_cpu(*pg->rx_tail), le32_to_cpu(*pg->rx_head));
 
 	return 0;
 }
@@ -748,43 +829,67 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 
 	memset(altmode, 0, sizeof(*altmode));
 
+	log_warning("pmic-glink: get_altmode start\n");
+
 	ret = qpg_init(&pg);
+	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = qpg_send_version(&pg);
+	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(&pg, altmode, qpg_done_version, 1000);
+	log_warning("pmic-glink: wait VERSION_ACK ret=%d version_acked=%d\n",
+		    ret, pg.version_acked);
 	if (ret)
 		return ret;
 
 	ret = qpg_send_open(&pg);
+	log_warning("pmic-glink: send OPEN ret=%d lcid=%u\n", ret, pg.lcid);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(&pg, altmode, qpg_done_open, 1000);
+	log_warning("pmic-glink: wait OPEN ret=%d open_acked=%d remote_opened=%d rcid=%u\n",
+		    ret, pg.open_acked, pg.remote_opened, pg.rcid);
 	if (ret)
 		return ret;
 
 	ret = qpg_send_rx_intent(&pg);
+	log_warning("pmic-glink: send RX_INTENT ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
+	log_warning("pmic-glink: send ALTMODE_PAN_EN ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(&pg, altmode, qpg_done_pan_ack, 1000);
+	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+		    ret, pg.pan_acked);
 	if (ret)
-		log_debug("pmic-glink: PAN enable ack timeout: %d\n", ret);
+		log_warning("pmic-glink: PAN_ACK timeout/nonfatal ret=%d\n",
+			    ret);
 
 	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode, 2500);
+	log_warning("pmic-glink: wait ALTMODE ret=%d dp=%d orientation=%u pin=%u port=%u hpd=%d hpd_irq=%d\n",
+		    ret, altmode->dp, altmode->orientation,
+		    altmode->pin_assignment, altmode->port,
+		    altmode->hpd, altmode->hpd_irq);
 	if (ret)
 		return ret;
 
-	qpg_send_altmode_req(&pg, ALTMODE_PAN_ACK, altmode->port);
+	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_ACK, altmode->port);
+	log_warning("pmic-glink: send ALTMODE_PAN_ACK port=%u ret=%d\n",
+		    altmode->port, ret);
+
+	log_warning("pmic-glink: final altmode dp=%d port=%u orientation=%u pin=%u hpd=%d hpd_irq=%d\n",
+		    altmode->dp, altmode->port, altmode->orientation,
+		    altmode->pin_assignment, altmode->hpd, altmode->hpd_irq);
 
 	return 0;
 }
