@@ -153,6 +153,7 @@
 #define REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING 0x038
 #define REG_DP_MAINLINK_READY		0x040
 #define DP_MAINLINK_READY_FOR_VIDEO	BIT(0)
+#define DP_MAINLINK_READY_LINK_TRAINING_SHIFT 3
 #define REG_DP_TU			0x04c
 
 /* DP Audio clock regeneration registers (SC7280 / QCM6490 DP controller) */
@@ -3777,7 +3778,8 @@ static u32 tachyon_dp_configuration_ctrl(struct tachyon_dp_priv *priv)
 static void tachyon_dp_dump_link_state(struct tachyon_dp_priv *priv,
 				       const char *tag)
 {
-	log_warning("DP LINK %s: STATE_CTRL=%08x MAINLINK_CTRL=%08x CONFIG_CTRL=%08x "
+	log_warning("DP LINK %s: STATE_CTRL=%08x MAINLINK_CTRL=%08x "
+		    "MAINLINK_READY=%08x CONFIG_CTRL=%08x "
 		    "SOFTWARE_MVID=%08x SOFTWARE_NVID=%08x TOTAL_HOR_VER=%08x "
 		    "START_HOR_VER=%08x ACTIVE_HOR_VER=%08x POLARITY=%08x "
 		    "MISC1_MISC0=%08x VALID_BOUNDARY=%08x VALID_BOUNDARY2=%08x "
@@ -3785,6 +3787,7 @@ static void tachyon_dp_dump_link_state(struct tachyon_dp_priv *priv,
 		    tag,
 		    readl(priv->link + REG_DP_STATE_CTRL),
 		    readl(priv->link + REG_DP_MAINLINK_CTRL),
+		    readl(priv->link + REG_DP_MAINLINK_READY),
 		    readl(priv->link + REG_DP_CONFIGURATION_CTRL),
 		    readl(priv->link + REG_DP_SOFTWARE_MVID),
 		    readl(priv->link + REG_DP_SOFTWARE_NVID),
@@ -3813,11 +3816,21 @@ static void tachyon_dp_mainlink_enable_training(struct tachyon_dp_priv *priv)
 {
 	u32 val = readl(priv->link + REG_DP_MAINLINK_CTRL);
 
+	val &= ~(DP_MAINLINK_CTRL_RESET | DP_MAINLINK_CTRL_ENABLE);
+	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
+
+	val |= DP_MAINLINK_CTRL_RESET;
+	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
+
+	val &= ~DP_MAINLINK_CTRL_RESET;
+	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
+
 	val |= DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL;
 	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
 
-	log_warning("DP mainlink training enable: MAINLINK_CTRL=%08x STATE_CTRL=%08x\n",
+	log_warning("DP mainlink enable linux-seq: MAINLINK_CTRL=%08x MAINLINK_READY=%08x STATE_CTRL=%08x\n",
 		    readl(priv->link + REG_DP_MAINLINK_CTRL),
+		    readl(priv->link + REG_DP_MAINLINK_READY),
 		    readl(priv->link + REG_DP_STATE_CTRL));
 }
 
@@ -3831,6 +3844,49 @@ static void tachyon_dp_configure_source_link(struct tachyon_dp_priv *priv)
 	log_warning("DP source link cfg: rate=%u bw=%02x lanes=%u enhanced=%u lane_map=%08x cfg=%08x\n",
 		    priv->rate, tachyon_dp_bw_code(priv->rate), priv->lanes,
 		    priv->caps.enhanced ? 1 : 0, priv->lane_map, cfg);
+}
+
+static int tachyon_dp_set_pattern_state_bit(struct tachyon_dp_priv *priv,
+					    u32 state_bit)
+{
+	u32 state;
+	u32 ready_bit;
+	int ret;
+
+	if (!state_bit || state_bit > 2)
+		return -EINVAL;
+
+	state = BIT(state_bit - 1);
+	ready_bit = state << DP_MAINLINK_READY_LINK_TRAINING_SHIFT;
+
+	log_warning("DP source pattern %u select: STATE_CTRL=%08x ready_bit=%08x\n",
+		    state_bit, state, ready_bit);
+
+	writel(0, priv->link + REG_DP_STATE_CTRL);
+	writel(state, priv->link + REG_DP_STATE_CTRL);
+
+	tachyon_dp_dump_link_state(priv, "after source pattern select");
+
+	ret = tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
+				   ready_bit, ready_bit, 10000);
+	if (ret) {
+		log_warning("DP source pattern %u not ready: ret=%d MAINLINK_READY=%08x STATE_CTRL=%08x MAINLINK_CTRL=%08x CONFIG_CTRL=%08x\n",
+			    state_bit, ret,
+			    readl(priv->link + REG_DP_MAINLINK_READY),
+			    readl(priv->link + REG_DP_STATE_CTRL),
+			    readl(priv->link + REG_DP_MAINLINK_CTRL),
+			    readl(priv->link + REG_DP_CONFIGURATION_CTRL));
+		tachyon_dp_dump_link_state(priv, "source pattern not ready");
+		return ret;
+	}
+
+	log_warning("DP source pattern %u ready: MAINLINK_READY=%08x ready_bit=%08x\n",
+		    state_bit, readl(priv->link + REG_DP_MAINLINK_READY),
+		    ready_bit);
+
+	tachyon_dp_dump_link_state(priv, "after source pattern ready");
+
+	return 0;
 }
 
 static bool tachyon_dp_cr_done(u8 *status, u8 lanes)
@@ -3990,6 +4046,10 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 			    dm_gpio_get_value(&priv->sbu_select) : -1,
 		    priv->lanes);
 
+	log_warning("DP TRAIN STEP: mainlink training enable\n");
+	tachyon_dp_mainlink_enable_training(priv);
+	tachyon_dp_dump_link_state(priv, "after mainlink training enable");
+
 	log_warning("DP TRAIN STEP: source link config\n");
 	tachyon_dp_configure_source_link(priv);
 	tachyon_dp_dump_link_state(priv, "after source link config");
@@ -4047,9 +4107,9 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		return -EIO;
 
 	log_warning("DP TRAIN STEP: source TP1 select\n");
-	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN1,
-	       priv->link + REG_DP_STATE_CTRL);
-	tachyon_dp_dump_link_state(priv, "after source TP1");
+	ret = tachyon_dp_set_pattern_state_bit(priv, 1);
+	if (ret)
+		return ret;
 
 	log_warning("DP TRAIN STEP: sink TP1 select\n");
 	pattern = DP_TRAINING_PATTERN_1 | DP_LINK_SCRAMBLING_DISABLE;
@@ -4067,16 +4127,12 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		return -EIO;
 	tachyon_dp_dump_link_state(priv, "after sink TP1");
 
-	log_warning("DP TRAIN STEP: mainlink training enable\n");
-	tachyon_dp_mainlink_enable_training(priv);
-	tachyon_dp_dump_link_state(priv, "after mainlink training enable");
-
 	/* --- Training Pattern 1 (clock recovery) --- */
 	for (tries = 0; tries < 5; tries++) {
 		ret = tachyon_dp_program_training_set(priv);
 		if (ret)
 			return ret;
-		udelay(400);
+		udelay(10000);
 		log_warning("DP TRAIN STEP: lane status read\n");
 		tachyon_dp_dump_link_state(priv, "before CR status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
@@ -4101,9 +4157,9 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 
 	/* --- Training Pattern 2 (channel equalization) --- */
 	log_warning("DP TRAIN STEP: source TP2 select\n");
-	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN2,
-	       priv->link + REG_DP_STATE_CTRL);
-	tachyon_dp_dump_link_state(priv, "after source TP2");
+	ret = tachyon_dp_set_pattern_state_bit(priv, 2);
+	if (ret)
+		return ret;
 
 	log_warning("DP TRAIN STEP: sink TP2 select\n");
 	pattern = DP_TRAINING_PATTERN_2 | DP_LINK_SCRAMBLING_DISABLE;
@@ -4125,7 +4181,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		ret = tachyon_dp_program_training_set(priv);
 		if (ret)
 			return ret;
-		udelay(400);
+		udelay(10000);
 		log_warning("DP TRAIN STEP: lane status read\n");
 		tachyon_dp_dump_link_state(priv, "before EQ status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
