@@ -19,6 +19,8 @@
 #include <linux/sizes.h>
 #include <smem.h>
 
+DECLARE_GLOBAL_DATA_PTR;
+
 /*
  * The Qualcomm shared memory system is an allocate-only heap structure that
  * consists of one of more memory areas that can be accessed by the processors
@@ -334,7 +336,7 @@ static void *cached_entry_to_item(struct smem_private_entry *e)
 }
 
 /* Pointer to the one and only smem handle */
-static struct qcom_smem *__smem;
+static struct qcom_smem *__smem __section(".data") = NULL;
 
 static int qcom_smem_alloc_private(struct qcom_smem *smem,
 				   struct smem_partition_header *phdr,
@@ -932,8 +934,11 @@ static int qcom_smem_probe(struct udevice *dev)
 
 static int qcom_smem_remove(struct udevice *dev)
 {
+	if (__smem) {
+		devm_kfree(dev, __smem);	
 	__smem = NULL;
-
+	}
+	
 	return 0;
 }
 
