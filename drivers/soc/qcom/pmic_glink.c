@@ -15,6 +15,7 @@
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
 #include <errno.h>
+#include <linux/err.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/kernel.h>
