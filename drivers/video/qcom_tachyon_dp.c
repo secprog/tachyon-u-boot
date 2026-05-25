@@ -103,16 +103,20 @@
 #define REG_DP_PHY_AUX_INTERRUPT_STATUS	0x0bc
 
 #define DP_INTR_AUX_XFER_DONE		BIT(3)
+#define DP_INTR_WRONG_ADDR		BIT(6)
 #define DP_INTR_TIMEOUT			BIT(9)
 #define DP_INTR_NACK_DEFER		BIT(12)
+#define DP_INTR_WRONG_DATA_CNT		BIT(15)
 #define DP_INTR_I2C_NACK		BIT(18)
 #define DP_INTR_I2C_DEFER		BIT(21)
 #define DP_INTR_AUX_ERROR		BIT(27)
 #define DP_INTERRUPT_STATUS_ACK_SHIFT	1
 #define DP_INTERRUPT_STATUS_MASK_SHIFT	2
 #define DP_INTERRUPT_STATUS1		(DP_INTR_AUX_XFER_DONE | \
+					 DP_INTR_WRONG_ADDR | \
 					 DP_INTR_TIMEOUT | \
 					 DP_INTR_NACK_DEFER | \
+					 DP_INTR_WRONG_DATA_CNT | \
 					 DP_INTR_I2C_NACK | \
 					 DP_INTR_I2C_DEFER | \
 					 DP_INTR_AUX_ERROR)
@@ -2320,17 +2324,18 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	tachyon_dp_aux_clear_hw_interrupts(priv);
 	stale_intr = tachyon_dp_aux_get_irq(priv);
 
-	writel(DP_AUX_DATA_INDEX_WRITE, priv->aux + REG_DP_AUX_DATA);
-
 	for (i = 0; i < sizeof(hdr); i++) {
-		reg = DP_AUX_DATA_INDEX_WRITE | ((u32)hdr[i] << DP_AUX_DATA_OFFSET);
+		reg = ((u32)hdr[i] << DP_AUX_DATA_OFFSET) &
+		      DP_AUX_DATA_MASK;
+		if (i == 0)
+			reg |= DP_AUX_DATA_INDEX_WRITE;
 		writel(reg, priv->aux + REG_DP_AUX_DATA);
 	}
 
 	if (!read) {
 		for (i = 0; i < len; i++) {
-			reg = DP_AUX_DATA_INDEX_WRITE |
-			      ((u32)buf[i] << DP_AUX_DATA_OFFSET);
+			reg = ((u32)buf[i] << DP_AUX_DATA_OFFSET) &
+			      DP_AUX_DATA_MASK;
 			writel(reg, priv->aux + REG_DP_AUX_DATA);
 		}
 	}
@@ -2402,6 +2407,26 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 
 		priv->aux_errors++;
 		tachyon_dp_aux_clear_hw_interrupts(priv);
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EIO;
+	}
+
+	if (intr & DP_INTR_WRONG_ADDR) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_nacks++;
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EREMOTEIO;
+	}
+
+	if (intr & DP_INTR_WRONG_DATA_CNT) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_errors++;
 		if (first_failure)
 			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 		return -EIO;
