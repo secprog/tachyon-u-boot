@@ -303,6 +303,7 @@
 #define QMP_OFF_DP_PHY			0x2a00
 #define QMP_V3_TX_TX_EMP_POST1_LVL	0x00c
 #define QMP_V3_TX_TX_DRV_LVL		0x014
+#define QMP_V3_TX_RESET_TSYNC_EN	0x024
 #define QMP_V3_TX_TRANSCEIVER_BIAS_EN	0x054
 #define QMP_V3_TX_HIGHZ_DRVR_EN	0x058
 #define QMP_V3_TX_TX_POL_INV		0x05c
@@ -343,13 +344,23 @@
 #define QMP_V4_DP_PHY_TX0_TX1_LANE_CTL	0x078
 #define QMP_V4_DP_PHY_TX2_TX3_LANE_CTL	0x09c
 #define QMP_V4_DP_PHY_STATUS		0x0dc
-#define QMP_DP_PHY_PD_CTL_PWRDN		BIT(0)
+/*
+ * QMP DP PHY PD_CTL mostly uses active-low enables, matching Qualcomm HAL
+ * *_B naming. A set bit powers/enables that block, except PSR_PWRDN.
+ */
+#define QMP_DP_PHY_PD_CTL_PWRDN_B	BIT(0)
 #define QMP_DP_PHY_PD_CTL_PSR_PWRDN	BIT(1)
-#define QMP_DP_PHY_PD_CTL_AUX_PWRDN	BIT(2)
-#define QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN BIT(3)
-#define QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN BIT(4)
-#define QMP_DP_PHY_PD_CTL_PLL_PWRDN	BIT(5)
-#define QMP_DP_PHY_PD_CTL_DP_CLAMP_EN	BIT(6)
+#define QMP_DP_PHY_PD_CTL_AUX_PWRDN_B	BIT(2)
+#define QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN_B BIT(3)
+#define QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN_B BIT(4)
+#define QMP_DP_PHY_PD_CTL_PLL_PWRDN_B	BIT(5)
+#define QMP_DP_PHY_PD_CTL_DP_CLAMP_EN_B	BIT(6)
+#define QMP_DP_PHY_PD_CTL_POWER_DOWN	0x02
+#define QMP_DP_PHY_PD_CTL_AUX_ON	0x67
+#define QMP_DP_PHY_PD_CTL_4LANE_ON	0x7d
+#define QMP_DP_PHY_STATUS_TSYNC_DONE	BIT(0)
+#define QMP_DP_PHY_STATUS_PHY_READY	BIT(1)
+#define QMP_DP_PHY_STATUS_C_READY	BIT(2)
 
 /* QMP COM control registers — from Linux phy-qcom-qmp-dp-com-v3.h model */
 #define QMP_V3_DP_COM_SW_RESET		0x004
@@ -1579,9 +1590,8 @@ static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 }
 
 /*
- * Force-clear AUX powerdown/clamp bits in the QMP DP PHY PD_CTL register.
- * The debug log shows AUX_PWRDN=1 CLAMP=1 after tachyon_dp_qmp_aux_init(),
- * which would prevent any AUX transaction from completing.
+ * Use the Qualcomm HAL AUX-only PD_CTL sequence. Most PD_CTL bits are
+ * active-low enables, so a set *_B bit means that block is powered/enabled.
  *
  * IMPORTANT: Like other QMP byte-style registers, use direct writel()
  * with a fully-computed low-byte value.  Do NOT use clrbits_le32() here;
@@ -1593,23 +1603,19 @@ static void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv)
 
 	before = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
 
-	/*
-	 * Temporary bring-up: write 0x00 to the PD_CTL low byte.
-	 * This clears ALL powerdown/clamp bits including AUX_PWRDN
-	 * and DP_CLAMP_EN.  Once AUX works, restore lane-specific
-	 * powerdown control.
-	 */
-	writel(0x00, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
 
 	after = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
 
-	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x AUX_PWRDN=%u CLAMP=%u\n",
+	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x AUX_PWRDN_B=%u CLAMP_EN_B=%u\n",
 		    before,
 		    after,
 		    after & 0xff,
-		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_AUX_PWRDN),
-		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN));
+		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_AUX_PWRDN_B),
+		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN_B));
 }
 
 static u8 tachyon_dp_qmp_pd_low(struct tachyon_dp_priv *priv)
@@ -1624,15 +1630,7 @@ static u8 tachyon_dp_qmp_status_low(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
 {
-	u8 pd = QMP_DP_PHY_PD_CTL_PWRDN |
-		QMP_DP_PHY_PD_CTL_PSR_PWRDN |
-		QMP_DP_PHY_PD_CTL_AUX_PWRDN |
-		QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN |
-		QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN |
-		QMP_DP_PHY_PD_CTL_PLL_PWRDN |
-		QMP_DP_PHY_PD_CTL_DP_CLAMP_EN;
-
-	writel(pd, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
 	priv->qmp_dp_serdes_programmed = false;
 	priv->qmp_dp_phy_started = false;
@@ -1645,11 +1643,10 @@ static void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
 static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
 {
 	/*
-	 * Bring the DP PHY out of powerdown/clamp. For first bring-up,
-	 * power all lanes and AUX. Lane-specific power gating can be
-	 * restored after AUX and DPCD work.
+	 * Bring the DP PHY out of powerdown/clamp using the 4-lane Qualcomm
+	 * HAL value. PD_CTL is mostly active-low enables, so this is not 0.
 	 */
-	writel(0x00, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	writel(QMP_DP_PHY_PD_CTL_4LANE_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
 
 	log_warning("QMP DP power-up all lanes: PD=%02x STATUS=%02x\n",
@@ -1690,6 +1687,30 @@ static void tachyon_dp_qmp_dump_pll_state(struct tachyon_dp_priv *priv,
 		log_warning("QMP DP PLL %s %-22s +%03x=%02x\n",
 			    tag, regs[i].name, regs[i].off,
 			    readl(serdes + regs[i].off) & 0xff);
+}
+
+static void tachyon_dp_qmp_dump_lane_power_state(struct tachyon_dp_priv *priv,
+						 const char *tag)
+{
+	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
+	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+
+	log_warning("QMP DP PHY %s: PD_CTL=%02x DP_PHY_CFG=%02x DP_PHY_CFG1=%02x DP_STATUS=%02x\n",
+		    tag,
+		    tachyon_dp_qmp_pd_low(priv),
+		    readl(priv->phy_dp + QMP_DP_PHY_CFG) & 0xff,
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_CFG_1) & 0xff,
+		    tachyon_dp_qmp_status_low(priv));
+	log_warning("QMP DP PHY %s TX0: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
+		    tag,
+		    readl(tx0 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
+		    readl(tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
+		    readl(tx0 + QMP_V3_TX_RESET_TSYNC_EN) & 0xff);
+	log_warning("QMP DP PHY %s TX1: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
+		    tag,
+		    readl(tx1 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
+		    readl(tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
+		    readl(tx1 + QMP_V3_TX_RESET_TSYNC_EN) & 0xff);
 }
 
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
@@ -2040,10 +2061,10 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
 {
-	writel(QMP_DP_PHY_PD_CTL_PWRDN | QMP_DP_PHY_PD_CTL_PSR_PWRDN |
-	       QMP_DP_PHY_PD_CTL_AUX_PWRDN | QMP_DP_PHY_PD_CTL_PLL_PWRDN |
-	       QMP_DP_PHY_PD_CTL_DP_CLAMP_EN,
-	       priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
 
 	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG0);
 	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
@@ -2102,10 +2123,10 @@ static void tachyon_dp_qmp_start_dp_phy(struct tachyon_dp_priv *priv)
 {
 	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
 
-	/* Critical: do not poll QMP readiness while PD_CTL is 0x7f. */
+	/* Critical: do not poll QMP readiness while PD_CTL is powered down. */
 	log_warning("QMP DP PHY start: powering up all lanes\n");
 	tachyon_dp_qmp_power_up_all_lanes(priv);
-	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=00");
+	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=7d");
 
 	writel(0x20, serdes + QMP_V4_COM_RESETSM_CNTRL);
 	udelay(10);
@@ -2277,13 +2298,15 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
 	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				  BIT(0) | BIT(1), BIT(0) | BIT(1),
-				  "DP_PHY_STATUS");
+				  QMP_DP_PHY_STATUS_PHY_READY,
+				  QMP_DP_PHY_STATUS_PHY_READY,
+				  "DP_PHY_STATUS PHY_READY");
 	if (ret) {
-		log_warning("QMP DP FAIL_STAGE=DP_PHY_STATUS ret=%d PD=%02x STATUS=%02x\n",
+		log_warning("QMP DP FAIL_STAGE=DP_PHY_READY ret=%d PD=%02x STATUS=%02x\n",
 			    ret,
 			    tachyon_dp_qmp_pd_low(priv),
 			    tachyon_dp_qmp_status_low(priv));
+		tachyon_dp_qmp_dump_lane_power_state(priv, "FAIL PHY_READY");
 		return ret;
 	}
 
@@ -2291,8 +2314,17 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	udelay(2000);
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
-	return tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				   BIT(1), BIT(1), "DP_PHY_STATUS bit1");
+	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  "DP_PHY_STATUS TSYNC_DONE");
+	if (ret)
+		log_warning("QMP DP WARN_STAGE=DP_TSYNC_DONE ret=%d PD=%02x STATUS=%02x\n",
+			    ret,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
+
+	return 0;
 }
 
 static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
