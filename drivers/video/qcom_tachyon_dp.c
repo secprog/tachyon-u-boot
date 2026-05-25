@@ -416,6 +416,7 @@ struct tachyon_dp_priv {
 	bool dp_clk_valid[TACHYON_DP_CORE_CLK_COUNT];
 	bool dpu_clk_valid[TACHYON_DPU_CLK_COUNT];
 	bool has_qmp_phy;
+	bool qmp_dp_serdes_programmed;
 	struct gpio_desc sbu_enable;
 	struct gpio_desc sbu_select;
 	struct tachyon_dp_caps caps;
@@ -1730,6 +1731,31 @@ static const struct tachyon_qmp_reg qmp_v4_dp_tx_tbl[] = {
 	{ 0x014, 0x2a }, { 0x00c, 0x20 },
 };
 
+static void tachyon_dp_qmp_rate_serdes_table(struct tachyon_dp_priv *priv,
+					     const struct tachyon_qmp_reg **regs,
+					     int *count)
+{
+	switch (priv->rate) {
+	case DP_LINK_RATE_RBR:
+		*regs = qmp_v4_dp_serdes_rbr_tbl;
+		*count = ARRAY_SIZE(qmp_v4_dp_serdes_rbr_tbl);
+		break;
+	case DP_LINK_RATE_HBR:
+		*regs = qmp_v4_dp_serdes_hbr_tbl;
+		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr_tbl);
+		break;
+	case DP_LINK_RATE_HBR3:
+		*regs = qmp_v4_dp_serdes_hbr3_tbl;
+		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr3_tbl);
+		break;
+	case DP_LINK_RATE_HBR2:
+	default:
+		*regs = qmp_v4_dp_serdes_hbr2_tbl;
+		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr2_tbl);
+		break;
+	}
+}
+
 static void tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 {
 	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
@@ -1737,10 +1763,9 @@ static void tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 	int rate_tbl_count;
 
 	/*
-	 * Assert SW reset before writing init tables so the SERDES starts
-	 * from a known state regardless of what firmware left behind.
-	 * This matches the Linux sc7280 phy-qcom-qmp-dp-phy.c sequence:
-	 * reset → write tables → de-assert → kick PLL.
+	 * Linux qmp_combo_dp_power_on() initializes DP SerDes before
+	 * programming DP TX and DP PHY registers. Keep the same ordering
+	 * here so C_READY is not polled against an unprogrammed PLL.
 	 */
 	writel(1, serdes + QMP_V4_COM_SW_RESET);
 	udelay(10);
@@ -1748,25 +1773,7 @@ static void tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 	tachyon_qmp_write_table(serdes, qmp_v4_dp_serdes_tbl,
 				ARRAY_SIZE(qmp_v4_dp_serdes_tbl));
 
-	switch (priv->rate) {
-	case DP_LINK_RATE_RBR:
-		rate_tbl = qmp_v4_dp_serdes_rbr_tbl;
-		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_rbr_tbl);
-		break;
-	case DP_LINK_RATE_HBR:
-		rate_tbl = qmp_v4_dp_serdes_hbr_tbl;
-		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr_tbl);
-		break;
-	case DP_LINK_RATE_HBR3:
-		rate_tbl = qmp_v4_dp_serdes_hbr3_tbl;
-		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr3_tbl);
-		break;
-	case DP_LINK_RATE_HBR2:
-	default:
-		rate_tbl = qmp_v4_dp_serdes_hbr2_tbl;
-		rate_tbl_count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr2_tbl);
-		break;
-	}
+	tachyon_dp_qmp_rate_serdes_table(priv, &rate_tbl, &rate_tbl_count);
 
 	tachyon_qmp_write_table(serdes, rate_tbl, rate_tbl_count);
 	tachyon_qmp_write_table(priv->phy + QMP_OFF_DP_TX0, qmp_v4_dp_tx_tbl,
@@ -1776,6 +1783,50 @@ static void tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 
 	/* De-assert SW reset; all init values are now latched */
 	writel(0, serdes + QMP_V4_COM_SW_RESET);
+	priv->qmp_dp_serdes_programmed = true;
+}
+
+static void tachyon_dp_qmp_dump_serdes_table(struct tachyon_dp_priv *priv,
+					     const char *name,
+					     const struct tachyon_qmp_reg *regs,
+					     int count)
+{
+	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	u8 actual;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		actual = readl(serdes + regs[i].off) & 0xff;
+		log_warning("QMP DP SerDes pre-C_READY %-4s[%02d] +%03x actual=%02x expected=%02x %s\n",
+			    name, i, regs[i].off, actual, regs[i].val,
+			    actual == regs[i].val ? "ok" : "MISMATCH");
+	}
+}
+
+static void tachyon_dp_qmp_dump_serdes_pre_ready(struct tachyon_dp_priv *priv)
+{
+	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	const struct tachyon_qmp_reg *rate_tbl;
+	int rate_tbl_count;
+
+	tachyon_dp_qmp_rate_serdes_table(priv, &rate_tbl, &rate_tbl_count);
+
+	log_warning("QMP DP SerDes pre-C_READY: programmed=%u rate=%u lanes=%u SW_RESET=%02x RESETSM=%02x C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+		    priv->qmp_dp_serdes_programmed,
+		    priv->rate,
+		    priv->lanes,
+		    readl(serdes + QMP_V4_COM_SW_RESET) & 0xff,
+		    readl(serdes + QMP_V4_COM_RESETSM_CNTRL) & 0xff,
+		    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+		    readl(serdes + QMP_V4_COM_CMN_STATUS) & 0xff,
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+
+	tachyon_dp_qmp_dump_serdes_table(priv, "base",
+					 qmp_v4_dp_serdes_tbl,
+					 ARRAY_SIZE(qmp_v4_dp_serdes_tbl));
+	tachyon_dp_qmp_dump_serdes_table(priv, "rate",
+					 rate_tbl, rate_tbl_count);
 }
 
 static const u8 qmp_dp_v3_pre_hbr3_hbr2[4][4] = {
@@ -1932,6 +1983,8 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 
 	tachyon_dp_qmp_power_down(priv);
 
+	tachyon_dp_qmp_program_serdes(priv);
+
 	ret = tachyon_dp_qmp_program_tx(priv);
 	if (ret)
 		return ret;
@@ -1968,6 +2021,8 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	tachyon_dp_qmp_power_up_all_lanes(priv);
 
 	writel(0x20, priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_RESETSM_CNTRL);
+	tachyon_dp_qmp_dump_serdes_pre_ready(priv);
+
 	ret = tachyon_dp_qmp_poll(priv,
 				  priv->phy + QMP_OFF_DP_SERDES,
 				  QMP_V4_COM_C_READY_STATUS,
