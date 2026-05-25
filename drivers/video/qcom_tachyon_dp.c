@@ -1786,8 +1786,6 @@ static const struct tachyon_qmp_reg qmp_v4_dp_serdes_tbl[] = {
 	{ 0x0f0, 0x00 }, { 0x10c, 0x00 }, { 0x0cc, 0x00 },
 	{ 0x00c, 0x0a }, { 0x168, 0x0a }, { 0x108, 0x00 },
 	{ 0x044, 0x17 }, { 0x174, 0x1f },
-	/* CMN_MODE: select DP output mode (rate-independent) */
-	{ 0x1a4, 0x04 },
 };
 
 static const struct tachyon_qmp_reg qmp_v4_dp_serdes_rbr_tbl[] = {
