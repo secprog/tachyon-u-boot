@@ -376,6 +376,8 @@
 #define TACHYON_DP_WRITE_CMN_MODE	0
 #define TACHYON_DP_LINUX_LANE_CTL	1
 #define TACHYON_DP_FORCE_TRAIN_RBR_X4	0
+#define TACHYON_DP_FORCE_TRAIN_RBR_X2	0
+#define TACHYON_DP_FORCE_TRAIN_RBR_X1	0
 
 /*
  * QMP DP PHY PD_CTL mostly uses active-low enables, matching Qualcomm HAL
@@ -1976,6 +1978,21 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	writel(pre_cfg, tx0 + QMP_V3_TX_TX_EMP_POST1_LVL);
 	writel(swing_cfg, tx1 + QMP_V3_TX_TX_DRV_LVL);
 	writel(pre_cfg, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
+
+	log_warning("DP TX train cfg: rate=%u lanes=%u swing=%u pre=%u drv=%02x emp=%02x "
+		    "tx0_drv=%02x tx0_emp=%02x tx0_highz=%02x tx0_bias=%02x tx0_pol=%02x "
+		    "tx1_drv=%02x tx1_emp=%02x tx1_highz=%02x tx1_bias=%02x tx1_pol=%02x\n",
+		    priv->rate, priv->lanes, swing, pre, swing_cfg, pre_cfg,
+		    readl(tx0 + QMP_V3_TX_TX_DRV_LVL) & 0xff,
+		    readl(tx0 + QMP_V3_TX_TX_EMP_POST1_LVL) & 0xff,
+		    readl(tx0 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
+		    readl(tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
+		    readl(tx0 + QMP_V3_TX_TX_POL_INV) & 0xff,
+		    readl(tx1 + QMP_V3_TX_TX_DRV_LVL) & 0xff,
+		    readl(tx1 + QMP_V3_TX_TX_EMP_POST1_LVL) & 0xff,
+		    readl(tx1 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
+		    readl(tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
+		    readl(tx1 + QMP_V3_TX_TX_POL_INV) & 0xff);
 
 	/*
 	 * TX bias and polarity are handled separately by
@@ -3741,6 +3758,81 @@ static u8 tachyon_dp_bw_code(u32 rate)
 	return DP_LINK_BW_1_62;
 }
 
+static u32 tachyon_dp_configuration_ctrl(struct tachyon_dp_priv *priv)
+{
+	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
+		  DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
+		  DP_CONFIGURATION_CTRL_P_INTERLACED |
+		  (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT) |
+		  ((priv->lanes - 1) <<
+		   DP_CONFIGURATION_CTRL_NUM_OF_LANES_SHIFT) |
+		  (2 << DP_CONFIGURATION_CTRL_BPC_SHIFT);
+
+	if (priv->caps.enhanced)
+		cfg |= DP_CONFIGURATION_CTRL_ENHANCED_FRAMING;
+
+	return cfg;
+}
+
+static void tachyon_dp_dump_link_state(struct tachyon_dp_priv *priv,
+				       const char *tag)
+{
+	log_warning("DP LINK %s: STATE_CTRL=%08x MAINLINK_CTRL=%08x CONFIG_CTRL=%08x "
+		    "SOFTWARE_MVID=%08x SOFTWARE_NVID=%08x TOTAL_HOR_VER=%08x "
+		    "START_HOR_VER=%08x ACTIVE_HOR_VER=%08x POLARITY=%08x "
+		    "MISC1_MISC0=%08x VALID_BOUNDARY=%08x VALID_BOUNDARY2=%08x "
+		    "TU=%08x\n",
+		    tag,
+		    readl(priv->link + REG_DP_STATE_CTRL),
+		    readl(priv->link + REG_DP_MAINLINK_CTRL),
+		    readl(priv->link + REG_DP_CONFIGURATION_CTRL),
+		    readl(priv->link + REG_DP_SOFTWARE_MVID),
+		    readl(priv->link + REG_DP_SOFTWARE_NVID),
+		    readl(priv->link + REG_DP_TOTAL_HOR_VER),
+		    readl(priv->link + REG_DP_START_HOR_VER_FROM_SYNC),
+		    readl(priv->link + REG_DP_ACTIVE_HOR_VER),
+		    readl(priv->link + REG_DP_HSYNC_VSYNC_WIDTH_POLARITY),
+		    readl(priv->link + REG_DP_MISC1_MISC0),
+		    readl(priv->link + REG_DP_VALID_BOUNDARY),
+		    readl(priv->link + REG_DP_VALID_BOUNDARY_2),
+		    readl(priv->link + REG_DP_TU));
+}
+
+static void tachyon_dp_mainlink_disable(struct tachyon_dp_priv *priv)
+{
+	u32 val = readl(priv->link + REG_DP_MAINLINK_CTRL);
+
+	val &= ~(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_CTRL_RESET);
+	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
+
+	log_warning("DP mainlink disable: MAINLINK_CTRL=%08x\n",
+		    readl(priv->link + REG_DP_MAINLINK_CTRL));
+}
+
+static void tachyon_dp_mainlink_enable_training(struct tachyon_dp_priv *priv)
+{
+	u32 val = readl(priv->link + REG_DP_MAINLINK_CTRL);
+
+	val |= DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL;
+	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
+
+	log_warning("DP mainlink training enable: MAINLINK_CTRL=%08x STATE_CTRL=%08x\n",
+		    readl(priv->link + REG_DP_MAINLINK_CTRL),
+		    readl(priv->link + REG_DP_STATE_CTRL));
+}
+
+static void tachyon_dp_configure_source_link(struct tachyon_dp_priv *priv)
+{
+	u32 cfg = tachyon_dp_configuration_ctrl(priv);
+
+	writel(priv->lane_map, priv->link + REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING);
+	writel(cfg, priv->link + REG_DP_CONFIGURATION_CTRL);
+
+	log_warning("DP source link cfg: rate=%u bw=%02x lanes=%u enhanced=%u lane_map=%08x cfg=%08x\n",
+		    priv->rate, tachyon_dp_bw_code(priv->rate), priv->lanes,
+		    priv->caps.enhanced ? 1 : 0, priv->lane_map, cfg);
+}
+
 static bool tachyon_dp_cr_done(u8 *status, u8 lanes)
 {
 	u8 lane;
@@ -3801,7 +3893,7 @@ static void tachyon_dp_apply_adjust(struct tachyon_dp_priv *priv, u8 *adj)
 
 static int tachyon_dp_program_training_set(struct tachyon_dp_priv *priv)
 {
-	u8 training[4] = {};
+	u8 training[4] = {}, rb[4] = {};
 	u8 i;
 	int ret;
 
@@ -3812,14 +3904,38 @@ static int tachyon_dp_program_training_set(struct tachyon_dp_priv *priv)
 	for (i = 0; i < priv->lanes; i++)
 		training[i] = tachyon_dp_train_set(priv, i);
 
-	return tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_LANE0_SET,
-				    training, priv->lanes);
+	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_LANE0_SET,
+				   training, priv->lanes);
+	if (ret)
+		return ret;
+
+	tachyon_dp_dump_link_state(priv, "after lane train set");
+
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_TRAINING_LANE0_SET,
+				   rb, sizeof(rb));
+	if (ret) {
+		log_warning("DP DPCD lane set verify failed: ret=%d\n", ret);
+		return ret;
+	}
+
+	log_warning("DP DPCD lane set verify: lane0=%02x lane1=%02x lane2=%02x lane3=%02x\n",
+		    rb[0], rb[1], rb[2], rb[3]);
+
+	for (i = 0; i < priv->lanes; i++) {
+		if (rb[i] != training[i]) {
+			log_warning("DP DPCD lane set mismatch: lane=%u got=%02x expected=%02x\n",
+				    i, rb[i], training[i]);
+			return -EIO;
+		}
+	}
+
+	return 0;
 }
 
 static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				    u8 lanes)
 {
-	u8 link[2], pattern, status[6], adj[2];
+	u8 link[2], rb[2], pattern, pattern_rb, status[6], adj[2];
 	int ret, tries;
 	u8 lane;
 
@@ -3830,6 +3946,23 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	rate = DP_LINK_RATE_RBR;
 	lanes = 4;
 #endif
+#if TACHYON_DP_FORCE_TRAIN_RBR_X2
+	if (rate != DP_LINK_RATE_RBR || lanes != 2)
+		log_warning("DP force RBR x2 overrides requested %u kHz x %u lanes\n",
+			    rate, lanes);
+	rate = DP_LINK_RATE_RBR;
+	lanes = 2;
+#endif
+#if TACHYON_DP_FORCE_TRAIN_RBR_X1
+	if (rate != DP_LINK_RATE_RBR || lanes != 1)
+		log_warning("DP force RBR x1 overrides requested %u kHz x %u lanes\n",
+			    rate, lanes);
+	rate = DP_LINK_RATE_RBR;
+	lanes = 1;
+#endif
+
+	lanes = min_t(u8, lanes, priv->max_lanes ?: 1);
+	lanes = min_t(u8, lanes, priv->caps.lanes ?: 1);
 
 	priv->rate = rate;
 	priv->lanes = lanes;
@@ -3839,41 +3972,113 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	log_warning("DP training: rate=%u kHz lanes=%u\n",
 		    priv->rate, priv->lanes);
 
+	log_warning("DP TRAIN STEP: disable mainlink\n");
+	tachyon_dp_mainlink_disable(priv);
+	tachyon_dp_dump_link_state(priv, "after mainlink disable");
+
 	ret = tachyon_dp_qmp_configure(priv);
 	if (ret)
 		return ret;
 
+	log_warning("DP orientation summary: orientation=%u TYPEC=%02x PHY_MODE=%02x SBU_EN=%d SBU_SEL=%d lane_count=%u\n",
+		    priv->orientation,
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
+		    dm_gpio_is_valid(&priv->sbu_enable) ?
+			    dm_gpio_get_value(&priv->sbu_enable) : -1,
+		    dm_gpio_is_valid(&priv->sbu_select) ?
+			    dm_gpio_get_value(&priv->sbu_select) : -1,
+		    priv->lanes);
+
+	log_warning("DP TRAIN STEP: source link config\n");
+	tachyon_dp_configure_source_link(priv);
+	tachyon_dp_dump_link_state(priv, "after source link config");
+
 	link[0] = tachyon_dp_bw_code(priv->rate);
 	link[1] = priv->lanes |
 		  (priv->caps.enhanced ? DP_ENHANCED_FRAME_CAP : 0);
+	log_warning("DP TRAIN STEP: sink link config\n");
+	tachyon_dp_dump_link_state(priv, "before DPCD link cfg");
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_LINK_BW_SET, link,
 				   sizeof(link));
 	if (ret)
 		return ret;
 	log_warning("DP DPCD link cfg: rate=%u lanes=%u enhanced=%u lane_count_reg=%02x\n",
 		    priv->rate, priv->lanes, priv->caps.enhanced, link[1]);
+	tachyon_dp_dump_link_state(priv, "after DPCD link cfg");
+
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_LINK_BW_SET, rb,
+				   sizeof(rb));
+	if (ret)
+		return ret;
+	log_warning("DP DPCD link cfg verify: bw=%02x lane_count=%02x expected_bw=%02x expected_lane=%02x\n",
+		    rb[0], rb[1], link[0], link[1]);
+	if (memcmp(rb, link, sizeof(link)))
+		return -EIO;
 
 	pattern = 0;
-	tachyon_dp_aux_retry(priv, false, false, DP_DOWNSPREAD_CTRL,
-			     &pattern, 1);
-	pattern = 1;
-	tachyon_dp_aux_retry(priv, false, false,
-			     DP_MAIN_LINK_CHANNEL_CODING_SET, &pattern, 1);
+	ret = tachyon_dp_aux_retry(priv, false, false, DP_DOWNSPREAD_CTRL,
+				   &pattern, 1);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_DOWNSPREAD_CTRL,
+				   &pattern_rb, 1);
+	if (ret)
+		return ret;
+	log_warning("DP DPCD downspread verify: downspread=%02x expected=%02x\n",
+		    pattern_rb, pattern);
+	if (pattern_rb != pattern)
+		return -EIO;
 
+	pattern = 1;
+	ret = tachyon_dp_aux_retry(priv, false, false,
+				   DP_MAIN_LINK_CHANNEL_CODING_SET, &pattern,
+				   1);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true,
+				   DP_MAIN_LINK_CHANNEL_CODING_SET,
+				   &pattern_rb, 1);
+	if (ret)
+		return ret;
+	log_warning("DP DPCD coding verify: coding=%02x expected=%02x\n",
+		    pattern_rb, pattern);
+	if (pattern_rb != pattern)
+		return -EIO;
+
+	log_warning("DP TRAIN STEP: source TP1 select\n");
+	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN1,
+	       priv->link + REG_DP_STATE_CTRL);
+	tachyon_dp_dump_link_state(priv, "after source TP1");
+
+	log_warning("DP TRAIN STEP: sink TP1 select\n");
 	pattern = DP_TRAINING_PATTERN_1 | DP_LINK_SCRAMBLING_DISABLE;
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
 				   &pattern, 1);
 	if (ret)
 		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_TRAINING_PATTERN_SET,
+				   &pattern_rb, 1);
+	if (ret)
+		return ret;
+	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+		    pattern_rb, pattern);
+	if (pattern_rb != pattern)
+		return -EIO;
+	tachyon_dp_dump_link_state(priv, "after sink TP1");
 
-	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN1, priv->link + REG_DP_STATE_CTRL);
+	log_warning("DP TRAIN STEP: mainlink training enable\n");
+	tachyon_dp_mainlink_enable_training(priv);
+	tachyon_dp_dump_link_state(priv, "after mainlink training enable");
 
 	/* --- Training Pattern 1 (clock recovery) --- */
 	for (tries = 0; tries < 5; tries++) {
 		ret = tachyon_dp_program_training_set(priv);
 		if (ret)
 			return ret;
-		udelay(10000);
+		udelay(400);
+		log_warning("DP TRAIN STEP: lane status read\n");
+		tachyon_dp_dump_link_state(priv, "before CR status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
 		if (ret)
@@ -3887,6 +4092,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	if (tries == 5) {
 		log_warning("DP clock recovery failed: status=%02x %02x %02x\n",
 			    status[0], status[1], status[2]);
+		tachyon_dp_dump_link_state(priv, "clock recovery failed");
 		return -EIO;
 	}
 
@@ -3894,19 +4100,34 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		 tries + 1, status[0], status[1], status[2]);
 
 	/* --- Training Pattern 2 (channel equalization) --- */
+	log_warning("DP TRAIN STEP: source TP2 select\n");
+	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN2,
+	       priv->link + REG_DP_STATE_CTRL);
+	tachyon_dp_dump_link_state(priv, "after source TP2");
+
+	log_warning("DP TRAIN STEP: sink TP2 select\n");
 	pattern = DP_TRAINING_PATTERN_2 | DP_LINK_SCRAMBLING_DISABLE;
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
 				   &pattern, 1);
 	if (ret)
 		return ret;
-
-	writel(DP_STATE_CTRL_LINK_TRAINING_PATTERN2, priv->link + REG_DP_STATE_CTRL);
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_TRAINING_PATTERN_SET,
+				   &pattern_rb, 1);
+	if (ret)
+		return ret;
+	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+		    pattern_rb, pattern);
+	if (pattern_rb != pattern)
+		return -EIO;
+	tachyon_dp_dump_link_state(priv, "after sink TP2");
 
 	for (tries = 0; tries < 5; tries++) {
 		ret = tachyon_dp_program_training_set(priv);
 		if (ret)
 			return ret;
-		udelay(10000);
+		udelay(400);
+		log_warning("DP TRAIN STEP: lane status read\n");
+		tachyon_dp_dump_link_state(priv, "before EQ status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
 		if (ret)
@@ -3920,6 +4141,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	if (tries == 5) {
 		log_warning("DP channel equalization failed: status=%02x %02x %02x\n",
 			    status[0], status[1], status[2]);
+		tachyon_dp_dump_link_state(priv, "channel EQ failed");
 		return -EIO;
 	}
 
@@ -3929,9 +4151,20 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 			 priv->swing[lane], priv->pre[lane]);
 
 	pattern = DP_TRAINING_PATTERN_DISABLE;
-	tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
-			     &pattern, 1);
+	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
+				   &pattern, 1);
+	if (ret)
+		return ret;
+	ret = tachyon_dp_aux_retry(priv, false, true, DP_TRAINING_PATTERN_SET,
+				   &pattern_rb, 1);
+	if (ret)
+		return ret;
+	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+		    pattern_rb, pattern);
+	if (pattern_rb != pattern)
+		return -EIO;
 	writel(DP_STATE_CTRL_SEND_VIDEO, priv->link + REG_DP_STATE_CTRL);
+	tachyon_dp_dump_link_state(priv, "after training disable");
 
 	return 0;
 }
@@ -3943,7 +4176,14 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 		DP_LINK_RATE_RBR,
 	};
 	static const u8 lane_counts[] = { 4, 2, 1 };
+	u32 policy_rate = priv->rate;
+	u8 policy_lanes = priv->lanes;
 	int r, l, ret = -EIO;
+
+	log_warning("DP train policy: sink_lanes=%u graph_lanes=%u pin_lanes=%u policy_lanes=%u max_rate=%u\n",
+		    priv->caps.lanes, priv->graph_lanes,
+		    tachyon_dp_pin_assignment_lanes(priv), policy_lanes,
+		    priv->max_rate);
 
 #if TACHYON_DP_FORCE_TRAIN_RBR_X4
 	/*
@@ -3960,12 +4200,32 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	log_warning("DP force RBR x4 failed: %d\n", ret);
 	return ret;
 #endif
+#if TACHYON_DP_FORCE_TRAIN_RBR_X2
+	log_warning("DP force RBR x2 training test\n");
+	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 2);
+	if (!ret) {
+		log_info("DP link trained at RBR x2 (forced)\n");
+		return 0;
+	}
+	log_warning("DP force RBR x2 failed: %d\n", ret);
+	return ret;
+#endif
+#if TACHYON_DP_FORCE_TRAIN_RBR_X1
+	log_warning("DP force RBR x1 training test\n");
+	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 1);
+	if (!ret) {
+		log_info("DP link trained at RBR x1 (forced)\n");
+		return 0;
+	}
+	log_warning("DP force RBR x1 failed: %d\n", ret);
+	return ret;
+#endif
 
 	for (r = 0; r < ARRAY_SIZE(rates); r++) {
-		if (rates[r] > priv->rate)
+		if (rates[r] > policy_rate)
 			continue;
 		for (l = 0; l < ARRAY_SIZE(lane_counts); l++) {
-			if (lane_counts[l] > priv->lanes)
+			if (lane_counts[l] > policy_lanes)
 				continue;
 			ret = tachyon_dp_link_train_at(priv, rates[r],
 						       lane_counts[l]);
@@ -4140,23 +4400,12 @@ static void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
 
 static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 {
-	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
-		  DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
-		  DP_CONFIGURATION_CTRL_P_INTERLACED |
-		  (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT) |
-		  ((priv->lanes - 1) << DP_CONFIGURATION_CTRL_NUM_OF_LANES_SHIFT) |
-		  (2 << DP_CONFIGURATION_CTRL_BPC_SHIFT);
-
-	if (priv->caps.enhanced)
-		cfg |= DP_CONFIGURATION_CTRL_ENHANCED_FRAMING;
-
 	writel(DP_SW_RESET, priv->ctrl + REG_DP_SW_RESET);
 	udelay(1000);
 	writel(0, priv->ctrl + REG_DP_SW_RESET);
 
 	tachyon_dp_program_video_timing(priv);
-	writel(priv->lane_map, priv->link + REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING);
-	writel(cfg, priv->link + REG_DP_CONFIGURATION_CTRL);
+	tachyon_dp_configure_source_link(priv);
 	writel(DP_MAINLINK_CTRL_RESET, priv->link + REG_DP_MAINLINK_CTRL);
 	udelay(1000);
 	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
