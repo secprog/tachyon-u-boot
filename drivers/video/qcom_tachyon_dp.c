@@ -359,6 +359,15 @@
 #define TACHYON_DP_CORE_CLK_COUNT	4
 #define TACHYON_DPU_CLK_COUNT		6
 
+/*
+ * Temporary bring-up guard: when set to 1, the DP driver does NOT
+ * re-initialize the QMP COM block (POWER_DOWN_CTRL, RESET_OVRD_CTRL,
+ * SW_RESET, SWI_CTRL).  The phy-qcom-qmp-combo provider owns COM
+ * init via generic_phy_init().  The DP driver only updates TYPEC_CTRL
+ * and PHY_MODE_CTRL for orientation / DP mode selection.
+ */
+#define TACHYON_DP_SKIP_LOCAL_COM_RESET 1
+
 enum tachyon_dp_orientation {
 	TACHYON_DP_ORIENTATION_NORMAL,
 	TACHYON_DP_ORIENTATION_REVERSE,
@@ -1525,6 +1534,32 @@ static void tachyon_dp_qmp_typec_dp_select(struct tachyon_dp_priv *priv)
 }
 
 /*
+ * Slim COM update: ONLY writes TYPEC_CTRL and PHY_MODE_CTRL.
+ * This replaces tachyon_dp_qmp_com_init() when TACHYON_DP_SKIP_LOCAL_COM_RESET
+ * is active. The phy-qcom-qmp-combo provider owns POWER_DOWN_CTRL,
+ * RESET_OVRD_CTRL, SW_RESET, and SWI_CTRL via generic_phy_init().
+ *
+ * Do NOT toggle COM power/reset registers from here — repeated COM reset
+ * from the DP driver can clobber the provider's state and cause C_READY=0.
+ */
+static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
+{
+	u32 typec;
+
+	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
+	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
+		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
+
+	writel(typec, priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+	writel(QMP_DP_COM_DP_MODE,
+	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+
+	log_warning("QMP COM orientation update: TYPEC=%02x MODE=%02x\n",
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL));
+}
+
+/*
  * Force-clear AUX powerdown/clamp bits in the QMP DP PHY PD_CTL register.
  * The debug log shows AUX_PWRDN=1 CLAMP=1 after tachyon_dp_qmp_aux_init(),
  * which would prevent any AUX transaction from completing.
@@ -1960,6 +1995,17 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	u32 typec;
 	u32 vco_div;
 	int ret;
+	u32 com_pwr, rovrd, swr, swi, c_ready, cmn, dp_pd, dp_status;
+
+	/*
+	 * Force safest rate for initial DPCD bring-up.
+	 * Higher rates can be restored after C_READY and DPCD_REV succeed.
+	 */
+	priv->rate = DP_LINK_RATE_RBR;
+	priv->lanes = min_t(u8, priv->max_lanes ? priv->max_lanes : 4, 4);
+
+	log_warning("QMP DP configure enter: rate=%u lanes=%u orientation=%u\n",
+		    priv->rate, priv->lanes, priv->orientation);
 
 	if (priv->dp_clk_valid[2]) {
 		long clk_ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
@@ -1979,16 +2025,37 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	writel(typec,
 	       priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
 
+	/* Compact register dump before DP SerDes programming */
+	com_pwr = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL);
+	rovrd   = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL);
+	swr     = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET);
+	swi     = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL);
+	c_ready = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff;
+	cmn     = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff;
+	dp_pd   = tachyon_dp_qmp_pd_low(priv);
+	dp_status = tachyon_dp_qmp_status_low(priv);
+
+	log_warning("QMP DP dump before: COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
+		    com_pwr, rovrd, swr, swi,
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
+		    c_ready, cmn, dp_pd, dp_status);
+
 	tachyon_dp_qmp_aux_init(priv);
 
 	tachyon_dp_qmp_power_down(priv);
 
+	log_warning("QMP DP SERDES table start\n");
 	tachyon_dp_qmp_program_serdes(priv);
+	log_warning("QMP DP SERDES table done\n");
 
+	log_warning("QMP DP TX table start\n");
 	ret = tachyon_dp_qmp_program_tx(priv);
+	log_warning("QMP DP TX table done ret=%d\n", ret);
 	if (ret)
 		return ret;
 
+	log_warning("QMP DP PHY table start\n");
 	writel(0x0f, priv->phy_dp + QMP_V4_DP_PHY_CFG_1);
 	writel(mode, priv->phy_dp + QMP_DP_PHY_MODE);
 	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
@@ -2016,31 +2083,72 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	writel(0x05, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x09, priv->phy_dp + QMP_DP_PHY_CFG);
+	log_warning("QMP DP PHY table done\n");
 
 	/* Critical: do not poll QMP readiness while PD_CTL is 0x7f. */
+	log_warning("QMP DP PHY start: powering up all lanes\n");
 	tachyon_dp_qmp_power_up_all_lanes(priv);
+	log_warning("QMP DP PHY start done\n");
 
 	writel(0x20, priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_RESETSM_CNTRL);
 	tachyon_dp_qmp_dump_serdes_pre_ready(priv);
+
+	/* Compact register dump after DP SerDes programming */
+	c_ready = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff;
+	cmn     = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff;
+	dp_pd   = tachyon_dp_qmp_pd_low(priv);
+	dp_status = tachyon_dp_qmp_status_low(priv);
+
+	log_warning("QMP DP dump after:  COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
+		    c_ready, cmn, dp_pd, dp_status);
+
+	log_warning("QMP DP before C_READY poll: did_program_serdes=%d did_start_phy=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+		    priv->qmp_dp_serdes_programmed, 1,
+		    c_ready, cmn, dp_pd, dp_status);
 
 	ret = tachyon_dp_qmp_poll(priv,
 				  priv->phy + QMP_OFF_DP_SERDES,
 				  QMP_V4_COM_C_READY_STATUS,
 				  BIT(0), BIT(0), "C_READY");
-	if (ret)
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=C_READY ret=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+			    ret,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
 		return ret;
+	}
+
 	ret = tachyon_dp_qmp_poll(priv,
 				  priv->phy + QMP_OFF_DP_SERDES,
 				  QMP_V4_COM_CMN_STATUS,
 				  BIT(0), BIT(0), "CMN_STATUS bit0");
-	if (ret)
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=CMN_BIT0 ret=%d C_READY=%02x CMN=%02x\n",
+			    ret,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff);
 		return ret;
+	}
+
 	ret = tachyon_dp_qmp_poll(priv,
 				  priv->phy + QMP_OFF_DP_SERDES,
 				  QMP_V4_COM_CMN_STATUS,
 				  BIT(1), BIT(1), "CMN_STATUS bit1");
-	if (ret)
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=CMN_BIT1 ret=%d C_READY=%02x CMN=%02x\n",
+			    ret,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff);
 		return ret;
+	}
 
 	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
 
@@ -2048,7 +2156,7 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 				  BIT(0) | BIT(1), BIT(0) | BIT(1),
 				  "DP_PHY_STATUS");
 	if (ret) {
-		log_warning("DP PHY full lock failed: ret=%d PD=%02x STATUS=%02x\n",
+		log_warning("QMP DP FAIL_STAGE=DP_PHY_STATUS ret=%d PD=%02x STATUS=%02x\n",
 			    ret,
 			    tachyon_dp_qmp_pd_low(priv),
 			    tachyon_dp_qmp_status_low(priv));
@@ -3913,10 +4021,13 @@ static void tachyon_dp_prepare_aux_for_orientation(
 		    priv->orientation, priv->pin_assignment);
 
 	/* Initialize QMP COM block (resets, mode, Type-C) before AUX */
+#if TACHYON_DP_SKIP_LOCAL_COM_RESET
+	log_warning("QMP DP local COM reset skipped; provider owns COM\n");
+	tachyon_dp_qmp_com_orientation_update(priv);
+#else
 	tachyon_dp_qmp_com_init(priv);
-
-	/* Reprogram QMP Type-C select and DP mode */
 	tachyon_dp_qmp_typec_dp_select(priv);
+#endif
 
 	/* Reprogram the external SBU mux */
 	tachyon_dp_program_sbu_mux(priv);
@@ -4016,9 +4127,22 @@ static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
 	log_warning("DP full QMP pre-DPCD configure: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
 
+	log_warning("DP FULL-QMP path enter\n");
+
 	tachyon_dp_qmp_com_dump(priv, "probe-before-com-init");
 
+	log_warning("DP FULL-QMP: before DP SerDes program C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+		    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
+		    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff,
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv));
+
+#if TACHYON_DP_SKIP_LOCAL_COM_RESET
+	log_warning("QMP DP local COM reset skipped; provider owns COM\n");
+	tachyon_dp_qmp_com_orientation_update(priv);
+#else
 	tachyon_dp_qmp_com_init(priv);
+#endif
 
 	ret = tachyon_dp_qmp_configure(priv);
 
@@ -4027,8 +4151,15 @@ static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
 		    tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 
-	if (ret)
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=QMP_CONFIGURE ret=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+			    ret,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
 		return ret;
+	}
 
 	tachyon_dp_qmp_force_aux_on(priv);
 	tachyon_dp_aux_hw_init(priv);
