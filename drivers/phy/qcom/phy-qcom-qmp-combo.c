@@ -315,8 +315,11 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 
 	for (i = 0; i < qmp->num_clks; i++) {
 		ret = clk_enable(&qmp->clks[i]);
+		dev_info(qmp->dev, "QMP clk %s enable ret=%d\n",
+			 qmp_combo_phy_clk_l[i], ret);
 		if (ret) {
-			printf("Failed to enable clock %d: %d\n", i, ret);
+			printf("Failed to enable clock %s: %d\n",
+			       qmp_combo_phy_clk_l[i], ret);
 			while (--i >= 0)
 				clk_disable(&qmp->clks[i]);
 			for (i = qmp->num_vregs - 1; i >= 0; i--)
