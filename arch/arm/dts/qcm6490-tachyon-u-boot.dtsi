@@ -51,12 +51,16 @@
 	bootph-all;
 };
 
-&{/smem} {
-	memory-region = <&smem_mem>;
+&{/reserved-memory} {
 	bootph-all;
 };
 
 &smem_mem {
+	bootph-all;
+};
+
+&{/smem} {
+	memory-region = <&smem_mem>;
 	bootph-all;
 };
 
