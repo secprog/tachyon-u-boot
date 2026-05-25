@@ -1770,25 +1770,34 @@ static void tachyon_dp_qmp_rate_serdes_table(struct tachyon_dp_priv *priv,
 					     const struct tachyon_qmp_reg **regs,
 					     int *count)
 {
+	const char *name;
+
 	switch (priv->rate) {
 	case DP_LINK_RATE_RBR:
 		*regs = qmp_v4_dp_serdes_rbr_tbl;
 		*count = ARRAY_SIZE(qmp_v4_dp_serdes_rbr_tbl);
+		name = "RBR";
 		break;
 	case DP_LINK_RATE_HBR:
 		*regs = qmp_v4_dp_serdes_hbr_tbl;
 		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr_tbl);
+		name = "HBR";
 		break;
 	case DP_LINK_RATE_HBR3:
 		*regs = qmp_v4_dp_serdes_hbr3_tbl;
 		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr3_tbl);
+		name = "HBR3";
 		break;
 	case DP_LINK_RATE_HBR2:
 	default:
 		*regs = qmp_v4_dp_serdes_hbr2_tbl;
 		*count = ARRAY_SIZE(qmp_v4_dp_serdes_hbr2_tbl);
+		name = "HBR2";
 		break;
 	}
+
+	log_warning("QMP DP SerDes rate table: rate=%u table=%s count=%d\n",
+		    priv->rate, name, *count);
 }
 
 static int tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
@@ -2014,6 +2023,10 @@ static int tachyon_dp_qmp_program_dp_phy_regs(struct tachyon_dp_priv *priv)
 	       priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL);
 	writel(priv->lanes > 2 ? 0x05 : 0x00,
 	       priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL);
+	log_warning("QMP DP lane cfg: lanes=%u TX0_TX1=%02x TX2_TX3=%02x\n",
+		    priv->lanes,
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL) & 0xff,
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL) & 0xff);
 
 	switch (priv->rate) {
 	case DP_LINK_RATE_RBR:
@@ -2027,6 +2040,8 @@ static int tachyon_dp_qmp_program_dp_phy_regs(struct tachyon_dp_priv *priv)
 		vco_div = 0x0;
 		break;
 	}
+	log_warning("QMP DP rate cfg: rate=%u vco_div=%u\n",
+		    priv->rate, vco_div);
 	writel(vco_div, priv->phy_dp + QMP_V4_DP_PHY_VCO_DIV);
 
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
@@ -2103,12 +2118,17 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	int ret;
 	u32 com_pwr, rovrd, swr, swi, c_ready, cmn, dp_pd, dp_status;
 
-	/*
-	 * Force safest rate for initial DPCD bring-up.
-	 * Higher rates can be restored after C_READY and DPCD_REV succeed.
-	 */
-	priv->rate = DP_LINK_RATE_RBR;
-	priv->lanes = min_t(u8, priv->max_lanes ? priv->max_lanes : 4, 4);
+	if (!priv->rate || !priv->lanes) {
+		log_warning("QMP DP configure invalid training state: rate=%u lanes=%u\n",
+			    priv->rate, priv->lanes);
+		return -EINVAL;
+	}
+
+	if (priv->lanes > 4) {
+		log_warning("QMP DP configure invalid lane count: %u\n",
+			    priv->lanes);
+		return -EINVAL;
+	}
 
 	log_warning("QMP DP configure enter: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
@@ -3643,18 +3663,22 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	memset(priv->swing, 0, sizeof(priv->swing));
 	memset(priv->pre, 0, sizeof(priv->pre));
 
-	log_warning("DP training: rate=%d kHz lanes=%u\n", rate, lanes);
+	log_warning("DP training: rate=%u kHz lanes=%u\n",
+		    priv->rate, priv->lanes);
 
 	ret = tachyon_dp_qmp_configure(priv);
 	if (ret)
 		return ret;
 
-	link[0] = tachyon_dp_bw_code(rate);
-	link[1] = lanes | (priv->caps.enhanced ? DP_ENHANCED_FRAME_CAP : 0);
+	link[0] = tachyon_dp_bw_code(priv->rate);
+	link[1] = priv->lanes |
+		  (priv->caps.enhanced ? DP_ENHANCED_FRAME_CAP : 0);
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_LINK_BW_SET, link,
 				   sizeof(link));
 	if (ret)
 		return ret;
+	log_warning("DP DPCD link cfg: rate=%u lanes=%u enhanced=%u lane_count_reg=%02x\n",
+		    priv->rate, priv->lanes, priv->caps.enhanced, link[1]);
 
 	pattern = 0;
 	tachyon_dp_aux_retry(priv, false, false, DP_DOWNSPREAD_CTRL,
