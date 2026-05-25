@@ -3285,11 +3285,36 @@ static void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 	priv->mode_count = out;
 }
 
+static int tachyon_dp_preferred_mode_index(struct tachyon_dp_priv *priv)
+{
+	int i;
+
+	if (!priv->mode_count)
+		return -1;
+
+	/*
+	 * For first-light bring-up on a fallback RBR x2 link, prefer a
+	 * conservative CEA mode even if larger EDID modes still fit on paper.
+	 */
+	if (priv->max_rate <= DP_LINK_RATE_RBR && priv->max_lanes <= 2) {
+		for (i = 0; i < priv->mode_count; i++) {
+			if (priv->modes[i].width == 1280 &&
+			    priv->modes[i].height == 720 &&
+			    priv->modes[i].has_timing &&
+			    tachyon_dp_mode_fits_link(priv,
+						      &priv->modes[i].timing))
+				return i;
+		}
+	}
+
+	return 0;
+}
+
 static void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv)
 {
 	char out[TACHYON_DP_EDID_MODE_STR_SIZE] = {};
 	int pos = 0;
-	int i;
+	int i, pref;
 
 	if (!priv->mode_count) {
 		env_set("tachyon_dp_edid_modes", NULL);
@@ -3309,18 +3334,25 @@ static void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv)
 		pos += ret;
 	}
 
+	pref = tachyon_dp_preferred_mode_index(priv);
+	if (pref < 0)
+		pref = 0;
+
 	env_set("tachyon_dp_edid_modes", out);
-	env_set_ulong("tachyon_dp_pref_xres", priv->modes[0].width);
-	env_set_ulong("tachyon_dp_pref_yres", priv->modes[0].height);
+	env_set_ulong("tachyon_dp_pref_xres", priv->modes[pref].width);
+	env_set_ulong("tachyon_dp_pref_yres", priv->modes[pref].height);
 	env_set_ulong("tachyon_dp_policy_lanes", priv->max_lanes);
 	env_set_ulong("tachyon_dp_policy_rate", priv->max_rate);
-	if (priv->modes[0].has_timing)
+	if (priv->modes[pref].has_timing)
 		env_set_ulong("tachyon_dp_pref_pclk",
-			      priv->modes[0].timing.pixelclock.typ);
+			      priv->modes[pref].timing.pixelclock.typ);
 	else
 		env_set("tachyon_dp_pref_pclk", NULL);
 
-	log_info("DP EDID modes: %s\n", out);
+	log_info("DP EDID modes: %s preferred=%ux%u pclk=%u\n",
+		 out, priv->modes[pref].width, priv->modes[pref].height,
+		 priv->modes[pref].has_timing ?
+		 priv->modes[pref].timing.pixelclock.typ : 0);
 }
 
 static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
@@ -4875,8 +4907,6 @@ static int tachyon_dp_probe(struct udevice *dev)
 	}
 #endif
 
-	tachyon_dp_select_mode(priv, &width, &height);
-
 	ret = tachyon_dp_link_train(priv);
 	if (ret)
 		return ret;
@@ -4954,7 +4984,6 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	if (!mode_changed && !alt_changed)
 		return 0;
 
-	tachyon_dp_select_mode(priv, &width, &height);
 	if (!alt_changed)
 		tachyon_dp_reset_link_policy(priv);
 
