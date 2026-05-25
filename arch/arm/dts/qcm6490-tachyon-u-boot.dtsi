@@ -52,6 +52,7 @@
 };
 
 &{/smem} {
+	memory-region = <&smem_mem>;
 	bootph-all;
 };
 
