@@ -368,6 +368,15 @@
 #define QMP_V4_DP_PHY_TX0_TX1_LANE_CTL	0x078
 #define QMP_V4_DP_PHY_TX2_TX3_LANE_CTL	0x09c
 #define QMP_V4_DP_PHY_STATUS		0x0dc
+
+/*
+ * Build-time switches for Linux-aligned DP PHY flow.
+ * Default all to Linux-aligned behaviour.
+ */
+#define TACHYON_DP_WRITE_CMN_MODE	0
+#define TACHYON_DP_LINUX_LANE_CTL	1
+#define TACHYON_DP_FORCE_TRAIN_RBR_X4	0
+
 /*
  * QMP DP PHY PD_CTL mostly uses active-low enables, matching Qualcomm HAL
  * *_B naming. A set bit powers/enables that block, except PSR_PWRDN.
@@ -1810,7 +1819,16 @@ static int tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 	 * Linux qmp_combo_dp_power_on() initializes DP SerDes before
 	 * programming DP TX and DP PHY registers. Keep the same ordering
 	 * here so C_READY is not polled against an unprogrammed PLL.
+	 *
+	 * Phase 2: Explicitly guard CMN_MODE — Linux defines
+	 * QSERDES_V4_COM_CMN_MODE but does NOT write it in the
+	 * V4 DP SerDes table for this PHY.
 	 */
+#if TACHYON_DP_WRITE_CMN_MODE
+	writel(0x04, serdes + QMP_V4_COM_CMN_MODE);
+	udelay(10);
+#endif
+
 	writel(1, serdes + QMP_V4_COM_SW_RESET);
 	udelay(10);
 	tachyon_dp_qmp_dump_pll_state(priv, "after SW_RESET=1");
@@ -1924,7 +1942,6 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	const u8 (*pre_tbl)[4];
 	u8 swing = 0, pre = 0;
 	u8 swing_cfg, pre_cfg;
-	u32 bias0_en, bias1_en, drvr0_en, drvr1_en;
 	int i;
 
 	for (i = 0; i < priv->lanes; i++) {
@@ -1960,20 +1977,37 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	writel(swing_cfg, tx1 + QMP_V3_TX_TX_DRV_LVL);
 	writel(pre_cfg, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
 
+	/*
+	 * TX bias and polarity are handled separately by
+	 * tachyon_dp_qmp_v4_program_tx_bias() and
+	 * tachyon_dp_qmp_program_tx_levels() in the Linux-aligned
+	 * V4 DP PHY configure path.
+	 */
+
+	return 0;
+}
+
+/*
+ * Phase 5: Linux-like V4 lane/orientation TX bias programming.
+ * Mirrors the per-lane HIGHZ_DRVR_EN and TRANSCEIVER_BIAS_EN
+ * logic from Linux qmp_v4_configure_dp_phy().
+ */
+static void tachyon_dp_qmp_v4_program_tx_bias(struct tachyon_dp_priv *priv)
+{
+	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
+	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	bool reverse = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE;
+	u32 bias0_en, bias1_en;
+	u32 drvr0_en, drvr1_en;
+
 	if (priv->lanes == 1) {
-		bias0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x3e : 0x15;
-		bias1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x15 : 0x3e;
-		drvr0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x13 : 0x10;
-		drvr1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x10 : 0x13;
+		bias0_en = reverse ? 0x3e : 0x15;
+		bias1_en = reverse ? 0x15 : 0x3e;
+		drvr0_en = reverse ? 0x13 : 0x10;
+		drvr1_en = reverse ? 0x10 : 0x13;
 	} else if (priv->lanes == 2) {
-		bias0_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x3f : 0x15;
-		bias1_en = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-			   0x15 : 0x3f;
+		bias0_en = reverse ? 0x3f : 0x15;
+		bias1_en = reverse ? 0x15 : 0x3f;
 		drvr0_en = 0x10;
 		drvr1_en = 0x10;
 	} else {
@@ -1987,47 +2021,108 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	writel(bias0_en, tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
 	writel(drvr1_en, tx1 + QMP_V3_TX_HIGHZ_DRVR_EN);
 	writel(bias1_en, tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
+
+	log_warning("QMP DP V4 TX bias: lanes=%u reverse=%u bias0=%02x bias1=%02x drvr0=%02x drvr1=%02x\n",
+		    priv->lanes, reverse ? 1 : 0,
+		    bias0_en, bias1_en, drvr0_en, drvr1_en);
+}
+
+/*
+ * Phase 7: Linux-like TX polarity / drive / pre-emphasis defaults.
+ * These match Linux qmp_v4_configure_dp_phy() TX defaults.
+ * Link-training voltage/pre-emphasis updates via program_tx() happen
+ * separately and can override these defaults.
+ */
+static void tachyon_dp_qmp_program_tx_levels(struct tachyon_dp_priv *priv)
+{
+	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
+	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+
 	writel(0x0a, tx0 + QMP_V3_TX_TX_POL_INV);
 	writel(0x0a, tx1 + QMP_V3_TX_TX_POL_INV);
+
+	writel(0x27, tx0 + QMP_V3_TX_TX_DRV_LVL);
+	writel(0x27, tx1 + QMP_V3_TX_TX_DRV_LVL);
+
+	writel(0x20, tx0 + QMP_V3_TX_TX_EMP_POST1_LVL);
+	writel(0x20, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
+
+	log_warning("QMP DP V4 TX levels: pol=0a drv=27 emp=20\n");
+}
+
+/*
+ * Phase 9: Configure DP link clock for the current rate.
+ * Returns 0 even if the clock framework is a no-op; log clearly.
+ */
+static int tachyon_dp_qmp_configure_dp_clocks(struct tachyon_dp_priv *priv)
+{
+	long clk_ret;
+
+	if (priv->dp_clk_valid[2]) {
+		clk_ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
+		log_warning("QMP DP clock cfg: rate=%u link_clk=%ld ret=%ld\n",
+			    priv->rate, (long)priv->rate * 1000, clk_ret);
+		if (clk_ret < 0) {
+			log_warning("Failed to set DP link clock %u kHz: %ld\n",
+				    priv->rate, clk_ret);
+			/* Continue — clock may have been set previously */
+		}
+	} else {
+		log_warning("QMP DP clock cfg: no ctrl_link clock, rate=%u\n",
+			    priv->rate);
+	}
 
 	return 0;
 }
 
-static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
+/*
+ * Phase 4: Linux-like qmp_v456_configure_dp_phy().
+ * Implements the full V456 DP PHY start sequence including polls.
+ * This replaces the old program_dp_phy_regs() + start_dp_phy() +
+ * inline poll sequence.
+ */
+static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 {
-	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG0);
-	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
-	writel(0xa4, priv->phy_dp + QMP_DP_PHY_AUX_CFG2);
-	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG3);
-	writel(0x0a, priv->phy_dp + QMP_DP_PHY_AUX_CFG4);
-	writel(0x26, priv->phy_dp + QMP_DP_PHY_AUX_CFG5);
-	writel(0x0a, priv->phy_dp + QMP_DP_PHY_AUX_CFG6);
-	writel(0x03, priv->phy_dp + QMP_DP_PHY_AUX_CFG7);
-	writel(0xb7, priv->phy_dp + QMP_DP_PHY_AUX_CFG8);
-	writel(0x03, priv->phy_dp + QMP_DP_PHY_AUX_CFG9);
-}
-
-static int tachyon_dp_qmp_program_dp_phy_regs(struct tachyon_dp_priv *priv)
-{
-	u32 mode = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
-		   0x4c : 0x5c;
+	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	u32 mode;
 	u32 vco_div;
+	u32 tx01, tx23;
+	int ret;
 
-	log_warning("QMP DP PHY table start\n");
+	log_warning("QMP DP V456 start\n");
 
+	/* DP_PHY_CFG_1 = 0x0f */
 	writel(0x0f, priv->phy_dp + QMP_V4_DP_PHY_CFG_1);
+
+	/* Configure DP mode (orientation-dependent) */
+	mode = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE ?
+	       0x4c : 0x5c;
 	writel(mode, priv->phy_dp + QMP_DP_PHY_MODE);
+
+	/* AUX configuration */
 	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
 	writel(0xa4, priv->phy_dp + QMP_DP_PHY_AUX_CFG2);
-	writel(priv->lanes > 2 ? 0x05 : 0x01,
-	       priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL);
-	writel(priv->lanes > 2 ? 0x05 : 0x00,
-	       priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL);
-	log_warning("QMP DP lane cfg: lanes=%u TX0_TX1=%02x TX2_TX3=%02x\n",
+
+	/* Lane control — Linux-aligned values */
+#if TACHYON_DP_LINUX_LANE_CTL
+	tx01 = 0x05;
+	tx23 = 0x05;
+#else
+	tx01 = priv->lanes > 0 ? 0x01 : 0x00;
+	tx23 = priv->lanes > 2 ? 0x05 : 0x00;
+#endif
+	writel(tx01, priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL);
+	writel(tx23, priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL);
+	log_warning("QMP DP lane cfg: lanes=%u TX0_TX1=%02x TX2_TX3=%02x linux=%d\n",
 		    priv->lanes,
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL) & 0xff,
-		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL) & 0xff);
+		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL) & 0xff,
+		    TACHYON_DP_LINUX_LANE_CTL);
 
+	/* Configure DP clocks */
+	tachyon_dp_qmp_configure_dp_clocks(priv);
+
+	/* VCO divider per rate */
 	switch (priv->rate) {
 	case DP_LINK_RATE_RBR:
 	case DP_LINK_RATE_HBR:
@@ -2044,21 +2139,13 @@ static int tachyon_dp_qmp_program_dp_phy_regs(struct tachyon_dp_priv *priv)
 		    priv->rate, vco_div);
 	writel(vco_div, priv->phy_dp + QMP_V4_DP_PHY_VCO_DIV);
 
+	/* DP_PHY_CFG start sequence */
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x05, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x09, priv->phy_dp + QMP_DP_PHY_CFG);
 
-	log_warning("QMP DP PHY table done\n");
-
-	return 0;
-}
-
-static void tachyon_dp_qmp_start_dp_phy(struct tachyon_dp_priv *priv)
-{
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
-
-	/* Critical: do not poll QMP readiness while PD_CTL is powered down. */
+	/* Power up all lanes and start RESETSM */
 	log_warning("QMP DP PHY start: powering up all lanes\n");
 	tachyon_dp_qmp_power_up_all_lanes(priv);
 	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=7d");
@@ -2068,15 +2155,174 @@ static void tachyon_dp_qmp_start_dp_phy(struct tachyon_dp_priv *priv)
 	priv->qmp_dp_phy_started = true;
 	tachyon_dp_qmp_dump_pll_state(priv, "after RESETSM_CNTRL");
 
-	log_warning("QMP DP PHY start done\n");
 	log_warning("QMP DP start: PD=%02x RESETSM=%02x C_READY=%02x CMN=%02x STATUS=%02x\n",
 		    tachyon_dp_qmp_pd_low(priv),
 		    readl(serdes + QMP_V4_COM_RESETSM_CNTRL) & 0xff,
 		    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
 		    readl(serdes + QMP_V4_COM_CMN_STATUS) & 0xff,
 		    tachyon_dp_qmp_status_low(priv));
+
+	/* Poll C_READY */
+	tachyon_dp_qmp_dump_serdes_pre_ready(priv);
+	tachyon_dp_qmp_dump_pll_state(priv, "before C_READY poll");
+
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_C_READY_STATUS,
+				  BIT(0), BIT(0), "C_READY");
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=C_READY ret=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+			    ret,
+			    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(serdes + QMP_V4_COM_CMN_STATUS) & 0xff,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
+		tachyon_dp_qmp_dump_pll_state(priv, "FAIL C_READY");
+		return ret;
+	}
+
+	/* Poll CMN_STATUS bit0 */
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_CMN_STATUS,
+				  BIT(0), BIT(0), "CMN_STATUS bit0");
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=CMN_BIT0 ret=%d C_READY=%02x CMN=%02x\n",
+			    ret,
+			    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(serdes + QMP_V4_COM_CMN_STATUS) & 0xff);
+		tachyon_dp_qmp_dump_pll_state(priv, "FAIL CMN_BIT0");
+		return ret;
+	}
+
+	/* Poll CMN_STATUS bit1 */
+	ret = tachyon_dp_qmp_poll(priv,
+				  priv->phy + QMP_OFF_DP_SERDES,
+				  QMP_V4_COM_CMN_STATUS,
+				  BIT(1), BIT(1), "CMN_STATUS bit1");
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=CMN_BIT1 ret=%d C_READY=%02x CMN=%02x\n",
+			    ret,
+			    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+			    readl(serdes + QMP_V4_COM_CMN_STATUS) & 0xff);
+		tachyon_dp_qmp_dump_pll_state(priv, "FAIL CMN_BIT1");
+		return ret;
+	}
+
+	/* DP_PHY_CFG = 0x19 */
+	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
+
+	/* Poll DP_PHY_STATUS PHY_READY (bit0) */
+	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				  QMP_DP_PHY_STATUS_PHY_READY,
+				  QMP_DP_PHY_STATUS_PHY_READY,
+				  "DP_PHY_STATUS PHY_READY");
+	if (ret) {
+		log_warning("QMP DP FAIL_STAGE=DP_PHY_READY ret=%d PD=%02x STATUS=%02x\n",
+			    ret,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
+		tachyon_dp_qmp_dump_lane_power_state(priv, "FAIL PHY_READY");
+		return ret;
+	}
+
+	/* Poll DP_PHY_STATUS TSYNC_DONE (bit1) */
+	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  "DP_PHY_STATUS TSYNC_DONE");
+	if (ret) {
+		log_warning("QMP DP WARN_STAGE=DP_TSYNC_DONE ret=%d PD=%02x STATUS=%02x\n",
+			    ret,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
+	}
+
+	log_warning("QMP DP V456 done\n");
+
+	return 0;
 }
 
+/*
+ * Phase 6: Linux-like qmp_v4_configure_dp_phy().
+ * Calls v456_configure for the common sequence, then adds V4-specific
+ * TX bias programming and the 0x18->delay->0x19 re-lock sequence.
+ */
+static int tachyon_dp_qmp_v4_configure_dp_phy(struct tachyon_dp_priv *priv)
+{
+	int ret;
+
+	ret = tachyon_dp_qmp_v456_configure_dp_phy(priv);
+	if (ret)
+		return ret;
+
+	/*
+	 * Linux says this has to be done after enabling link clock
+	 * on at least the 7nm DP PHY.
+	 */
+	tachyon_dp_qmp_v4_program_tx_bias(priv);
+
+	writel(0x18, priv->phy_dp + QMP_DP_PHY_CFG);
+	udelay(2000);
+	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
+
+	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  QMP_DP_PHY_STATUS_TSYNC_DONE,
+				  "DP_PHY_STATUS V4 TSYNC");
+	if (ret)
+		log_warning("QMP DP WARN_STAGE=V4_TSYNC ret=%d PD=%02x STATUS=%02x\n",
+			    ret,
+			    tachyon_dp_qmp_pd_low(priv),
+			    tachyon_dp_qmp_status_low(priv));
+
+	tachyon_dp_qmp_program_tx_levels(priv);
+
+	log_warning("QMP DP V4 post-cfg 18->19 done\n");
+
+	return 0;
+}
+
+/*
+ * Phase 11: Controlled teardown for retune.
+ * Only used if forced RBR x4 fails during training after the initial
+ * successful pre-DPCD configure.
+ */
+static void tachyon_dp_qmp_dp_phy_teardown_for_retune(struct tachyon_dp_priv *priv)
+{
+	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+
+	log_warning("QMP DP teardown for retune\n");
+
+	writel(0x00, priv->phy_dp + QMP_DP_PHY_CFG);
+	writel(0x00, serdes + QMP_V4_COM_RESETSM_CNTRL);
+	tachyon_dp_qmp_power_down(priv);
+	writel(0x01, serdes + QMP_V4_COM_SW_RESET);
+	udelay(100);
+
+	tachyon_dp_qmp_dump_pll_state(priv, "after teardown");
+}
+
+static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
+{
+	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG0);
+	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
+	writel(0xa4, priv->phy_dp + QMP_DP_PHY_AUX_CFG2);
+	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG3);
+	writel(0x0a, priv->phy_dp + QMP_DP_PHY_AUX_CFG4);
+	writel(0x26, priv->phy_dp + QMP_DP_PHY_AUX_CFG5);
+	writel(0x0a, priv->phy_dp + QMP_DP_PHY_AUX_CFG6);
+	writel(0x03, priv->phy_dp + QMP_DP_PHY_AUX_CFG7);
+	writel(0xb7, priv->phy_dp + QMP_DP_PHY_AUX_CFG8);
+	writel(0x03, priv->phy_dp + QMP_DP_PHY_AUX_CFG9);
+}
+
+/*
+ * Linux-aligned DP PHY programming:
+ *   power_down -> program_serdes -> program_tx_table ->
+ *   deassert_serdes_reset -> program_tx (swing/pre) ->
+ *   v4_configure_dp_phy (V456 start + polls + V4 bias + re-lock + TX levels)
+ */
 static int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
 {
 	int ret;
@@ -2101,11 +2347,17 @@ static int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
 	if (ret)
 		return ret;
 
-	ret = tachyon_dp_qmp_program_dp_phy_regs(priv);
+	/*
+	 * Linux-aligned V4 DP PHY configure:
+	 * Replaces old program_dp_phy_regs() + start_dp_phy() +
+	 * inline poll sequence with the full Linux flow:
+	 *   V456 start -> C_READY/CMN/DP_PHY_STATUS polls ->
+	 *   V4 TX bias -> 0x18->delay->0x19 re-lock ->
+	 *   TX levels defaults.
+	 */
+	ret = tachyon_dp_qmp_v4_configure_dp_phy(priv);
 	if (ret)
 		return ret;
-
-	tachyon_dp_qmp_start_dp_phy(priv);
 
 	log_warning("QMP DP program done\n");
 
@@ -2132,14 +2384,6 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 
 	log_warning("QMP DP configure enter: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
-
-	if (priv->dp_clk_valid[2]) {
-		long clk_ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
-
-		if (clk_ret < 0)
-			log_warning("Failed to set DP link clock %u kHz: %ld\n",
-				    priv->rate, clk_ret);
-	}
 
 	/* Direct writel: QMP COM registers are byte-style, RMW corrupts */
 	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
@@ -2172,9 +2416,6 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	if (ret)
 		return ret;
 
-	tachyon_dp_qmp_dump_serdes_pre_ready(priv);
-	tachyon_dp_qmp_dump_pll_state(priv, "before C_READY poll");
-
 	/* Compact register dump after DP SerDes programming */
 	c_ready = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff;
 	cmn     = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff;
@@ -2190,79 +2431,7 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
 		    c_ready, cmn, dp_pd, dp_status);
 
-	log_warning("QMP DP before C_READY poll: did_program_serdes=%d did_start_phy=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
-		    priv->qmp_dp_serdes_programmed, priv->qmp_dp_phy_started,
-		    c_ready, cmn, dp_pd, dp_status);
-
-	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
-				  QMP_V4_COM_C_READY_STATUS,
-				  BIT(0), BIT(0), "C_READY");
-	if (ret) {
-		log_warning("QMP DP FAIL_STAGE=C_READY ret=%d C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
-			    ret,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff,
-			    tachyon_dp_qmp_pd_low(priv),
-			    tachyon_dp_qmp_status_low(priv));
-		tachyon_dp_qmp_dump_pll_state(priv, "FAIL C_READY");
-		return ret;
-	}
-
-	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
-				  QMP_V4_COM_CMN_STATUS,
-				  BIT(0), BIT(0), "CMN_STATUS bit0");
-	if (ret) {
-		log_warning("QMP DP FAIL_STAGE=CMN_BIT0 ret=%d C_READY=%02x CMN=%02x\n",
-			    ret,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff);
-		tachyon_dp_qmp_dump_pll_state(priv, "FAIL CMN_BIT0");
-		return ret;
-	}
-
-	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
-				  QMP_V4_COM_CMN_STATUS,
-				  BIT(1), BIT(1), "CMN_STATUS bit1");
-	if (ret) {
-		log_warning("QMP DP FAIL_STAGE=CMN_BIT1 ret=%d C_READY=%02x CMN=%02x\n",
-			    ret,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff,
-			    readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff);
-		tachyon_dp_qmp_dump_pll_state(priv, "FAIL CMN_BIT1");
-		return ret;
-	}
-
-	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
-
-	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				  QMP_DP_PHY_STATUS_PHY_READY,
-				  QMP_DP_PHY_STATUS_PHY_READY,
-				  "DP_PHY_STATUS PHY_READY");
-	if (ret) {
-		log_warning("QMP DP FAIL_STAGE=DP_PHY_READY ret=%d PD=%02x STATUS=%02x\n",
-			    ret,
-			    tachyon_dp_qmp_pd_low(priv),
-			    tachyon_dp_qmp_status_low(priv));
-		tachyon_dp_qmp_dump_lane_power_state(priv, "FAIL PHY_READY");
-		return ret;
-	}
-
-	writel(0x18, priv->phy_dp + QMP_DP_PHY_CFG);
-	udelay(2000);
-	writel(0x19, priv->phy_dp + QMP_DP_PHY_CFG);
-
-	ret = tachyon_dp_qmp_poll(priv, priv->phy_dp, QMP_V4_DP_PHY_STATUS,
-				  QMP_DP_PHY_STATUS_TSYNC_DONE,
-				  QMP_DP_PHY_STATUS_TSYNC_DONE,
-				  "DP_PHY_STATUS TSYNC_DONE");
-	if (ret)
-		log_warning("QMP DP WARN_STAGE=DP_TSYNC_DONE ret=%d PD=%02x STATUS=%02x\n",
-			    ret,
-			    tachyon_dp_qmp_pd_low(priv),
-			    tachyon_dp_qmp_status_low(priv));
+	log_warning("QMP DP configure done\n");
 
 	return 0;
 }
@@ -3771,6 +3940,22 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	};
 	static const u8 lane_counts[] = { 4, 2, 1 };
 	int r, l, ret = -EIO;
+
+#if TACHYON_DP_FORCE_TRAIN_RBR_X4
+	/*
+	 * Phase 10: Known-good retune test.
+	 * Only try RBR x4 to isolate "second configure after lock"
+	 * vs. "non-RBR or reduced-lane specific" failures.
+	 */
+	log_warning("DP force RBR x4 training test\n");
+	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 4);
+	if (!ret) {
+		log_info("DP link trained at RBR x4 (forced)\n");
+		return 0;
+	}
+	log_warning("DP force RBR x4 failed: %d\n", ret);
+	return ret;
+#endif
 
 	for (r = 0; r < ARRAY_SIZE(rates); r++) {
 		if (rates[r] > priv->rate)
