@@ -706,7 +706,7 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 static int qpg_init(struct qpg *pg)
 {
 	struct ofnode_phandle_args args;
-	ofnode ipcc;
+	ofnode ipcc = ofnode_null();
 	ofnode adsp;
 	ofnode glink = ofnode_null();
 	fdt_addr_t addr;
@@ -720,12 +720,6 @@ static int qpg_init(struct qpg *pg)
 	if (ret)
 		return ret;
 
-	pg->remote_pid = 2;
-	pg->ipcc_client = QPG_IPCC_CLIENT_LPASS;
-	pg->ipcc_signal = QPG_IPCC_SIGNAL_GLINK_QMP;
-	log_warning("pmic-glink: defaults remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
-		    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
-
 	adsp = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-adsp-pas");
 	if (ofnode_valid(adsp))
 		ofnode_for_each_subnode(glink, adsp) {
@@ -736,38 +730,45 @@ static int qpg_init(struct qpg *pg)
 		}
 	log_warning("pmic-glink: adsp node valid=%d glink node valid=%d\n",
 		    ofnode_valid(adsp), ofnode_valid(glink));
-
-	if (ofnode_valid(glink)) {
-		u32 remote_pid;
-
-		if (!ofnode_read_u32(glink, "qcom,remote-pid", &remote_pid))
-			pg->remote_pid = remote_pid;
-
-		ret = ofnode_parse_phandle_with_args(glink, "mboxes",
-						     "#mbox-cells", 0, 0,
-						     &args);
-		if (!ret && args.args_count >= 2) {
-			ipcc = args.node;
-			pg->ipcc_client = args.args[0];
-			pg->ipcc_signal = args.args[1];
-		} else {
-			ipcc = ofnode_null();
-		}
-		log_warning("pmic-glink: DT remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
-			    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
-	} else {
-		ipcc = ofnode_null();
+	if (!ofnode_valid(adsp)) {
+		log_warning("pmic-glink: missing qcom,sc7280-adsp-pas node\n");
+		return -ENOENT;
 	}
 
-	if (!ofnode_valid(ipcc))
-		ipcc = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-ipcc");
-	if (!ofnode_valid(ipcc))
-		ipcc = ofnode_by_compatible(ofnode_null(), "qcom,ipcc");
+	if (!ofnode_valid(glink)) {
+		log_warning("pmic-glink: missing lpass GLINK edge node\n");
+		return -ENOENT;
+	}
+
+	ret = ofnode_read_u32(glink, "qcom,remote-pid", &pg->remote_pid);
+	if (ret) {
+		log_warning("pmic-glink: missing qcom,remote-pid ret=%d\n", ret);
+		return ret;
+	}
+
+	ret = ofnode_parse_phandle_with_args(glink, "mboxes",
+					     "#mbox-cells", 0, 0,
+					     &args);
+	if (ret) {
+		log_warning("pmic-glink: missing/invalid mboxes ret=%d\n", ret);
+		return ret;
+	}
+
+	if (args.args_count < 2 || !ofnode_valid(args.node)) {
+		log_warning("pmic-glink: invalid mboxes args_count=%d node_valid=%d\n",
+			    args.args_count, ofnode_valid(args.node));
+		return -EINVAL;
+	}
+
+	ipcc = args.node;
+	pg->ipcc_client = args.args[0];
+	pg->ipcc_signal = args.args[1];
+	log_warning("pmic-glink: DT remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
+		    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
+
 	log_warning("pmic-glink: ipcc node valid=%d name=%s\n",
 		    ofnode_valid(ipcc),
 		    ofnode_valid(ipcc) ? ofnode_get_name(ipcc) : "<none>");
-	if (!ofnode_valid(ipcc))
-		return -ENOENT;
 
 	addr = ofnode_get_addr(ipcc);
 	log_warning("pmic-glink: ipcc addr=%llx\n",
