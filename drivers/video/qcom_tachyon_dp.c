@@ -77,6 +77,7 @@
 
 #define REG_DP_SW_RESET			0x010
 #define DP_SW_RESET			BIT(0)
+#define REG_DP_INTR_STATUS		0x020
 #define REG_DP_AUX_CTRL			0x030
 #define DP_AUX_CTRL_ENABLE		BIT(0)
 #define DP_AUX_CTRL_RESET		BIT(1)
@@ -98,6 +99,25 @@
 #define DP_AUX_STATUS_TIMEOUT		BIT(6)
 #define DP_AUX_STATUS_ERROR		BIT(7)
 #define DP_AUX_STATUS_ERR_MASK		GENMASK(7, 4)
+#define REG_DP_PHY_AUX_INTERRUPT_CLEAR	0x04c
+#define REG_DP_PHY_AUX_INTERRUPT_STATUS	0x0bc
+
+#define DP_INTR_AUX_XFER_DONE		BIT(3)
+#define DP_INTR_TIMEOUT			BIT(9)
+#define DP_INTR_NACK_DEFER		BIT(12)
+#define DP_INTR_I2C_NACK		BIT(18)
+#define DP_INTR_I2C_DEFER		BIT(21)
+#define DP_INTR_AUX_ERROR		BIT(27)
+#define DP_INTERRUPT_STATUS_ACK_SHIFT	1
+#define DP_INTERRUPT_STATUS_MASK_SHIFT	2
+#define DP_INTERRUPT_STATUS1		(DP_INTR_AUX_XFER_DONE | \
+					 DP_INTR_TIMEOUT | \
+					 DP_INTR_NACK_DEFER | \
+					 DP_INTR_I2C_NACK | \
+					 DP_INTR_I2C_DEFER | \
+					 DP_INTR_AUX_ERROR)
+#define DP_INTERRUPT_STATUS1_MASK	(DP_INTERRUPT_STATUS1 << \
+					 DP_INTERRUPT_STATUS_MASK_SHIFT)
 
 #define REG_DP_MAINLINK_CTRL		0x000
 #define DP_MAINLINK_CTRL_ENABLE		BIT(0)
@@ -369,28 +389,9 @@
 #define QMP_V3_DP_COM_TYPEC_PWRDN_CTRL	0x014
 #define QMP_V3_DP_COM_RESET_OVRD_CTRL	0x01c
 
-#define QMP_DP_COM_SW_PWRDN		BIT(0)
-
-#define QMP_DP_COM_SW_DPPHY_RESET	BIT(0)
-#define QMP_DP_COM_SW_DPPHY_RESET_MUX	BIT(1)
-#define QMP_DP_COM_SW_USB3PHY_RESET	BIT(2)
-#define QMP_DP_COM_SW_USB3PHY_RESET_MUX BIT(3)
-
-#define QMP_DP_COM_SW_RESET		BIT(0)
-#define QMP_DP_COM_SWI_CTRL_MASK	GENMASK(1, 0)
-
 #define TACHYON_DP_AUX_DEBOUNCE_TRIES	20
 #define TACHYON_DP_CORE_CLK_COUNT	4
 #define TACHYON_DPU_CLK_COUNT		6
-
-/*
- * Temporary bring-up guard: when set to 1, the DP driver does NOT
- * re-initialize the QMP COM block (POWER_DOWN_CTRL, RESET_OVRD_CTRL,
- * SW_RESET, SWI_CTRL).  The phy-qcom-qmp-combo provider owns COM
- * init via generic_phy_init().  The DP driver only updates TYPEC_CTRL
- * and PHY_MODE_CTRL for orientation / DP mode selection.
- */
-#define TACHYON_DP_SKIP_LOCAL_COM_RESET 1
 
 enum tachyon_dp_orientation {
 	TACHYON_DP_ORIENTATION_NORMAL,
@@ -1469,105 +1470,9 @@ static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
 }
 
 /*
- * Initialize the QMP COM (common SerDes) block before DP AUX bring-up.
- * This is the minimal subset of Linux's qmp_combo_com_init() needed for
- * the SC7280/QCM6490 QMP USB3-DP combo PHY.
- *
- * The sequence:
- *   1. Power the COM block
- *   2. Take software control of DP and USB3 PHY resets (assert both)
- *   3. Program Type-C orientation and DP-only mode
- *   4. Release DP PHY reset (keep USB3 reset asserted for DP-only)
- *   5. Release COM software reset / SWI hold
- */
-static void tachyon_dp_qmp_com_init(struct tachyon_dp_priv *priv)
-{
-	u32 typec;
-
-	log_warning("QMP bases: phy=%p serdes=%p tx0=%p tx1=%p dp=%p\n",
-		    priv->phy,
-		    (u8 __iomem *)priv->phy + QMP_OFF_DP_SERDES,
-		    (u8 __iomem *)priv->phy + QMP_OFF_DP_TX0,
-		    (u8 __iomem *)priv->phy + QMP_OFF_DP_TX1,
-		    priv->phy_dp);
-
-	tachyon_dp_qmp_com_dump(priv, "before-init");
-
-	/*
-	 * Power the COM block and take software control of PHY resets.
-	 * Match Linux qmp_combo_com_init() order: power first, then
-	 * override resets so the reset controls are owned by software.
-	 */
-	writel(QMP_DP_COM_SW_PWRDN,
-	       priv->phy + QMP_V3_DP_COM_POWER_DOWN_CTRL);
-
-	writel(QMP_DP_COM_SW_DPPHY_RESET_MUX |
-	       QMP_DP_COM_SW_DPPHY_RESET |
-	       QMP_DP_COM_SW_USB3PHY_RESET_MUX |
-	       QMP_DP_COM_SW_USB3PHY_RESET,
-	       priv->phy + QMP_V3_DP_COM_RESET_OVRD_CTRL);
-
-	/* Program Type-C orientation */
-	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
-		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-
-	writel(typec, priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
-
-	/*
-	 * DP-only mode for pre-DPCD bring-up.
-	 * Later, if USB3+DP concurrent mode is required, this can become
-	 * QMP_DP_COM_USB3_MODE | QMP_DP_COM_DP_MODE depending on the
-	 * negotiated Type-C pin assignment.
-	 */
-	writel(QMP_DP_COM_DP_MODE,
-	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
-
-	/*
-	 * Release DP PHY reset.
-	 * Keep USB3 reset asserted for this DP-only pre-DPCD test.
-	 */
-	writel(QMP_DP_COM_SW_USB3PHY_RESET_MUX |
-	       QMP_DP_COM_SW_USB3PHY_RESET,
-	       priv->phy + QMP_V3_DP_COM_RESET_OVRD_CTRL);
-
-	/*
-	 * Release COM software reset / SWI hold.
-	 */
-	writel(0x00, priv->phy + QMP_V3_DP_COM_SWI_CTRL);
-	writel(0x00, priv->phy + QMP_V3_DP_COM_SW_RESET);
-
-	udelay(100);
-
-	tachyon_dp_qmp_com_dump(priv, "after-init");
-}
-
-static void tachyon_dp_qmp_typec_dp_select(struct tachyon_dp_priv *priv)
-{
-	u32 typec;
-
-	typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
-		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-
-	writel(QMP_DP_COM_DP_MODE,
-	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
-
-	writel(typec,
-	       priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
-
-	log_warning("QMP Type-C low after select: TYPEC=%02x PHY_MODE=%02x raw_typec=%08x raw_mode=%08x\n",
-		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
-		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL) & 0xff,
-		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL),
-		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL));
-}
-
-/*
  * Slim COM update: ONLY writes TYPEC_CTRL and PHY_MODE_CTRL.
- * This replaces tachyon_dp_qmp_com_init() when TACHYON_DP_SKIP_LOCAL_COM_RESET
- * is active. The phy-qcom-qmp-combo provider owns POWER_DOWN_CTRL,
- * RESET_OVRD_CTRL, SW_RESET, and SWI_CTRL via generic_phy_init().
+ * The phy-qcom-qmp-combo provider owns POWER_DOWN_CTRL, RESET_OVRD_CTRL,
+ * SW_RESET, and SWI_CTRL via generic_phy_init().
  *
  * Do NOT toggle COM power/reset registers from here — repeated COM reset
  * from the DP driver can clobber the provider's state and cause C_READY=0.
@@ -1589,31 +1494,47 @@ static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL));
 }
 
+static void tachyon_dp_qmp_aux_only_power_on(struct tachyon_dp_priv *priv)
+{
+	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	udelay(100);
+}
+
 /*
- * Use the Qualcomm HAL AUX-only PD_CTL sequence. Most PD_CTL bits are
- * active-low enables, so a set *_B bit means that block is powered/enabled.
+ * Keep AUX powered without downgrading a fully-ready DP PHY. Most PD_CTL bits
+ * are active-low enables, so a set *_B bit means that block is powered/enabled.
  *
  * IMPORTANT: Like other QMP byte-style registers, use direct writel()
- * with a fully-computed low-byte value.  Do NOT use clrbits_le32() here;
+ * with a fully-computed low-byte value. Do NOT use clrbits_le32() here;
  * it reads back byte-replicated garbage and the RMW may not work.
  */
 static void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv)
 {
 	u32 before, after;
+	u8 status;
 
 	before = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	status = readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff;
 
-	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
-	udelay(100);
-	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
-	udelay(100);
+	if (status & QMP_DP_PHY_STATUS_PHY_READY) {
+		if ((before & 0xff) != QMP_DP_PHY_PD_CTL_4LANE_ON) {
+			writel(QMP_DP_PHY_PD_CTL_4LANE_ON,
+			       priv->phy_dp + QMP_DP_PHY_PD_CTL);
+			udelay(100);
+		}
+	} else {
+		tachyon_dp_qmp_aux_only_power_on(priv);
+	}
 
 	after = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
 
-	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x AUX_PWRDN_B=%u CLAMP_EN_B=%u\n",
+	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x STATUS=%02x AUX_PWRDN_B=%u CLAMP_EN_B=%u\n",
 		    before,
 		    after,
 		    after & 0xff,
+		    status,
 		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_AUX_PWRDN_B),
 		    !!((after & 0xff) & QMP_DP_PHY_PD_CTL_DP_CLAMP_EN_B));
 }
@@ -2061,11 +1982,6 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
 {
-	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
-	udelay(100);
-	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
-	udelay(100);
-
 	writel(0x00, priv->phy_dp + QMP_DP_PHY_AUX_CFG0);
 	writel(0x13, priv->phy_dp + QMP_DP_PHY_AUX_CFG1);
 	writel(0xa4, priv->phy_dp + QMP_DP_PHY_AUX_CFG2);
@@ -2327,11 +2243,57 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	return 0;
 }
 
+static void tachyon_dp_aux_clear_hw_interrupts(struct tachyon_dp_priv *priv)
+{
+	readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS);
+	writel(0x1f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+	writel(0x9f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+	writel(0x00, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+}
+
+static u32 tachyon_dp_aux_get_irq(struct tachyon_dp_priv *priv)
+{
+	u32 intr, ack;
+
+	intr = readl(priv->ctrl + REG_DP_INTR_STATUS);
+	intr &= ~DP_INTERRUPT_STATUS1_MASK;
+	ack = (intr & DP_INTERRUPT_STATUS1) << DP_INTERRUPT_STATUS_ACK_SHIFT;
+	writel(ack | DP_INTERRUPT_STATUS1_MASK,
+	       priv->ctrl + REG_DP_INTR_STATUS);
+
+	return intr;
+}
+
+static void tachyon_dp_aux_log_first_failure(struct tachyon_dp_priv *priv,
+					     const u8 hdr[4], u32 intr)
+{
+	log_warning("AUX first-failure detail: hdr=%02x %02x %02x %02x intr=%08x intr_raw=%08x phy_intr=%08x status=%08x trans=%08x data=%08x timeout=%08x limits=%08x PD=%02x DP_STATUS=%02x TYPEC=%02x SBU_EN=%d SBU_SEL=%d\n",
+		    hdr[0], hdr[1], hdr[2], hdr[3],
+		    intr,
+		    readl(priv->ctrl + REG_DP_INTR_STATUS),
+		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS),
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
+		    readl(priv->aux + REG_DP_AUX_DATA),
+		    readl(priv->aux + REG_DP_TIMEOUT_COUNT),
+		    readl(priv->aux + REG_DP_AUX_LIMITS),
+		    tachyon_dp_qmp_pd_low(priv),
+		    tachyon_dp_qmp_status_low(priv),
+		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
+		    dm_gpio_is_valid(&priv->sbu_enable) ?
+			    dm_gpio_get_value(&priv->sbu_enable) : -1,
+		    dm_gpio_is_valid(&priv->sbu_select) ?
+			    dm_gpio_get_value(&priv->sbu_select) : -1);
+}
+
 static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
 {
 	writel(DP_AUX_CTRL_RESET, priv->aux + REG_DP_AUX_CTRL);
 	udelay(1000);
 	writel(DP_AUX_CTRL_ENABLE, priv->aux + REG_DP_AUX_CTRL);
+	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+	tachyon_dp_aux_clear_hw_interrupts(priv);
+	tachyon_dp_aux_get_irq(priv);
 	writel(0xffff, priv->aux + REG_DP_TIMEOUT_COUNT);
 	writel(0xffff, priv->aux + REG_DP_AUX_LIMITS);
 }
@@ -2341,7 +2303,7 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 			       size_t len)
 {
 	u8 hdr[4];
-	u32 ctrl, reg;
+	u32 ctrl, intr, reg, stale_intr;
 	size_t i;
 
 	if (!len || len > 16)
@@ -2353,6 +2315,10 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	hdr[1] = addr >> 8;
 	hdr[2] = addr;
 	hdr[3] = len - 1;
+
+	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+	tachyon_dp_aux_clear_hw_interrupts(priv);
+	stale_intr = tachyon_dp_aux_get_irq(priv);
 
 	writel(DP_AUX_DATA_INDEX_WRITE, priv->aux + REG_DP_AUX_DATA);
 
@@ -2380,11 +2346,13 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	 * idle (non-zero TRANS_CTRL) or STATUS already shows errors,
 	 * the transaction will likely fail before it begins.
 	 */
-	log_warning("AUX start: addr=%x i2c=%d read=%d mot=%d len=%zu ctrl=%08x status=%08x trans=%08x\n",
+	log_warning("AUX start: addr=%x i2c=%d read=%d mot=%d len=%zu ctrl=%08x status=%08x trans=%08x stale_intr=%08x phy_intr=%08x\n",
 		    addr, i2c, read, mot, len,
 		    readl(priv->aux + REG_DP_AUX_CTRL),
 		    readl(priv->aux + REG_DP_AUX_STATUS),
-		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
+		    stale_intr,
+		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS));
 
 	writel(ctrl, priv->aux + REG_DP_AUX_TRANS_CTRL);
 
@@ -2392,43 +2360,133 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	 * Confirm the GO bit was accepted.  If it doesn't read back as
 	 * set, the controller may be in reset or the clock may be gated.
 	 */
-	log_warning("AUX go: trans=%08x status=%08x\n",
+	log_warning("AUX go: trans=%08x status=%08x intr_raw=%08x\n",
 		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
-		    readl(priv->aux + REG_DP_AUX_STATUS));
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->ctrl + REG_DP_INTR_STATUS));
 
+	intr = 0;
 	for (i = 0; i < 250; i++) {
-		reg = readl(priv->aux + REG_DP_AUX_STATUS);
-		if (!(readl(priv->aux + REG_DP_AUX_TRANS_CTRL) &
-			    DP_AUX_TRANS_CTRL_GO))
+		intr = tachyon_dp_aux_get_irq(priv);
+		if (intr & DP_INTERRUPT_STATUS1)
 			break;
 		udelay(1000);
 	}
 
 	if (i == 250) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
 		priv->aux_timeouts++;
-		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu ctrl=%08x status=%08x trans=%08x\n",
+		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu intr=%08x ctrl=%08x status=%08x trans=%08x\n",
 			    addr, i2c, read, len,
+			    intr,
 			    readl(priv->aux + REG_DP_AUX_CTRL),
 			    readl(priv->aux + REG_DP_AUX_STATUS),
 			    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 		return -ETIMEDOUT;
 	}
 
+	log_warning("AUX done: addr=%x i2c=%d read=%d len=%zu intr=%08x phy_intr=%08x status=%08x trans=%08x\n",
+		    addr, i2c, read, len,
+		    intr,
+		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS),
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
+
+	if (intr & DP_INTR_AUX_ERROR) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_errors++;
+		tachyon_dp_aux_clear_hw_interrupts(priv);
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EIO;
+	}
+
+	if (intr & DP_INTR_TIMEOUT) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_timeouts++;
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -ETIMEDOUT;
+	}
+
+	if (intr & (DP_INTR_NACK_DEFER | DP_INTR_I2C_DEFER)) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_defers++;
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EAGAIN;
+	}
+
+	if (intr & DP_INTR_I2C_NACK) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_nacks++;
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EREMOTEIO;
+	}
+
+	if (!(intr & DP_INTR_AUX_XFER_DONE)) {
+		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
+				     !priv->aux_defers && !priv->aux_errors;
+
+		priv->aux_errors++;
+		if (first_failure)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
+		return -EIO;
+	}
+
+	reg = readl(priv->aux + REG_DP_AUX_STATUS);
 	if (reg & DP_AUX_STATUS_ERR_MASK) {
 		log_debug("DP AUX status error: addr=%x i2c=%d read=%d len=%zu status=%08x\n",
 			  addr, i2c, read, len, reg);
 		if (reg & DP_AUX_STATUS_TIMEOUT) {
+			bool first_failure = !priv->aux_timeouts &&
+					     !priv->aux_nacks &&
+					     !priv->aux_defers &&
+					     !priv->aux_errors;
+
 			priv->aux_timeouts++;
+			if (first_failure)
+				tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 			return -ETIMEDOUT;
 		}
 		if (reg & DP_AUX_STATUS_DEFER) {
+			bool first_failure = !priv->aux_timeouts &&
+					     !priv->aux_nacks &&
+					     !priv->aux_defers &&
+					     !priv->aux_errors;
+
 			priv->aux_defers++;
+			if (first_failure)
+				tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 			return -EAGAIN;
 		}
 		if (reg & DP_AUX_STATUS_NACK) {
+			bool first_failure = !priv->aux_timeouts &&
+					     !priv->aux_nacks &&
+					     !priv->aux_defers &&
+					     !priv->aux_errors;
+
 			priv->aux_nacks++;
+			if (first_failure)
+				tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 			return -EREMOTEIO;
 		}
+		if (!priv->aux_timeouts && !priv->aux_nacks &&
+		    !priv->aux_defers && !priv->aux_errors)
+			tachyon_dp_aux_log_first_failure(priv, hdr, intr);
 		priv->aux_errors++;
 		return -EIO;
 	}
@@ -2445,12 +2503,6 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	}
 
 	return 0;
-}
-
-static int tachyon_dp_aux_transfer(struct tachyon_dp_priv *priv, bool i2c,
-				   bool read, u32 addr, u8 *buf, size_t len)
-{
-	return tachyon_dp_aux_xfer(priv, i2c, read, false, addr, buf, len);
 }
 
 static int tachyon_dp_aux_retry_mot(struct tachyon_dp_priv *priv, bool i2c,
@@ -4176,21 +4228,15 @@ static void tachyon_dp_prepare_aux_for_orientation(
 	log_warning("DP prepare AUX orientation=%u pin=%u\n",
 		    priv->orientation, priv->pin_assignment);
 
-	/* Initialize QMP COM block (resets, mode, Type-C) before AUX */
-#if TACHYON_DP_SKIP_LOCAL_COM_RESET
-	log_warning("QMP DP local COM reset skipped; provider owns COM\n");
+	/* Provider owns COM reset; the DP driver only updates orientation/mode. */
 	tachyon_dp_qmp_com_orientation_update(priv);
-#else
-	tachyon_dp_qmp_com_init(priv);
-	tachyon_dp_qmp_typec_dp_select(priv);
-#endif
 
 	/* Reprogram the external SBU mux */
 	tachyon_dp_program_sbu_mux(priv);
 
-	/* Reinitialize QMP AUX + force AUX path out of powerdown/clamp */
-	tachyon_dp_qmp_aux_init(priv);
+	/* Keep the AUX path powered, then reinitialize QMP AUX CFG. */
 	tachyon_dp_qmp_force_aux_on(priv);
+	tachyon_dp_qmp_aux_init(priv);
 
 	/* Reset the DP AUX controller */
 	tachyon_dp_aux_hw_init(priv);
@@ -4293,12 +4339,8 @@ static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
 		    tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 
-#if TACHYON_DP_SKIP_LOCAL_COM_RESET
-	log_warning("QMP DP local COM reset skipped; provider owns COM\n");
+	/* Provider owns COM reset; the DP driver only updates orientation/mode. */
 	tachyon_dp_qmp_com_orientation_update(priv);
-#else
-	tachyon_dp_qmp_com_init(priv);
-#endif
 
 	ret = tachyon_dp_qmp_configure(priv);
 
@@ -4317,7 +4359,6 @@ static int tachyon_dp_prepare_full_qmp_for_dpcd(struct tachyon_dp_priv *priv)
 		return ret;
 	}
 
-	tachyon_dp_qmp_force_aux_on(priv);
 	tachyon_dp_aux_hw_init(priv);
 	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
 
