@@ -7,12 +7,9 @@
  */
 
 #include <blk.h>
-#include <asm/global_data.h>
 #include <clk.h>
 #include <cpu_func.h>
 #include <dm.h>
-#include <dm/device-internal.h>
-#include <dm/lists.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
 #include <elf.h>
@@ -90,8 +87,6 @@ struct qpas_fw {
 };
 
 static bool qpas_booted;
-
-DECLARE_GLOBAL_DATA_PTR;
 
 static int qpas_enable_clocks(struct udevice *dev)
 {
@@ -797,20 +792,6 @@ int qcom_adsp_pas_boot(void)
 	if (!ret || qpas_booted)
 		return 0;
 
-	if (ret == -ENODEV) {
-		ret = lists_bind_fdt(gd->dm_root, node, &dev, NULL, false);
-		if (!ret)
-			ret = device_probe(dev);
-		if (!ret || qpas_booted)
-			return 0;
-		log_warning("qcom-adsp-pas: bind/probe failed ret=%d\n", ret);
-		return ret;
-	}
-
-	if (ret) {
-		log_warning("qcom-adsp-pas: driver probe failed ret=%d\n", ret);
-		return ret;
-	}
-
-	return 0;
+	log_warning("qcom-adsp-pas: DM device lookup/probe failed ret=%d\n", ret);
+	return ret;
 }
