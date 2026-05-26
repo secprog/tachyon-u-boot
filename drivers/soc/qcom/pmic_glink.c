@@ -24,10 +24,9 @@
 #include <log.h>
 #include <mapmem.h>
 #include <smem.h>
+#include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/pmic_glink.h>
-
-#define QPG_IPCC_CLIENT_LPASS			3
-#define QPG_IPCC_SIGNAL_GLINK_QMP		0
+#include <time.h>
 
 #define QPG_SMEM_XPRT_DESCRIPTOR		478
 #define QPG_SMEM_XPRT_FIFO_0			479
@@ -712,11 +711,17 @@ static int qpg_init(struct qpg *pg)
 	fdt_addr_t addr;
 	size_t size;
 	__le32 *descs;
+	ulong start;
 	int ret;
 
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
 	log_warning("pmic-glink: smem lookup ret=%d smem=%p\n",
 		    ret, pg->smem);
+	if (ret)
+		return ret;
+
+	ret = qcom_adsp_pas_boot();
+	log_warning("pmic-glink: ADSP PAS boot ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -804,12 +809,22 @@ static int qpg_init(struct qpg *pg)
 
 	pg->tx_fifo = smem_get(pg->smem, pg->remote_pid,
 			       QPG_SMEM_XPRT_FIFO_0, &pg->tx_len);
-	pg->rx_fifo = smem_get(pg->smem, pg->remote_pid,
-			       QPG_SMEM_XPRT_FIFO_1, &pg->rx_len);
+	start = get_timer(0);
+	do {
+		pg->rx_fifo = smem_get(pg->smem, pg->remote_pid,
+				       QPG_SMEM_XPRT_FIFO_1, &pg->rx_len);
+		if (!IS_ERR_OR_NULL(pg->rx_fifo))
+			break;
+		mdelay(20);
+	} while (get_timer(start) < 2000);
 	log_warning("pmic-glink: tx_fifo=%p tx_len=%zu rx_fifo=%p rx_len=%zu\n",
 		    pg->tx_fifo, pg->tx_len, pg->rx_fifo, pg->rx_len);
-	if (IS_ERR_OR_NULL(pg->tx_fifo) || IS_ERR_OR_NULL(pg->rx_fifo))
- 		return -ENOENT;
+	if (IS_ERR_OR_NULL(pg->tx_fifo) || IS_ERR_OR_NULL(pg->rx_fifo)) {
+		log_warning("pmic-glink: missing GLINK FIFO remote_pid=%u tx_ok=%d rx_ok=%d\n",
+			    pg->remote_pid, !IS_ERR_OR_NULL(pg->tx_fifo),
+			    !IS_ERR_OR_NULL(pg->rx_fifo));
+		return -ENOENT;
+	}
 
 	*pg->rx_tail = 0;
 	*pg->tx_head = 0;

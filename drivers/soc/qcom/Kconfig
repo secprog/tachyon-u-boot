@@ -24,9 +24,21 @@ config QCOM_RPMH
 	  Say y here to support the Qualcomm RPMh (resource peripheral manager)
 	  if you need to control regulators on Qualcomm platforms, say y here.
 
+config QCOM_ADSP_PAS
+	bool "Qualcomm ADSP PAS bootstrap"
+	depends on ARM64 && OF_CONTROL && BLK
+	select ARM_SMCCC
+	select EFI_PARTITION
+	select FS_FAT
+	help
+	  Start the Qualcomm ADSP/LPASS remote processor through the
+	  Peripheral Authentication Service using firmware stored in the
+	  modem_a FAT partition.
+
 config QCOM_PMIC_GLINK
 	bool "Qualcomm PMIC GLINK transport"
-	depends on MSM_SMEM
+	depends on MSM_SMEM && ARM64 && OF_CONTROL && BLK
+	select QCOM_ADSP_PAS
 	help
 	  Enable a small Qualcomm PMIC-GLINK transport over the LPASS/ADSP
 	  GLINK-SMEM edge. This is used during early boot to query USB-C
