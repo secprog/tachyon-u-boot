@@ -183,6 +183,50 @@ u32 cmd_db_read_addr(const char *id)
 }
 EXPORT_SYMBOL_GPL(cmd_db_read_addr);
 
+const void *cmd_db_read_aux_data(const char *id, size_t *len)
+{
+	int ret;
+	const struct entry_header *ent;
+	const struct rsc_hdr *rsc_hdr;
+
+	debug("%s(%s)\n", __func__, id);
+
+	if (!cmd_db_header) {
+		log_err("%s: Command DB not initialized\n", __func__);
+		return ERR_PTR(-ENOENT);
+	}
+
+	ret = cmd_db_get_header(id, &ent, &rsc_hdr);
+	if (ret < 0)
+		return ERR_PTR(ret);
+
+	if (len)
+		*len = le16_to_cpu(ent->len);
+
+	return rsc_offset(rsc_hdr, ent);
+}
+EXPORT_SYMBOL_GPL(cmd_db_read_aux_data);
+
+enum cmd_db_hw_type cmd_db_read_slave_id(const char *id)
+{
+	int ret;
+	const struct rsc_hdr *rsc_hdr;
+
+	debug("%s(%s)\n", __func__, id);
+
+	if (!cmd_db_header) {
+		log_err("%s: Command DB not initialized\n", __func__);
+		return CMD_DB_HW_INVALID;
+	}
+
+	ret = cmd_db_get_header(id, NULL, &rsc_hdr);
+	if (ret < 0)
+		return CMD_DB_HW_INVALID;
+
+	return le16_to_cpu(rsc_hdr->slv_id);
+}
+EXPORT_SYMBOL_GPL(cmd_db_read_slave_id);
+
 static int cmd_db_bind(struct udevice *dev)
 {
 	void __iomem *base;

@@ -59,8 +59,32 @@
 	bootph-all;
 };
 
+&adsp_mem {
+	bootph-all;
+};
+
 &{/smem} {
 	memory-region = <&smem_mem>;
+	bootph-all;
+};
+
+&aop_cmd_db_mem {
+	bootph-all;
+};
+
+&apps_rsc {
+	bootph-all;
+};
+
+&rpmhpd {
+	bootph-all;
+};
+
+&rpmhcc {
+	bootph-all;
+};
+
+&remoteproc_adsp {
 	bootph-all;
 };
 

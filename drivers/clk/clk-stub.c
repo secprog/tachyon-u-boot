@@ -14,6 +14,7 @@
 static const struct udevice_id nop_parent_ids[] = {
 	{ .compatible = "qcom,rpm-proc" },
 	{ .compatible = "qcom,glink-rpm" },
+	{ .compatible = "qcom,glink-smd-rpm" },
 	{ .compatible = "qcom,rpm-sm6115" },
 	{ }
 };
@@ -50,6 +51,11 @@ static struct clk_ops stub_clk_ops = {
 
 static const struct udevice_id stub_clk_ids[] = {
 	{ .compatible = "qcom,rpmcc" },
+	{ .compatible = "qcom,sdm670-rpmh-clk" },
+	{ .compatible = "qcom,sdm845-rpmh-clk" },
+	{ .compatible = "qcom,sc7180-rpmh-clk" },
+	{ .compatible = "qcom,sc7280-rpmh-clk" },
+	{ .compatible = "qcom,sm6350-rpmh-clk" },
 	{ .compatible = "qcom,sm8150-rpmh-clk" },
 	{ .compatible = "qcom,sm8250-rpmh-clk" },
 	{ .compatible = "qcom,sm8550-rpmh-clk" },
@@ -64,4 +70,3 @@ U_BOOT_DRIVER(clk_stub) = {
 	.of_match = stub_clk_ids,
 	.flags = DM_FLAG_DEFAULT_PD_CTRL_OFF,
 };
-

@@ -7,8 +7,12 @@
  */
 
 #include <blk.h>
+#include <asm/global_data.h>
+#include <clk.h>
 #include <cpu_func.h>
 #include <dm.h>
+#include <dm/device-internal.h>
+#include <dm/lists.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
 #include <elf.h>
@@ -86,6 +90,26 @@ struct qpas_fw {
 };
 
 static bool qpas_booted;
+
+DECLARE_GLOBAL_DATA_PTR;
+
+static int qpas_enable_clocks(struct udevice *dev)
+{
+	struct clk_bulk clocks;
+	int ret;
+
+	ret = clk_get_bulk(dev, &clocks);
+	if (ret) {
+		log_warning("qcom-adsp-pas: clk_get_bulk ret=%d; XO may be unmanaged in U-Boot\n",
+			    ret);
+		return 0;
+	}
+
+	ret = clk_enable_bulk(&clocks);
+	log_warning("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
+		    ret, clocks.count);
+	return ret;
+}
 
 static int qcom_scm_remap_error(long err)
 {
@@ -664,7 +688,7 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 	return 0;
 }
 
-static int qcom_adsp_pas_boot_node(ofnode node)
+static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 {
 	struct qpas_fw fw = {};
 	const char *fw_name;
@@ -677,6 +701,14 @@ static int qcom_adsp_pas_boot_node(ofnode node)
 
 	if (qpas_booted)
 		return 0;
+
+	if (dev) {
+		ret = qpas_enable_clocks(dev);
+		if (ret)
+			return ret;
+	} else {
+		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
+	}
 
 	ret = qpas_get_memory_region(node, &mem_phys, &mem_size, &mem_region);
 	if (ret) {
@@ -730,7 +762,7 @@ out_unmap:
 
 static int qcom_adsp_pas_probe(struct udevice *dev)
 {
-	return qcom_adsp_pas_boot_node(dev_ofnode(dev));
+	return qcom_adsp_pas_boot_node(dev, dev_ofnode(dev));
 }
 
 static const struct udevice_id qcom_adsp_pas_ids[] = {
@@ -765,11 +797,20 @@ int qcom_adsp_pas_boot(void)
 	if (!ret || qpas_booted)
 		return 0;
 
-	if (ret != -ENODEV) {
+	if (ret == -ENODEV) {
+		ret = lists_bind_fdt(gd->dm_root, node, &dev, NULL, false);
+		if (!ret)
+			ret = device_probe(dev);
+		if (!ret || qpas_booted)
+			return 0;
+		log_warning("qcom-adsp-pas: bind/probe failed ret=%d\n", ret);
+		return ret;
+	}
+
+	if (ret) {
 		log_warning("qcom-adsp-pas: driver probe failed ret=%d\n", ret);
 		return ret;
 	}
 
-	log_warning("qcom-adsp-pas: DT node not bound, booting directly\n");
-	return qcom_adsp_pas_boot_node(node);
+	return 0;
 }
