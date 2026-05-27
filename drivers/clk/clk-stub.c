@@ -9,9 +9,6 @@
 
 #include <clk-uclass.h>
 #include <dm.h>
-#include <dt-bindings/clock/qcom,rpmh.h>
-
-#define QCOM_RPMH_XO_RATE	19200000
 
 /* NOP parent nodes to stub clocks */
 static const struct udevice_id nop_parent_ids[] = {
@@ -37,16 +34,7 @@ static ulong stub_clk_set_rate(struct clk *clk, ulong rate)
 
 static ulong stub_clk_get_rate(struct clk *clk)
 {
-	if (clk->rate)
-		return clk->rate;
-
-	switch (clk->id) {
-	case RPMH_CXO_CLK:
-	case RPMH_CXO_CLK_A:
-		return QCOM_RPMH_XO_RATE;
-	default:
-		return 0;
-	}
+	return clk->rate;
 }
 
 static int stub_clk_nop(struct clk *clk)
