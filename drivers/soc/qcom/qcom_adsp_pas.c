@@ -85,6 +85,8 @@ struct qcom_scm_res {
 struct qpas_fw {
 	void *data;
 	size_t size;
+	struct blk_desc *desc;
+	int part;
 	char path[128];
 };
 
@@ -412,6 +414,8 @@ static int qpas_read_firmware(struct qpas_fw *fw, const char *dt_fw_name)
 		log_warning("qcom-adsp-pas: read %s ret=%d size=%zu\n",
 			    candidate[i], ret, ret ? 0 : fw->size);
 		if (!ret) {
+			fw->desc = desc;
+			fw->part = part;
 			snprintf(fw->path, sizeof(fw->path), "%s", candidate[i]);
 			return 0;
 		}
@@ -420,30 +424,28 @@ static int qpas_read_firmware(struct qpas_fw *fw, const char *dt_fw_name)
 	return ret;
 }
 
-static int qpas_read_segment(const char *fw_path, unsigned int segment,
+static int qpas_read_segment(const struct qpas_fw *fw, unsigned int segment,
 			     void *dst, size_t size)
 {
-	struct blk_desc *desc;
 	char seg_path[128];
-	int part;
 	int len;
 	int ret;
 	void *buf;
 	size_t read_size;
 
-	ret = qpas_find_modem_partition(&desc, &part);
-	if (ret)
-		return ret;
+	if (!fw->desc)
+		return -EINVAL;
 
-	len = strlen(fw_path);
+	len = strlen(fw->path);
 	if (len < 3 || len >= sizeof(seg_path))
 		return -EINVAL;
 
-	snprintf(seg_path, sizeof(seg_path), "%s", fw_path);
+	snprintf(seg_path, sizeof(seg_path), "%s", fw->path);
 	snprintf(seg_path + len - 3, sizeof(seg_path) - len + 3,
 		 "b%02u", segment);
 
-	ret = qpas_read_file_exact(desc, part, seg_path, &buf, &read_size);
+	ret = qpas_read_file_exact(fw->desc, fw->part, seg_path, &buf,
+				   &read_size);
 	log_warning("qcom-adsp-pas: read segment %s ret=%d size=%zu expected=%zu\n",
 		    seg_path, ret, ret ? 0 : read_size, size);
 	if (ret)
@@ -572,7 +574,7 @@ static int qpas_mdt_read_metadata(const struct qpas_fw *fw,
 		hash_offset = phdrs[hash_segment].p_offset;
 		memcpy((u8 *)metadata + ehdr_size, data + hash_offset, hash_size);
 	} else {
-		ret = qpas_read_segment(fw->path, hash_segment,
+		ret = qpas_read_segment(fw, hash_segment,
 					(u8 *)metadata + ehdr_size, hash_size);
 		if (ret) {
 			free(metadata);
@@ -697,8 +699,7 @@ static int qpas_mdt_load_segments(const struct qpas_fw *fw, void *mem_region,
 				return -EINVAL;
 			memcpy(ptr, data + phdr->p_offset, phdr->p_filesz);
 		} else if (phdr->p_filesz) {
-			ret = qpas_read_segment(fw->path, i, ptr,
-						phdr->p_filesz);
+			ret = qpas_read_segment(fw, i, ptr, phdr->p_filesz);
 			if (ret)
 				return ret;
 		}
