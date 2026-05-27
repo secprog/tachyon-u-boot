@@ -194,13 +194,16 @@ static void qpg_rx_peek(struct qpg *pg, void *data, size_t offset, size_t len)
 
 static void qpg_rx_advance(struct qpg *pg, size_t len)
 {
-	u32 tail = le32_to_cpu(*pg->rx_tail);
+	u32 old_tail = le32_to_cpu(*pg->rx_tail);
+	u32 tail = old_tail;
 
 	tail += len;
 	if (tail >= pg->rx_len)
 		tail %= pg->rx_len;
 
 	*pg->rx_tail = cpu_to_le32(tail);
+	log_warning("pmic-glink: RX advance old_tail=%u new_tail=%u aligned=%zu\n",
+		    old_tail, tail, len);
 }
 
 static u32 qpg_tx_write_one(struct qpg *pg, u32 head, const void *data,
@@ -596,11 +599,58 @@ static size_t qpg_rx_payload_len(u16 cmd, u32 param2)
 	}
 }
 
+static int qpg_rx_packet_len(struct qpg *pg, size_t avail, u16 cmd,
+			     u32 param2, size_t *header_lenp,
+			     size_t *payload_lenp)
+{
+	struct {
+		struct qpg_msg msg;
+		__le32 chunk_size;
+		__le32 left_size;
+	} __packed data_hdr;
+	size_t header_len = sizeof(struct qpg_msg);
+	size_t payload_len = qpg_rx_payload_len(cmd, param2);
+	size_t aligned_len;
+
+	if (cmd == GLINK_CMD_TX_DATA || cmd == GLINK_CMD_TX_DATA_CONT) {
+		header_len = sizeof(data_hdr);
+		if (avail < header_len) {
+			log_warning("pmic-glink: short data header avail=%zu header_len=%zu cmd=%u\n",
+				    avail, header_len, cmd);
+			return -EAGAIN;
+		}
+
+		qpg_rx_peek(pg, &data_hdr, 0, sizeof(data_hdr));
+		payload_len = le32_to_cpu(data_hdr.chunk_size);
+	}
+
+	if (payload_len > avail - header_len) {
+		log_warning("pmic-glink: bad payload_len=%zu avail=%zu cmd=%u\n",
+			    payload_len, avail, cmd);
+		return -EINVAL;
+	}
+
+	aligned_len = ALIGN(header_len + payload_len, 8);
+	if (aligned_len > avail) {
+		log_warning("pmic-glink: bad aligned_len=%zu payload_len=%zu avail=%zu cmd=%u\n",
+			    aligned_len, payload_len, avail, cmd);
+		return -EINVAL;
+	}
+
+	*header_lenp = header_len;
+	*payload_lenp = payload_len;
+	return 0;
+}
+
 static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	struct qpg_msg msg;
+	__le32 raw[4] = {};
 	size_t avail;
+	size_t header_len;
 	size_t payload_len;
+	size_t raw_len;
+	u32 tail;
 	u16 cmd, param1;
 	u32 param2;
 	int ret = 0;
@@ -609,16 +659,27 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	if (avail < sizeof(msg))
 		return -EAGAIN;
 
+	tail = le32_to_cpu(*pg->rx_tail);
+	raw_len = min_t(size_t, avail, sizeof(raw));
+	qpg_rx_peek(pg, raw, 0, raw_len);
+	log_warning("pmic-glink: RX raw off=%u avail=%zu h0=%08x h1=%08x h2=%08x h3=%08x\n",
+		    tail, avail, le32_to_cpu(raw[0]), le32_to_cpu(raw[1]),
+		    le32_to_cpu(raw[2]), le32_to_cpu(raw[3]));
+
 	qpg_rx_peek(pg, &msg, 0, sizeof(msg));
 	cmd = le16_to_cpu(msg.cmd);
 	param1 = le16_to_cpu(msg.param1);
 	param2 = le32_to_cpu(msg.param2);
-	payload_len = qpg_rx_payload_len(cmd, param2);
+
+	ret = qpg_rx_packet_len(pg, avail, cmd, param2, &header_len,
+				&payload_len);
+	if (ret)
+		return ret;
 
 	log_warning("pmic-glink: RX cmd=%u param1=%u param2=%u avail=%zu\n",
 		    cmd, param1, param2, avail);
-	log_warning("pmic-glink: RX header cmd=%u param1=%u param2=%u payload_len=%zu avail=%zu\n",
-		    cmd, param1, param2, payload_len, avail);
+	log_warning("pmic-glink: RX header cmd=%u param1=%u param2=%u header_len=%zu payload_len=%zu avail=%zu\n",
+		    cmd, param1, param2, header_len, payload_len, avail);
 
 	switch (cmd) {
 	case GLINK_CMD_VERSION:
