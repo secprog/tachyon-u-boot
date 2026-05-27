@@ -21,6 +21,8 @@
 #include <memalign.h>
 #include <part.h>
 #include <string.h>
+#include <scsi.h>
+#include <ufs.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
@@ -255,13 +257,30 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	return ret ? ret : (int)res.result[0];
 }
 
+static void qpas_prepare_storage(void)
+{
+	int ret;
+
+	if (IS_ENABLED(CONFIG_UFS)) {
+		ret = ufs_probe();
+		log_warning("qcom-adsp-pas: ufs_probe ret=%d\n", ret);
+	}
+
+	if (IS_ENABLED(CONFIG_SCSI)) {
+		ret = scsi_scan(false);
+		log_warning("qcom-adsp-pas: scsi_scan ret=%d\n", ret);
+	}
+}
+
 static int qpas_find_modem_partition(struct blk_desc **descp, int *partp)
 {
 	struct disk_partition info;
 	struct udevice *dev;
 	struct blk_desc *desc;
 	int part;
-
+	
+	qpas_prepare_storage();
+	
 	uclass_foreach_dev_probe(UCLASS_BLK, dev) {
 		desc = dev_get_uclass_plat(dev);
 		if (!desc) {
