@@ -6,6 +6,8 @@
 #ifndef __SOC_QCOM_TCS_H__
 #define __SOC_QCOM_TCS_H__
 
+#include <linux/types.h>
+
 #define MAX_RPMH_PAYLOAD	16
 
 /**
@@ -50,12 +52,14 @@ struct tcs_cmd {
  * @state:          state for the request.
  * @wait_for_compl: wait until we get a response from the h/w accelerator
  *                  (same as setting cmd->wait for all commands in the request)
+ * @is_read:        request data from the h/w accelerator instead of writing it
  * @num_cmds:       the number of @cmds in this request
  * @cmds:           an array of tcs_cmds
  */
 struct tcs_request {
 	enum rpmh_state state;
 	u32 wait_for_compl;
+	bool is_read;
 	u32 num_cmds;
 	struct tcs_cmd *cmds;
 };
