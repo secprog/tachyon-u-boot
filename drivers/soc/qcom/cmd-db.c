@@ -8,14 +8,17 @@
 
 #include <asm/system.h>
 #include <dm.h>
-#include <dm/ofnode.h>
 #include <dm/device_compat.h>
+#include <dm/ofnode.h>
+#include <dm/uclass.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/ioport.h>
 #include <linux/byteorder/generic.h>
 
 #include <soc/qcom/cmd-db.h>
+
+extern U_BOOT_DRIVER(qcom_cmd_db);
 
 #define NUM_PRIORITY		2
 #define MAX_SLV_ID		8
@@ -109,6 +112,22 @@ static bool cmd_db_magic_matches(const struct cmd_db_header *header)
 
 static struct cmd_db_header *cmd_db_header __section(".data") = NULL;
 
+static int cmd_db_ensure_init(void)
+{
+	struct udevice *dev;
+	int ret;
+
+	if (cmd_db_header)
+		return 0;
+
+	ret = uclass_get_device_by_driver(UCLASS_MISC,
+					  DM_DRIVER_GET(qcom_cmd_db), &dev);
+	if (ret)
+		log_err("%s: failed to probe Command DB: %d\n", __func__, ret);
+
+	return ret;
+}
+
 static inline const void *rsc_to_entry_header(const struct rsc_hdr *hdr)
 {
 	u16 offset = le16_to_cpu(hdr->header_offset);
@@ -172,10 +191,9 @@ u32 cmd_db_read_addr(const char *id)
 
 	debug("%s(%s)\n", __func__, id);
 
-	if (!cmd_db_header) {
-		log_err("%s: Command DB not initialized\n", __func__);
+	ret = cmd_db_ensure_init();
+	if (ret)
 		return 0;
-	}
 
 	ret = cmd_db_get_header(id, &ent, NULL);
 
@@ -191,10 +209,9 @@ const void *cmd_db_read_aux_data(const char *id, size_t *len)
 
 	debug("%s(%s)\n", __func__, id);
 
-	if (!cmd_db_header) {
-		log_err("%s: Command DB not initialized\n", __func__);
-		return ERR_PTR(-ENOENT);
-	}
+	ret = cmd_db_ensure_init();
+	if (ret)
+		return ERR_PTR(ret);
 
 	ret = cmd_db_get_header(id, &ent, &rsc_hdr);
 	if (ret < 0)
@@ -214,10 +231,9 @@ enum cmd_db_hw_type cmd_db_read_slave_id(const char *id)
 
 	debug("%s(%s)\n", __func__, id);
 
-	if (!cmd_db_header) {
-		log_err("%s: Command DB not initialized\n", __func__);
+	ret = cmd_db_ensure_init();
+	if (ret)
 		return CMD_DB_HW_INVALID;
-	}
 
 	ret = cmd_db_get_header(id, NULL, &rsc_hdr);
 	if (ret < 0)
@@ -227,7 +243,7 @@ enum cmd_db_hw_type cmd_db_read_slave_id(const char *id)
 }
 EXPORT_SYMBOL_GPL(cmd_db_read_slave_id);
 
-static int cmd_db_bind(struct udevice *dev)
+static int cmd_db_probe(struct udevice *dev)
 {
 	void __iomem *base;
 	fdt_size_t size;
@@ -266,7 +282,7 @@ static const struct udevice_id cmd_db_ids[] = {
 U_BOOT_DRIVER(qcom_cmd_db) = {
 	.name		= "qcom_cmd_db",
 	.id		= UCLASS_MISC,
-	.bind		= cmd_db_bind,
+	.probe		= cmd_db_probe,
 	.of_match	= cmd_db_ids,
 };
 
