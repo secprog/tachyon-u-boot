@@ -74,6 +74,14 @@
 
 &apps_rsc {
 	bootph-all;
+
+	regulators-0 {
+		bootph-all;
+	};
+
+	regulators-1 {
+		bootph-all;
+	};
 };
 
 &rpmhpd {

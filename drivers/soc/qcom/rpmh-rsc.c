@@ -394,7 +394,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 
 	/* U-Boot: Now wait for the TCS to be cleared, indicating that we're done */
 	for (i = 0; i < USEC_PER_SEC; i++) {
-		addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], i, 0);
+		addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], tcs_id, 0);
 		if (addr != msg->cmds[0].addr)
 			break;
 		udelay(1);
