@@ -700,9 +700,15 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		ret = qpg_rx_open(pg, avail, param1, param2);
 		break;
 	case GLINK_CMD_OPEN_ACK:
+		log_warning("pmic-glink: OPEN_ACK begin param1=%u lcid=%u\n",
+			    param1, pg->lcid);
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
-		if (param1 == pg->lcid)
+		log_warning("pmic-glink: OPEN_ACK after advance\n");
+		if (param1 == pg->lcid) {
 			pg->open_acked = true;
+			log_warning("pmic-glink: OPEN_ACK matched lcid=%u\n",
+				    pg->lcid);
+		}
 		break;
 	case GLINK_CMD_INTENT:
 		ret = qpg_rx_intent(pg, avail, param1, param2);
@@ -766,7 +772,7 @@ static bool qpg_done_version(struct qpg *pg,
 static bool qpg_done_open(struct qpg *pg,
 			  struct qcom_pmic_glink_altmode *altmode)
 {
-	return pg->open_acked && pg->remote_opened;
+	return pg->open_acked;
 }
 
 static bool qpg_done_riid(struct qpg *pg,
