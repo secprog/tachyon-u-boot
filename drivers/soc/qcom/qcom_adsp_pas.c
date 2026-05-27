@@ -344,15 +344,26 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 
 	ret = fs_size(path, &size);
 	log_warning("qcom-adsp-pas: fs_size path=%s ret=%d size=%llu\n",
-		    path, ret, (u64)size);
+			path, ret, (u64)size);
+	if (ret)
+		return ret;
+
+	/*
+	* fs_size() may close the current filesystem context, so select the
+	* block device/partition again before fs_read().
+	*/
+	ret = fs_set_blk_dev_with_part(desc, part);
+	log_warning("qcom-adsp-pas: fs_set_blk_dev_with_part before read ret=%d\n",
+			ret);
 	if (ret)
 		return ret;
 
 	buf = memalign(ARCH_DMA_MINALIGN,
-		       ALIGN(size + 1, ARCH_DMA_MINALIGN));
+			ALIGN(size + 1, ARCH_DMA_MINALIGN));
 	if (!buf)
 		return -ENOMEM;
 
+	read = 0;
 	ret = fs_read(path, (ulong)buf, 0, size, &read);
 	log_warning("qcom-adsp-pas: fs_read path=%s ret=%d read=%llu expected=%llu\n",
 		    path, ret, (u64)read, (u64)size);
