@@ -270,11 +270,11 @@ static int qpas_find_modem_partition(struct blk_desc **descp, int *partp)
 			continue;
 		}
 
-		log_warning("qcom-adsp-pas: checking blk dev=%s devnum=%d hwpart=%d if_type=%d part_type=%d lba=%llu blksz=%lu\n",
+		log_warning("qcom-adsp-pas: checking blk dev=%s devnum=%d hwpart=%d uclass_id=%d part_type=%d lba=%llu blksz=%lu\n",
 			    dev->name,
 			    desc->devnum,
 			    desc->hwpart,
-			    desc->if_type,
+			    desc->uclass_id,
 			    desc->part_type,
 			    (u64)desc->lba,
 			    (ulong)desc->blksz);
