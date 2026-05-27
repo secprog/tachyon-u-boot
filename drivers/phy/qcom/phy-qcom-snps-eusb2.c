@@ -353,9 +353,6 @@ static const struct udevice_id qcom_snps_eusb2_phy_ids[] = {
 	{
 		.compatible = "qcom,sm8550-snps-eusb2-phy",
 	},
-	{
-		.compatible = "qcom,sc7280-usb-hs-phy",
-	},
 	{}
 };
 
