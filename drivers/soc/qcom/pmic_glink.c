@@ -663,12 +663,12 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	raw_len = min_t(size_t, avail, sizeof(raw));
 	qpg_rx_peek(pg, raw, 0, raw_len);
 	if (avail >= 8)
-		log_warning("pmic-glink: RX raw off=%u avail=%u h0=%08x h1=%08x\n",
+		log_warning("pmic-glink: RX raw off=%u avail=%zu h0=%08x h1=%08x\n",
 				tail, avail,
-				qpg_rx_peek32(pg, tail + 0),
-				qpg_rx_peek32(pg, tail + 4));
+				le32_to_cpu(raw[0]),
+				le32_to_cpu(raw[1]));
 	else
-		log_warning("pmic-glink: RX raw off=%u avail=%u too short\n",
+		log_warning("pmic-glink: RX raw off=%u avail=%zu too short\n",
 				tail, avail);
 
 	qpg_rx_peek(pg, &msg, 0, sizeof(msg));
