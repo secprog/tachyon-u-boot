@@ -662,9 +662,14 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	tail = le32_to_cpu(*pg->rx_tail);
 	raw_len = min_t(size_t, avail, sizeof(raw));
 	qpg_rx_peek(pg, raw, 0, raw_len);
-	log_warning("pmic-glink: RX raw off=%u avail=%zu h0=%08x h1=%08x h2=%08x h3=%08x\n",
-		    tail, avail, le32_to_cpu(raw[0]), le32_to_cpu(raw[1]),
-		    le32_to_cpu(raw[2]), le32_to_cpu(raw[3]));
+	if (avail >= 8)
+		log_warning("pmic-glink: RX raw off=%u avail=%u h0=%08x h1=%08x\n",
+				tail, avail,
+				qpg_rx_peek32(pg, tail + 0),
+				qpg_rx_peek32(pg, tail + 4));
+	else
+		log_warning("pmic-glink: RX raw off=%u avail=%u too short\n",
+				tail, avail);
 
 	qpg_rx_peek(pg, &msg, 0, sizeof(msg));
 	cmd = le16_to_cpu(msg.cmd);
