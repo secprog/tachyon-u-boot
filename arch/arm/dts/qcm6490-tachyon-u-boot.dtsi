@@ -85,7 +85,12 @@
 };
 
 &remoteproc_adsp {
+	status = "okay";
 	bootph-all;
+
+	glink-edge {
+		bootph-all;
+	};
 };
 
 &usb_1_qmpphy {
