@@ -268,8 +268,17 @@ static int qpg_send_simple(struct qpg *pg, u16 cmd, u16 param1, u32 param2)
 		.param1 = cpu_to_le16(param1),
 		.param2 = cpu_to_le32(param2),
 	};
+	int ret;
 
-	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
+	if (cmd == GLINK_CMD_OPEN_ACK)
+		log_warning("pmic-glink: send OPEN_ACK begin\n");
+
+	ret = qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
+
+	if (cmd == GLINK_CMD_OPEN_ACK)
+		log_warning("pmic-glink: send OPEN_ACK end ret=%d\n", ret);
+
+	return ret;
 }
 
 static int qpg_send_version(struct qpg *pg)
@@ -351,7 +360,12 @@ static int qpg_send_data(struct qpg *pg, const void *data, size_t len)
 
 	pg->riid_avail = false;
 
-	return qpg_tx(pg, &hdr, sizeof(hdr), data, len);
+	log_warning("pmic-glink: send data begin len=%zu riid=%u\n",
+		    len, pg->riid);
+	ret = qpg_tx(pg, &hdr, sizeof(hdr), data, len);
+	log_warning("pmic-glink: send data end ret=%d\n", ret);
+
+	return ret;
 }
 
 static void qpg_parse_sc8280xp_notify(struct qcom_pmic_glink_altmode *altmode,
@@ -494,6 +508,11 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_peek(pg, &hdr, 0, sizeof(hdr));
 	chunk_size = le32_to_cpu(hdr.chunk_size);
 	liid = le32_to_cpu(hdr.msg.param2);
+	log_warning("pmic-glink: RX data header cmd=%u lcid=%u liid=%u chunk=%u left=%u avail=%zu payload_len=%u\n",
+		    le16_to_cpu(hdr.msg.cmd),
+		    le16_to_cpu(hdr.msg.param1),
+		    liid, chunk_size, le32_to_cpu(hdr.left_size),
+		    avail, chunk_size);
 
 	if (chunk_size > sizeof(payload) || avail < sizeof(hdr) + chunk_size)
 		return -EAGAIN;
@@ -538,26 +557,50 @@ static int qpg_rx_intent(struct qpg *pg, size_t avail, u16 cid, u32 count)
 static int qpg_rx_open(struct qpg *pg, size_t avail, u16 rcid, u32 name_len)
 {
 	char name[32] = {};
+	size_t copy_len;
 
-	if (name_len >= sizeof(name) || avail < ALIGN(sizeof(struct qpg_msg) + name_len, 8))
+	if (avail < ALIGN(sizeof(struct qpg_msg) + name_len, 8))
 		return -EAGAIN;
 
-	qpg_rx_peek(pg, name, sizeof(struct qpg_msg), name_len);
+	copy_len = min_t(size_t, name_len, sizeof(name) - 1);
+	qpg_rx_peek(pg, name, sizeof(struct qpg_msg), copy_len);
+	log_warning("pmic-glink: RX remote OPEN rcid=%u name_len=%u name='%s'%s\n",
+		    rcid, name_len, name,
+		    name_len >= sizeof(name) ? " truncated" : "");
 	qpg_rx_advance(pg, ALIGN(sizeof(struct qpg_msg) + name_len, 8));
 
 	if (!strcmp(name, QPG_CHANNEL_NAME)) {
 		pg->rcid = rcid;
 		pg->remote_opened = true;
-		qpg_send_simple(pg, GLINK_CMD_OPEN_ACK, pg->rcid, 0);
 	}
 
 	return 0;
+}
+
+static size_t qpg_rx_payload_len(u16 cmd, u32 param2)
+{
+	switch (cmd) {
+	case GLINK_CMD_OPEN:
+		return param2;
+	case GLINK_CMD_INTENT:
+		return param2 * 8;
+	case GLINK_CMD_VERSION:
+	case GLINK_CMD_VERSION_ACK:
+	case GLINK_CMD_OPEN_ACK:
+	case GLINK_CMD_RX_DONE:
+	case GLINK_CMD_RX_DONE_W_REUSE:
+	case GLINK_CMD_READ_NOTIF:
+		return 0;
+	default:
+		return 0;
+	}
 }
 
 static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	struct qpg_msg msg;
 	size_t avail;
+	size_t payload_len;
 	u16 cmd, param1;
 	u32 param2;
 	int ret = 0;
@@ -570,9 +613,12 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	cmd = le16_to_cpu(msg.cmd);
 	param1 = le16_to_cpu(msg.param1);
 	param2 = le32_to_cpu(msg.param2);
+	payload_len = qpg_rx_payload_len(cmd, param2);
 
 	log_warning("pmic-glink: RX cmd=%u param1=%u param2=%u avail=%zu\n",
 		    cmd, param1, param2, avail);
+	log_warning("pmic-glink: RX header cmd=%u param1=%u param2=%u payload_len=%zu avail=%zu\n",
+		    cmd, param1, param2, payload_len, avail);
 
 	switch (cmd) {
 	case GLINK_CMD_VERSION:
@@ -615,6 +661,10 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		break;
 	}
+
+	if (!ret)
+		log_warning("pmic-glink: RX handled cmd=%u rcid=%u done\n",
+			    cmd, pg->rcid);
 
 	return ret;
 }
@@ -724,6 +774,7 @@ static int qpg_init(struct qpg *pg)
 	log_warning("pmic-glink: ADSP PAS boot ret=%d\n", ret);
 	if (ret)
 		return ret;
+	mdelay(100);
 
 	adsp = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-adsp-pas");
 	if (ofnode_valid(adsp))
