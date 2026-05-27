@@ -194,16 +194,13 @@ static void qpg_rx_peek(struct qpg *pg, void *data, size_t offset, size_t len)
 
 static void qpg_rx_advance(struct qpg *pg, size_t len)
 {
-	u32 old_tail = le32_to_cpu(*pg->rx_tail);
-	u32 tail = old_tail;
+	u32 tail = le32_to_cpu(*pg->rx_tail);
 
 	tail += len;
 	if (tail >= pg->rx_len)
 		tail %= pg->rx_len;
 
 	*pg->rx_tail = cpu_to_le32(tail);
-	log_warning("pmic-glink: RX advance old_tail=%u new_tail=%u aligned=%zu\n",
-		    old_tail, tail, len);
 }
 
 static u32 qpg_tx_write_one(struct qpg *pg, u32 head, const void *data,
@@ -700,15 +697,9 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		ret = qpg_rx_open(pg, avail, param1, param2);
 		break;
 	case GLINK_CMD_OPEN_ACK:
-		log_warning("pmic-glink: OPEN_ACK begin param1=%u lcid=%u\n",
-			    param1, pg->lcid);
-		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
-		log_warning("pmic-glink: OPEN_ACK after advance\n");
-		if (param1 == pg->lcid) {
+		if (param1 == pg->lcid)
 			pg->open_acked = true;
-			log_warning("pmic-glink: OPEN_ACK matched lcid=%u\n",
-				    pg->lcid);
-		}
+		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		break;
 	case GLINK_CMD_INTENT:
 		ret = qpg_rx_intent(pg, avail, param1, param2);
