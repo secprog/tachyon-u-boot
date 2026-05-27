@@ -264,15 +264,40 @@ static int qpas_find_modem_partition(struct blk_desc **descp, int *partp)
 
 	uclass_foreach_dev_probe(UCLASS_BLK, dev) {
 		desc = dev_get_uclass_plat(dev);
-		if (!desc || desc->part_type == PART_TYPE_UNKNOWN)
+		if (!desc) {
+			log_warning("qcom-adsp-pas: blk dev=%s has no desc\n",
+				    dev->name);
 			continue;
+		}
+
+		log_warning("qcom-adsp-pas: checking blk dev=%s devnum=%d hwpart=%d if_type=%d part_type=%d lba=%llu blksz=%lu\n",
+			    dev->name,
+			    desc->devnum,
+			    desc->hwpart,
+			    desc->if_type,
+			    desc->part_type,
+			    (u64)desc->lba,
+			    (ulong)desc->blksz);
+
+		if (desc->part_type == PART_TYPE_UNKNOWN)
+			log_warning("qcom-adsp-pas: blk dev=%s devnum=%d has PART_TYPE_UNKNOWN; still trying %s\n",
+				    dev->name, desc->devnum, QCOM_MODEM_PARTITION);
 
 		part = part_get_info_by_name(desc, QCOM_MODEM_PARTITION, &info);
+		log_warning("qcom-adsp-pas: part_get_info_by_name dev=%s devnum=%d name=%s ret=%d\n",
+			    dev->name, desc->devnum, QCOM_MODEM_PARTITION, part);
+
 		if (part >= 0) {
 			*descp = desc;
 			*partp = part;
-			log_warning("qcom-adsp-pas: found %s on blk devnum=%d part=%d\n",
-				    QCOM_MODEM_PARTITION, desc->devnum, part);
+			log_warning("qcom-adsp-pas: found %s on blk dev=%s devnum=%d hwpart=%d part=%d start=%llu size=%llu\n",
+				    QCOM_MODEM_PARTITION,
+				    dev->name,
+				    desc->devnum,
+				    desc->hwpart,
+				    part,
+				    (u64)info.start,
+				    (u64)info.size);
 			return 0;
 		}
 	}
@@ -290,11 +315,17 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 	loff_t read;
 	int ret;
 
+	log_warning("qcom-adsp-pas: fs select devnum=%d hwpart=%d part=%d path=%s\n",
+		    desc->devnum, desc->hwpart, part, path);
+
 	ret = fs_set_blk_dev_with_part(desc, part);
+	log_warning("qcom-adsp-pas: fs_set_blk_dev_with_part ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = fs_size(path, &size);
+	log_warning("qcom-adsp-pas: fs_size path=%s ret=%d size=%llu\n",
+		    path, ret, (u64)size);
 	if (ret)
 		return ret;
 
@@ -304,6 +335,8 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 		return -ENOMEM;
 
 	ret = fs_read(path, (ulong)buf, 0, size, &read);
+	log_warning("qcom-adsp-pas: fs_read path=%s ret=%d read=%llu expected=%llu\n",
+		    path, ret, (u64)read, (u64)size);
 	if (ret || read != size) {
 		free(buf);
 		return -EIO;
