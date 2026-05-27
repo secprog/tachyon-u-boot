@@ -361,7 +361,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 {
 	struct tcs_group *tcs;
 	int tcs_id, i;
-	u32 addr;
+	u32 val;
 
 	tcs = get_tcs_for_msg(drv, msg);
 	if (IS_ERR(tcs))
@@ -369,6 +369,11 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 
 	/* u-boot is single-threaded, always use the first TCS as we'll never conflict */
 	tcs_id = tcs->offset;
+
+	if (!read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], tcs_id)) {
+		pr_err("%s: TCS %d is busy!\n", __func__, tcs_id);
+		return -EBUSY;
+	}
 
 	tcs->req[tcs_id - tcs->offset] = msg;
 	generic_set_bit(tcs_id, drv->tcs_in_use);
@@ -392,17 +397,23 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
 	__tcs_set_trigger(drv, tcs_id, true);
 
-	/* U-Boot: Now wait for the TCS to be cleared, indicating that we're done */
+	/* U-Boot: Now wait for RPMh to report command completion. */
 	for (i = 0; i < USEC_PER_SEC; i++) {
-		addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], tcs_id, 0);
-		if (addr != msg->cmds[0].addr)
+		val = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_STATUS], tcs_id, 0);
+		if (val & CMD_STATUS_COMPL)
 			break;
 		udelay(1);
 	}
 
+	__tcs_set_trigger(drv, tcs_id, false);
+
+	write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id, 0);
+	writel_relaxed(BIT(tcs_id), drv->tcs_base + drv->regs[RSC_DRV_IRQ_CLEAR]);
+	generic_clear_bit(tcs_id, drv->tcs_in_use);
+
 	if (i == USEC_PER_SEC) {
 		log_err("%s: error writing %#x to %d:%#x\n", drv->name,
-			msg->cmds[0].addr, tcs_id, drv->regs[RSC_DRV_CMD_ADDR]);
+			msg->cmds[0].addr, tcs_id, drv->regs[RSC_DRV_CMD_STATUS]);
 		return -EINVAL;
 	}
 
