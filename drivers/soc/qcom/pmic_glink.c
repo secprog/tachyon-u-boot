@@ -38,6 +38,7 @@
 #define QPG_RX_INTENT_SIZE			512
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
 #define QPG_IPCRTR_CHANNEL_NAME			"IPCRTR"
+#define QPG_IPCRTR_LIID			2
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -137,6 +138,7 @@ struct qpg {
 	bool open_acked;
 	bool remote_opened;
 	bool ipcrtr_opened;
+	bool ipcrtr_open_acked;
 	bool pan_acked;
 	u16 ipcrtr_rcid;
 };
@@ -311,7 +313,7 @@ static int qpg_send_open(struct qpg *pg)
 	return qpg_tx(pg, &req, ALIGN(sizeof(req.msg) + name_len, 8), NULL, 0);
 }
 
-static int qpg_send_rx_intent(struct qpg *pg)
+static int qpg_send_rx_intent_for(struct qpg *pg, u16 cid, u32 liid)
 {
 	struct {
 		__le16 cmd;
@@ -321,16 +323,19 @@ static int qpg_send_rx_intent(struct qpg *pg)
 		__le32 liid;
 	} __packed msg = {
 		.cmd = cpu_to_le16(GLINK_CMD_INTENT),
-		.lcid = cpu_to_le16(pg->lcid),
+		.lcid = cpu_to_le16(cid),
 		.count = cpu_to_le32(1),
 		.size = cpu_to_le32(QPG_RX_INTENT_SIZE),
-		.liid = cpu_to_le32(1),
+		.liid = cpu_to_le32(liid),
 	};
+
+	log_warning("pmic-glink: send RX_INTENT cid=%u liid=%u size=%u\n",
+		    cid, liid, QPG_RX_INTENT_SIZE);
 
 	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
 }
 
-static int qpg_send_rx_done(struct qpg *pg, u32 liid)
+static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 {
 	struct {
 		__le16 cmd;
@@ -338,9 +343,11 @@ static int qpg_send_rx_done(struct qpg *pg, u32 liid)
 		__le32 liid;
 	} __packed msg = {
 		.cmd = cpu_to_le16(GLINK_CMD_RX_DONE_W_REUSE),
-		.lcid = cpu_to_le16(pg->lcid),
+		.lcid = cpu_to_le16(cid),
 		.liid = cpu_to_le32(liid),
 	};
+
+	log_warning("pmic-glink: send RX_DONE cid=%u liid=%u\n", cid, liid);
 
 	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
 }
@@ -464,8 +471,9 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 	altmode->dp = true;
 }
 
-static void qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
-			   const void *data, size_t len)
+static void __maybe_unused
+qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
+	       const void *data, size_t len)
 {
 	const struct qpg_pmic_hdr *hdr = data;
 	u32 owner, type, raw_opcode;
@@ -499,6 +507,24 @@ static void qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmo
 	}
 }
 
+static void qpg_log_ipcrtr(const void *data, size_t len)
+{
+	const __le32 *words = data;
+	u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+
+	if (len >= 4)
+		w0 = le32_to_cpu(words[0]);
+	if (len >= 8)
+		w1 = le32_to_cpu(words[1]);
+	if (len >= 12)
+		w2 = le32_to_cpu(words[2]);
+	if (len >= 16)
+		w3 = le32_to_cpu(words[3]);
+
+	log_warning("pmic-glink: IPCRTR/QRTR frame len=%zu w0=%08x w1=%08x w2=%08x w3=%08x\n",
+		    len, w0, w1, w2, w3);
+}
+
 static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 		       size_t avail)
 {
@@ -509,16 +535,18 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	} __packed hdr;
 	u8 payload[QPG_RX_INTENT_SIZE];
 	u32 chunk_size, liid;
+	u16 cid;
 
 	if (avail < sizeof(hdr))
 		return -EAGAIN;
 
 	qpg_rx_peek(pg, &hdr, 0, sizeof(hdr));
+	cid = le16_to_cpu(hdr.msg.param1);
 	chunk_size = le32_to_cpu(hdr.chunk_size);
 	liid = le32_to_cpu(hdr.msg.param2);
 	log_warning("pmic-glink: RX data header cmd=%u lcid=%u liid=%u chunk=%u left=%u avail=%zu payload_len=%u\n",
 		    le16_to_cpu(hdr.msg.cmd),
-		    le16_to_cpu(hdr.msg.param1),
+		    cid,
 		    liid, chunk_size, le32_to_cpu(hdr.left_size),
 		    avail, chunk_size);
 
@@ -528,10 +556,13 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_peek(pg, payload, sizeof(hdr), chunk_size);
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
-	if (le16_to_cpu(hdr.msg.param1) == pg->lcid && liid == 1)
-		qpg_parse_pmic(pg, altmode, payload, chunk_size);
+	if (cid == pg->ipcrtr_rcid && liid == QPG_IPCRTR_LIID)
+		qpg_log_ipcrtr(payload, chunk_size);
+	else if (cid == pg->lcid && liid == 1)
+		log_warning("pmic-glink: raw PMIC frame ignored len=%u\n",
+			    chunk_size);
 
-	qpg_send_rx_done(pg, liid);
+	qpg_send_rx_done_for(pg, cid, liid);
 
 	return 0;
 }
@@ -554,6 +585,8 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 			   u32 name_len)
 {
+	int ret;
+
 	log_warning("pmic-glink: RX remote OPEN rcid=%u name_len=%u name='%s'%s\n",
 		    rcid, name_len, name,
 		    name_len >= 32 ? " truncated" : "");
@@ -564,6 +597,11 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 	} else if (!strcmp(name, QPG_IPCRTR_CHANNEL_NAME)) {
 		pg->ipcrtr_rcid = rcid;
 		pg->ipcrtr_opened = true;
+		ret = qpg_send_simple(pg, GLINK_CMD_OPEN_ACK, rcid, 0);
+		if (ret)
+			return ret;
+		pg->ipcrtr_open_acked = true;
+		log_warning("pmic-glink: IPCRTR OPEN_ACK rcid=%u\n", rcid);
 	}
 
 	return 0;
@@ -777,20 +815,26 @@ static bool qpg_done_open(struct qpg *pg,
 	return pg->open_acked;
 }
 
+static bool qpg_done_ipcrtr_open(struct qpg *pg,
+				 struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->ipcrtr_opened && pg->ipcrtr_open_acked;
+}
+
 static bool qpg_done_riid(struct qpg *pg,
 			  struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->riid_avail;
 }
 
-static bool qpg_done_pan_ack(struct qpg *pg,
-			     struct qcom_pmic_glink_altmode *altmode)
+static bool __maybe_unused
+qpg_done_pan_ack(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->pan_acked;
 }
 
-static bool qpg_done_altmode(struct qpg *pg,
-			     struct qcom_pmic_glink_altmode *altmode)
+static bool __maybe_unused
+qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
 	 * Accept DP Alt Mode entry regardless of HPD state.
@@ -799,6 +843,12 @@ static bool qpg_done_altmode(struct qpg *pg,
 	 */
 	return altmode->dp &&
 	       altmode->orientation != QCOM_PMIC_GLINK_ORIENTATION_NONE;
+}
+
+static bool qpg_done_never(struct qpg *pg,
+			   struct qcom_pmic_glink_altmode *altmode)
+{
+	return false;
 }
 
 static int qpg_wait_riid(struct qpg *pg)
@@ -817,7 +867,7 @@ static int qpg_wait_riid(struct qpg *pg)
 	return ret;
 }
 
-static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
+static int __maybe_unused qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 {
 	struct qpg_usbc_write_req req = {
 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USBC_PAN),
@@ -1009,45 +1059,31 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
-	if (!pg.remote_opened) {
-		log_warning("pmic-glink: direct channel %s not advertised; ipcrtr_opened=%d ipcrtr_rcid=%u\n",
-			    QPG_CHANNEL_NAME, pg.ipcrtr_opened, pg.ipcrtr_rcid);
-		log_warning("pmic-glink: PMIC routing requires QRTR/IPCRTR; not sending raw PMIC payload on unopened channel\n");
+	if (!pg.ipcrtr_opened) {
+		ret = qpg_drain_until(&pg, altmode, qpg_done_ipcrtr_open, 1000);
+		log_warning("pmic-glink: wait IPCRTR ret=%d ipcrtr_opened=%d ipcrtr_open_acked=%d ipcrtr_rcid=%u\n",
+			    ret, pg.ipcrtr_opened, pg.ipcrtr_open_acked,
+			    pg.ipcrtr_rcid);
+		if (ret)
+			return ret;
+	}
+
+	if (!pg.ipcrtr_open_acked) {
+		log_warning("pmic-glink: IPCRTR not ready; not sending PMIC payload\n");
 		return -ENODEV;
 	}
 
-	ret = qpg_send_rx_intent(&pg);
-	log_warning("pmic-glink: send RX_INTENT ret=%d\n", ret);
+	log_warning("pmic-glink: direct channel %s advertised=%d; ipcrtr_opened=%d ipcrtr_rcid=%u\n",
+		    QPG_CHANNEL_NAME, pg.remote_opened, pg.ipcrtr_opened,
+		    pg.ipcrtr_rcid);
+	log_warning("pmic-glink: bringing up IPCRTR only; PMIC QRTR decode/send is not implemented\n");
+
+	ret = qpg_send_rx_intent_for(&pg, pg.ipcrtr_rcid, QPG_IPCRTR_LIID);
+	log_warning("pmic-glink: send IPCRTR RX_INTENT ret=%d\n", ret);
 	if (ret)
 		return ret;
 
-	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
-	log_warning("pmic-glink: send ALTMODE_PAN_EN ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(&pg, altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
-		    ret, pg.pan_acked);
-	if (ret)
-		log_warning("pmic-glink: PAN_ACK timeout/nonfatal ret=%d\n",
-			    ret);
-
-	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode, 2500);
-	log_warning("pmic-glink: wait ALTMODE ret=%d dp=%d orientation=%u pin=%u port=%u hpd=%d hpd_irq=%d\n",
-		    ret, altmode->dp, altmode->orientation,
-		    altmode->pin_assignment, altmode->port,
-		    altmode->hpd, altmode->hpd_irq);
-	if (ret)
-		return ret;
-
-	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_ACK, altmode->port);
-	log_warning("pmic-glink: send ALTMODE_PAN_ACK port=%u ret=%d\n",
-		    altmode->port, ret);
-
-	log_warning("pmic-glink: final altmode dp=%d port=%u orientation=%u pin=%u hpd=%d hpd_irq=%d\n",
-		    altmode->dp, altmode->port, altmode->orientation,
-		    altmode->pin_assignment, altmode->hpd, altmode->hpd_irq);
-
-	return 0;
+	ret = qpg_drain_until(&pg, altmode, qpg_done_never, 1000);
+	log_warning("pmic-glink: IPCRTR drain ret=%d\n", ret);
+	return -ENODEV;
 }
