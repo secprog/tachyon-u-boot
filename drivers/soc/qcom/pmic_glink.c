@@ -44,7 +44,7 @@
  * 2 - ADSP boot only, return before SMEM/IPCC/FIFO/GLINK
  * 3 - ADSP + SMEM/IPCC/FIFO discovery, no FIFO pointer reset, no GLINK TX
  */
-#define QPG_DIAG_STAGE				1
+#define QPG_DIAG_STAGE				2
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
