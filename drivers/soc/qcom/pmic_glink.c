@@ -37,6 +37,7 @@
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
+#define QPG_DIAG_ADSP_ONLY			1
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -1066,6 +1067,7 @@ static int qpg_init(struct qpg *pg)
 int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 {
 	struct qpg pg = {};
+	static bool diag_adsp_only_done;
 	int ret;
 
 	if (!altmode)
@@ -1075,13 +1077,28 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 
 	log_warning("pmic-glink: get_altmode start\n");
 
+#if QPG_DIAG_ADSP_ONLY
+	if (diag_adsp_only_done) {
+		log_warning("pmic-glink: ADSP-only diag already ran; skipping SMEM/GLINK\n");
+		return -ENODEV;
+	}
+	diag_adsp_only_done = true;
+
+	ret = qcom_adsp_pas_boot();
+	log_warning("pmic-glink: ADSP-only diag boot ret=%d\n", ret);
+	if (ret)
+		return ret;
+	mdelay(100);
+
+	log_warning("pmic-glink: ADSP-only diag returning before SMEM/IPCC/FIFO/GLINK\n");
+	return -ENODEV;
+#endif
+
 	ret = qpg_init(&pg);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
 	if (ret)
 		return ret;
-	puts("pmic-glink: ADSP booted, returning before GLINK\n");
-	return -ENODEV;
-	
+
 	ret = qpg_send_version(&pg);
 	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
 	if (ret)
