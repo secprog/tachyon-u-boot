@@ -108,6 +108,11 @@ struct qpg_usbc_sc8180x_notify {
 	__le32 reserved[2];
 } __packed;
 
+struct qpg_intent_pair {
+	__le32 size;
+	__le32 iid;
+} __packed;
+
 struct qpg {
 	struct udevice *smem;
 	void __iomem *ipcc;
@@ -528,46 +533,27 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	return 0;
 }
 
-static int qpg_rx_intent(struct qpg *pg, size_t avail, u16 cid, u32 count)
+static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
+			     const struct qpg_intent_pair *intent)
 {
-	struct {
-		struct qpg_msg msg;
-		__le32 size;
-		__le32 iid;
-	} __packed intent;
-
 	if (!count)
 		return -EINVAL;
 
-	if (avail < sizeof(intent))
-		return -EAGAIN;
-
-	qpg_rx_peek(pg, &intent, 0, sizeof(intent));
-	qpg_rx_advance(pg, ALIGN(sizeof(intent), 8));
-
 	if (cid == pg->lcid) {
-		pg->riid_size = le32_to_cpu(intent.size);
-		pg->riid = le32_to_cpu(intent.iid);
+		pg->riid_size = le32_to_cpu(intent->size);
+		pg->riid = le32_to_cpu(intent->iid);
 		pg->riid_avail = pg->riid_size > 0;
 	}
 
 	return 0;
 }
 
-static int qpg_rx_open(struct qpg *pg, size_t avail, u16 rcid, u32 name_len)
+static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
+			   u32 name_len)
 {
-	char name[32] = {};
-	size_t copy_len;
-
-	if (avail < ALIGN(sizeof(struct qpg_msg) + name_len, 8))
-		return -EAGAIN;
-
-	copy_len = min_t(size_t, name_len, sizeof(name) - 1);
-	qpg_rx_peek(pg, name, sizeof(struct qpg_msg), copy_len);
 	log_warning("pmic-glink: RX remote OPEN rcid=%u name_len=%u name='%s'%s\n",
 		    rcid, name_len, name,
-		    name_len >= sizeof(name) ? " truncated" : "");
-	qpg_rx_advance(pg, ALIGN(sizeof(struct qpg_msg) + name_len, 8));
+		    name_len >= 32 ? " truncated" : "");
 
 	if (!strcmp(name, QPG_CHANNEL_NAME)) {
 		pg->rcid = rcid;
@@ -583,7 +569,7 @@ static size_t qpg_rx_payload_len(u16 cmd, u32 param2)
 	case GLINK_CMD_OPEN:
 		return param2;
 	case GLINK_CMD_INTENT:
-		return param2 * 8;
+		return param2 * sizeof(struct qpg_intent_pair);
 	case GLINK_CMD_VERSION:
 	case GLINK_CMD_VERSION_ACK:
 	case GLINK_CMD_OPEN_ACK:
@@ -694,16 +680,35 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		pg->version_acked = true;
 		break;
 	case GLINK_CMD_OPEN:
-		ret = qpg_rx_open(pg, avail, param1, param2);
+	{
+		char name[32] = {};
+		size_t copy_len;
+
+		copy_len = min_t(size_t, payload_len, sizeof(name) - 1);
+		qpg_rx_peek(pg, name, header_len, copy_len);
+		qpg_rx_advance(pg, ALIGN(header_len + payload_len, 8));
+		ret = qpg_handle_open(pg, param1, name, param2);
 		break;
+	}
 	case GLINK_CMD_OPEN_ACK:
+		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		if (param1 == pg->lcid)
 			pg->open_acked = true;
-		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		break;
 	case GLINK_CMD_INTENT:
-		ret = qpg_rx_intent(pg, avail, param1, param2);
+	{
+		struct qpg_intent_pair intent = {};
+
+		if (!param2) {
+			ret = -EINVAL;
+			break;
+		}
+
+		qpg_rx_peek(pg, &intent, header_len, sizeof(intent));
+		qpg_rx_advance(pg, ALIGN(header_len + payload_len, 8));
+		ret = qpg_handle_intent(pg, param1, param2, &intent);
 		break;
+	}
 	case GLINK_CMD_TX_DATA:
 	case GLINK_CMD_TX_DATA_CONT:
 		ret = qpg_rx_data(pg, altmode, avail);
