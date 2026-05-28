@@ -206,6 +206,11 @@ struct qpg {
 	bool open_acked;
 	bool remote_opened;
 	bool ipcrtr_opened;
+	bool ipcrtr_remote_open_seen;
+	bool ipcrtr_open_ack_pending;
+	bool ipcrtr_local_open_pending;
+	bool ipcrtr_remote_open_acked;
+	bool ipcrtr_local_open_sent;
 	bool ipcrtr_open_acked;
 	bool ipcrtr_seen_data;
 	bool pan_acked;
@@ -858,15 +863,15 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_peek(pg, payload, sizeof(hdr), chunk_size);
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
-	if ((cid == pg->ipcrtr_lcid || cid == pg->ipcrtr_rcid) &&
+	if (pg->ipcrtr_opened && cid == pg->ipcrtr_rcid &&
 	    liid == pg->ipcrtr_liid) {
 		pg->ipcrtr_seen_data = true;
 		qpg_log_ipcrtr(pg, payload, chunk_size);
-		rx_done_cid = cid;
+		rx_done_cid = pg->ipcrtr_lcid;
 	} else if (pg->remote_opened && cid == pg->rcid && liid == 1) {
 		log_warning("pmic-glink: raw PMIC frame ignored len=%u\n",
 			    chunk_size);
-		rx_done_cid = cid;
+		rx_done_cid = pg->lcid;
 	} else {
 		log_warning("pmic-glink: RX data on unknown cid=%u liid=%u len=%u\n",
 			    cid, liid, chunk_size);
@@ -884,17 +889,17 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 	if (!count)
 		return -EINVAL;
 
-	if (cid == pg->lcid) {
+	if (pg->remote_opened && cid == pg->rcid) {
 		pg->riid_size = le32_to_cpu(intent->size);
 		pg->riid = le32_to_cpu(intent->iid);
 		pg->riid_avail = pg->riid_size > 0;
-		log_warning("pmic-glink: RIID channel=raw lcid=%u riid=%u size=%u avail=%d\n",
+		log_warning("pmic-glink: RIID channel=raw rcid=%u riid=%u size=%u avail=%d\n",
 			    cid, pg->riid, pg->riid_size, pg->riid_avail);
-	} else if (pg->ipcrtr_lcid && cid == pg->ipcrtr_lcid) {
+	} else if (pg->ipcrtr_opened && cid == pg->ipcrtr_rcid) {
 		pg->ipcrtr_riid_size = le32_to_cpu(intent->size);
 		pg->ipcrtr_riid = le32_to_cpu(intent->iid);
 		pg->ipcrtr_riid_avail = pg->ipcrtr_riid_size > 0;
-		log_warning("pmic-glink: RIID channel=IPCRTR lcid=%u riid=%u size=%u avail=%d\n",
+		log_warning("pmic-glink: RIID channel=IPCRTR rcid=%u riid=%u size=%u avail=%d\n",
 			    cid, pg->ipcrtr_riid, pg->ipcrtr_riid_size,
 			    pg->ipcrtr_riid_avail);
 	} else {
@@ -923,9 +928,13 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 		if (!pg->ipcrtr_liid)
 			pg->ipcrtr_liid = pg->next_liid++;
 		pg->ipcrtr_opened = true;
-		log_warning("pmic-glink: IPCRTR ids confirmed rcid=%u allocated lcid=%u liid=%u\n",
+		pg->ipcrtr_remote_open_seen = true;
+		pg->ipcrtr_open_ack_pending = !pg->ipcrtr_remote_open_acked;
+		pg->ipcrtr_local_open_pending = !pg->ipcrtr_local_open_sent;
+		log_warning("pmic-glink: IPCRTR remote OPEN recorded rcid=%u allocated lcid=%u liid=%u ack_pending=%d open_pending=%d\n",
 			    pg->ipcrtr_rcid, pg->ipcrtr_lcid,
-			    pg->ipcrtr_liid);
+			    pg->ipcrtr_liid, pg->ipcrtr_open_ack_pending,
+			    pg->ipcrtr_local_open_pending);
 	}
 
 	return 0;
@@ -1056,24 +1065,14 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		qpg_rx_peek(pg, name, header_len, copy_len);
 		qpg_rx_advance(pg, ALIGN(header_len + payload_len, 8));
 		ret = qpg_handle_open(pg, param1, name, param2);
-		if (ret)
-			break;
-
-		if (!strcmp(name, QPG_IPCRTR_CHANNEL_NAME)) {
-			ret = qpg_send_open_ack(pg, param1, name);
-			if (ret)
-				break;
-
-			pg->ipcrtr_open_acked = false;
-			ret = qpg_send_open_for(pg, pg->ipcrtr_lcid,
-						QPG_IPCRTR_CHANNEL_NAME);
-		}
 		break;
 	}
 	case GLINK_CMD_OPEN_ACK:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		if (param1 == pg->lcid) {
 			pg->open_acked = true;
+			log_warning("pmic-glink: raw OPEN_ACK complete lcid=%u\n",
+				    pg->lcid);
 		} else if (pg->ipcrtr_opened && param1 == pg->ipcrtr_lcid) {
 			pg->ipcrtr_open_acked = true;
 			log_warning("pmic-glink: IPCRTR local OPEN_ACK lcid=%u rcid=%u\n",
@@ -1101,9 +1100,11 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	case GLINK_CMD_RX_DONE:
 	case GLINK_CMD_RX_DONE_W_REUSE:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
-		if (param1 == pg->lcid && param2 == pg->riid)
+		if (pg->remote_opened && param1 == pg->rcid &&
+		    param2 == pg->riid)
 			pg->riid_avail = cmd == GLINK_CMD_RX_DONE_W_REUSE;
-		else if (param1 == pg->ipcrtr_lcid && param2 == pg->ipcrtr_riid)
+		else if (pg->ipcrtr_opened && param1 == pg->ipcrtr_rcid &&
+			 param2 == pg->ipcrtr_riid)
 			pg->ipcrtr_riid_avail =
 				cmd == GLINK_CMD_RX_DONE_W_REUSE;
 		break;
@@ -1125,15 +1126,59 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	return ret;
 }
 
+static int qpg_service_ipcrtr_open(struct qpg *pg)
+{
+	int ret;
+
+	if (!pg->ipcrtr_remote_open_seen)
+		return 0;
+
+	if (pg->ipcrtr_open_ack_pending) {
+		log_warning("pmic-glink: service IPCRTR OPEN_ACK begin rcid=%u\n",
+			    pg->ipcrtr_rcid);
+		ret = qpg_send_open_ack(pg, pg->ipcrtr_rcid,
+					QPG_IPCRTR_CHANNEL_NAME);
+		log_warning("pmic-glink: service IPCRTR OPEN_ACK end ret=%d\n",
+			    ret);
+		if (ret)
+			return ret;
+
+		pg->ipcrtr_open_ack_pending = false;
+		pg->ipcrtr_remote_open_acked = true;
+	}
+
+	if (pg->ipcrtr_local_open_pending && !pg->ipcrtr_local_open_sent) {
+		log_warning("pmic-glink: service IPCRTR local OPEN begin lcid=%u\n",
+			    pg->ipcrtr_lcid);
+		pg->ipcrtr_open_acked = false;
+		ret = qpg_send_open_for(pg, pg->ipcrtr_lcid,
+					QPG_IPCRTR_CHANNEL_NAME);
+		log_warning("pmic-glink: service IPCRTR local OPEN end ret=%d\n",
+			    ret);
+		if (ret)
+			return ret;
+
+		pg->ipcrtr_local_open_pending = false;
+		pg->ipcrtr_local_open_sent = true;
+	}
+
+	return 0;
+}
+
 static int qpg_drain_until(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 			   bool (*done)(struct qpg *,
 					struct qcom_pmic_glink_altmode *),
 			   u32 timeout_ms)
 {
 	u32 i;
+	int ret;
 
 	for (i = 0; i < timeout_ms; i++) {
 		while (qpg_poll(pg, altmode) == 0) {
+			ret = qpg_service_ipcrtr_open(pg);
+			if (ret)
+				return ret;
+
 			if (done(pg, altmode))
 				return 0;
 		}
@@ -1162,7 +1207,10 @@ static bool qpg_done_open(struct qpg *pg,
 static bool qpg_done_ipcrtr_open(struct qpg *pg,
 				 struct qcom_pmic_glink_altmode *altmode)
 {
-	return pg->ipcrtr_opened && pg->ipcrtr_open_acked;
+	return pg->ipcrtr_remote_open_seen &&
+	       pg->ipcrtr_remote_open_acked &&
+	       pg->ipcrtr_local_open_sent &&
+	       pg->ipcrtr_open_acked;
 }
 
 static bool qpg_done_ipcrtr_data(struct qpg *pg,
