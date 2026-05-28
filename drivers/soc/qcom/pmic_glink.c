@@ -1079,7 +1079,9 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
 	if (ret)
 		return ret;
-
+	puts("pmic-glink: ADSP booted, returning before GLINK\n");
+	return -ENODEV;
+	
 	ret = qpg_send_version(&pg);
 	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
 	if (ret)
