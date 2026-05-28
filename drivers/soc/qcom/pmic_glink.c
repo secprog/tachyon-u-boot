@@ -37,6 +37,7 @@
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
+#define QPG_IPCRTR_CHANNEL_NAME			"IPCRTR"
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -135,7 +136,9 @@ struct qpg {
 	bool version_acked;
 	bool open_acked;
 	bool remote_opened;
+	bool ipcrtr_opened;
 	bool pan_acked;
+	u16 ipcrtr_rcid;
 };
 
 static u32 qpg_hwirq(u16 client, u16 signal)
@@ -558,6 +561,9 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 	if (!strcmp(name, QPG_CHANNEL_NAME)) {
 		pg->rcid = rcid;
 		pg->remote_opened = true;
+	} else if (!strcmp(name, QPG_IPCRTR_CHANNEL_NAME)) {
+		pg->ipcrtr_rcid = rcid;
+		pg->ipcrtr_opened = true;
 	}
 
 	return 0;
@@ -798,8 +804,17 @@ static bool qpg_done_altmode(struct qpg *pg,
 static int qpg_wait_riid(struct qpg *pg)
 {
 	struct qcom_pmic_glink_altmode altmode = {};
+	int ret;
 
-	return qpg_drain_until(pg, &altmode, qpg_done_riid, 500);
+	log_warning("pmic-glink: wait RIID begin riid_avail=%d riid=%u riid_size=%u\n",
+		    pg->riid_avail, pg->riid, pg->riid_size);
+
+	ret = qpg_drain_until(pg, &altmode, qpg_done_riid, 500);
+
+	log_warning("pmic-glink: wait RIID end ret=%d riid_avail=%d riid=%u riid_size=%u\n",
+		    ret, pg->riid_avail, pg->riid, pg->riid_size);
+
+	return ret;
 }
 
 static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
@@ -993,6 +1008,13 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 		    ret, pg.open_acked, pg.remote_opened, pg.rcid);
 	if (ret)
 		return ret;
+
+	if (!pg.remote_opened) {
+		log_warning("pmic-glink: direct channel %s not advertised; ipcrtr_opened=%d ipcrtr_rcid=%u\n",
+			    QPG_CHANNEL_NAME, pg.ipcrtr_opened, pg.ipcrtr_rcid);
+		log_warning("pmic-glink: PMIC routing requires QRTR/IPCRTR; not sending raw PMIC payload on unopened channel\n");
+		return -ENODEV;
+	}
 
 	ret = qpg_send_rx_intent(&pg);
 	log_warning("pmic-glink: send RX_INTENT ret=%d\n", ret);
