@@ -29,9 +29,9 @@ CONFIG_CMD_PMIC=y
 
 # Minimal USB-C DisplayPort bring-up path. Keep optional DP features off
 # until the base link-training and framebuffer path are confirmed stable.
-CONFIG_LOGLEVEL=7
+CONFIG_LOGLEVEL=4
 CONFIG_LOG_MAX_LEVEL=9
-CONFIG_LOG_DEFAULT_LEVEL=7
+CONFIG_LOG_DEFAULT_LEVEL=4
 CONFIG_CMD_LOG=y
 CONFIG_QCOM_PMIC_GLINK=y
 CONFIG_CLK_QCOM_SC7280_DISPCC=y
