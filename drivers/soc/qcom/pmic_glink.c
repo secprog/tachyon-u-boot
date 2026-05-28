@@ -138,6 +138,7 @@ struct qpg {
 	bool remote_opened;
 	bool remote_open_ack_pending;
 	bool remote_open_acked;
+	bool pan_acked;
 };
 
 static u32 qpg_hwirq(u16 client, u16 signal)
@@ -495,7 +496,8 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 	altmode->dp = true;
 }
 
-static void qpg_parse_pmic(struct qcom_pmic_glink_altmode *altmode,
+static void qpg_parse_pmic(struct qpg *pg,
+			   struct qcom_pmic_glink_altmode *altmode,
 			   const void *data, size_t len)
 {
 	const struct qpg_pmic_hdr *hdr = data;
@@ -519,6 +521,8 @@ static void qpg_parse_pmic(struct qcom_pmic_glink_altmode *altmode,
 
 	switch (opcode) {
 	case USBC_CMD_WRITE_REQ:
+		pg->pan_acked = true;
+		log_warning("pmic-glink: PAN ACK received\n");
 		break;
 	case USBC_NOTIFY_IND:
 		qpg_parse_sc8280xp_notify(altmode, data, len);
@@ -562,7 +566,7 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
 	if (pg->remote_opened && cid == pg->rcid && liid == 1) {
-		qpg_parse_pmic(altmode, payload, chunk_size);
+		qpg_parse_pmic(pg, altmode, payload, chunk_size);
 		rx_done_cid = pg->lcid;
 	} else {
 		log_warning("pmic-glink: RX data on unknown cid=%u liid=%u len=%u\n",
@@ -875,6 +879,12 @@ static bool qpg_done_riid(struct qpg *pg,
 	return pg->riid_avail;
 }
 
+static bool qpg_done_pan_ack(struct qpg *pg,
+			     struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->pan_acked;
+}
+
 static bool qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
@@ -1100,8 +1110,15 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
+	pg.pan_acked = false;
 	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
 	log_warning("pmic-glink: send PAN_EN ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(&pg, altmode, qpg_done_pan_ack, 1000);
+	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+		    ret, pg.pan_acked);
 	if (ret)
 		return ret;
 
