@@ -36,26 +36,7 @@
 #define QPG_FIFO_FULL_RESERVE			8
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
-#define QPG_QRTR_MAX_SERVERS			32
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
-#define QPG_IPCRTR_CHANNEL_NAME			"IPCRTR"
-#define QPG_IPCRTR_DRAIN_MS			1000
-
-#define QRTR_NODE_BCAST			0xffffffff
-#define QRTR_PORT_CTRL				0xfffffffe
-#define QRTR_PORT_CTRL_LEGACY			0x0000ffff
-#define QRTR_LOCAL_NODE			1
-
-#define QRTR_VERSION_1				1
-#define QRTR_VERSION_2				3
-#define QRTR_TYPE_DATA				1
-#define QRTR_TYPE_HELLO				2
-#define QRTR_TYPE_BYE				3
-#define QRTR_TYPE_NEW_SERVER			4
-#define QRTR_TYPE_DEL_SERVER			5
-#define QRTR_TYPE_DEL_CLIENT			6
-#define QRTR_TYPE_RESUME_TX			7
-#define QRTR_TYPE_NEW_LOOKUP			10
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -132,53 +113,6 @@ struct qpg_intent_pair {
 	__le32 iid;
 } __packed;
 
-struct qpg_qrtr_hdr_v1 {
-	__le32 version;
-	__le32 type;
-	__le32 src_node_id;
-	__le32 src_port_id;
-	__le32 confirm_rx;
-	__le32 size;
-	__le32 dst_node_id;
-	__le32 dst_port_id;
-} __packed;
-
-struct qpg_qrtr_hdr_v2 {
-	u8 version;
-	u8 type;
-	u8 flags;
-	u8 optlen;
-	__le32 size;
-	__le16 src_node_id;
-	__le16 src_port_id;
-	__le16 dst_node_id;
-	__le16 dst_port_id;
-} __packed;
-
-struct qpg_qrtr_ctrl_pkt {
-	__le32 cmd;
-	union {
-		struct {
-			__le32 service;
-			__le32 instance;
-			__le32 node;
-			__le32 port;
-		} server;
-		struct {
-			__le32 node;
-			__le32 port;
-		} client;
-	} u;
-} __packed;
-
-struct qpg_qrtr_server {
-	u32 service;
-	u32 instance;
-	u32 node;
-	u32 port;
-	bool valid;
-};
-
 struct qpg {
 	struct udevice *smem;
 	void __iomem *ipcc;
@@ -197,28 +131,13 @@ struct qpg {
 	u16 rcid;
 	u32 riid;
 	u32 riid_size;
-	u32 ipcrtr_riid;
-	u32 ipcrtr_riid_size;
-	u32 ipcrtr_liid;
 	bool riid_avail;
-	bool ipcrtr_riid_avail;
 	bool version_acked;
+	bool local_open_sent;
 	bool open_acked;
 	bool remote_opened;
-	bool ipcrtr_opened;
-	bool ipcrtr_remote_open_seen;
-	bool ipcrtr_open_ack_pending;
-	bool ipcrtr_local_open_pending;
-	bool ipcrtr_remote_open_acked;
-	bool ipcrtr_local_open_sent;
-	bool ipcrtr_open_acked;
-	bool ipcrtr_seen_data;
-	bool pan_acked;
-	u16 ipcrtr_rcid;
-	u16 ipcrtr_lcid;
-	u16 next_lcid;
-	u32 next_liid;
-	struct qpg_qrtr_server servers[QPG_QRTR_MAX_SERVERS];
+	bool remote_open_ack_pending;
+	bool remote_open_acked;
 };
 
 static u32 qpg_hwirq(u16 client, u16 signal)
@@ -450,7 +369,6 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 }
 
 static int qpg_wait_riid(struct qpg *pg);
-static int qpg_wait_ipcrtr_riid(struct qpg *pg);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -487,53 +405,6 @@ static int qpg_send_data(struct qpg *pg, const void *data, size_t len)
 	pg->riid_avail = false;
 
 	return qpg_send_data_for(pg, pg->lcid, pg->riid, data, len);
-}
-
-static int qpg_send_ipcrtr_data(struct qpg *pg, const void *data, size_t len)
-{
-	int ret;
-
-	ret = qpg_wait_ipcrtr_riid(pg);
-	if (ret)
-		return ret;
-
-	pg->ipcrtr_riid_avail = false;
-
-	return qpg_send_data_for(pg, pg->ipcrtr_lcid, pg->ipcrtr_riid,
-				 data, len);
-}
-
-static int qpg_send_qrtr_ctrl(struct qpg *pg, u32 type, u32 service,
-			      u32 instance)
-{
-	struct {
-		struct qpg_qrtr_hdr_v1 hdr;
-		struct qpg_qrtr_ctrl_pkt ctrl;
-	} __packed pkt = {};
-	int ret;
-
-	pkt.hdr.version = cpu_to_le32(QRTR_VERSION_1);
-	pkt.hdr.type = cpu_to_le32(type);
-	pkt.hdr.src_node_id = cpu_to_le32(QRTR_LOCAL_NODE);
-	pkt.hdr.src_port_id = cpu_to_le32(QRTR_PORT_CTRL);
-	pkt.hdr.size = cpu_to_le32(sizeof(pkt.ctrl));
-	pkt.hdr.dst_node_id = cpu_to_le32(QRTR_NODE_BCAST);
-	pkt.hdr.dst_port_id = cpu_to_le32(QRTR_PORT_CTRL);
-	pkt.ctrl.cmd = cpu_to_le32(type);
-
-	if (type == QRTR_TYPE_NEW_LOOKUP) {
-		pkt.ctrl.u.server.service = cpu_to_le32(service);
-		pkt.ctrl.u.server.instance = cpu_to_le32(instance);
-	}
-
-	log_warning("pmic-glink: QRTR send ctrl begin type=%u service=%u instance=%u lcid=%u riid_avail=%d riid=%u\n",
-		    type, service, instance, pg->ipcrtr_lcid,
-		    pg->ipcrtr_riid_avail, pg->ipcrtr_riid);
-	ret = qpg_send_ipcrtr_data(pg, &pkt, sizeof(pkt));
-	log_warning("pmic-glink: QRTR send ctrl end type=%u ret=%d\n",
-		    type, ret);
-
-	return ret;
 }
 
 static void qpg_parse_sc8280xp_notify(struct qcom_pmic_glink_altmode *altmode,
@@ -624,9 +495,8 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 	altmode->dp = true;
 }
 
-static void __maybe_unused
-qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
-	       const void *data, size_t len)
+static void qpg_parse_pmic(struct qcom_pmic_glink_altmode *altmode,
+			   const void *data, size_t len)
 {
 	const struct qpg_pmic_hdr *hdr = data;
 	u32 owner, type, raw_opcode;
@@ -649,7 +519,6 @@ qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 
 	switch (opcode) {
 	case USBC_CMD_WRITE_REQ:
-		pg->pan_acked = true;
 		break;
 	case USBC_NOTIFY_IND:
 		qpg_parse_sc8280xp_notify(altmode, data, len);
@@ -658,177 +527,6 @@ qpg_parse_pmic(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 		qpg_parse_sc8180x_notify(altmode, data, len);
 		break;
 	}
-}
-
-static void qpg_qrtr_store_server(struct qpg *pg, u32 service, u32 instance,
-				  u32 node, u32 port, bool valid)
-{
-	struct qpg_qrtr_server *free = NULL;
-	int i;
-
-	for (i = 0; i < QPG_QRTR_MAX_SERVERS; i++) {
-		struct qpg_qrtr_server *srv = &pg->servers[i];
-
-		if (!srv->valid) {
-			if (!free)
-				free = srv;
-			continue;
-		}
-
-		if (srv->service == service && srv->instance == instance &&
-		    srv->node == node && srv->port == port) {
-			srv->valid = valid;
-			log_warning("pmic-glink: QRTR server %s service=%u instance=%u node=%u port=%u\n",
-				    valid ? "update" : "delete",
-				    service, instance, node, port);
-			return;
-		}
-	}
-
-	if (!valid)
-		return;
-
-	if (!free) {
-		log_warning("pmic-glink: QRTR server table full, dropping service=%u instance=%u node=%u port=%u\n",
-			    service, instance, node, port);
-		return;
-	}
-
-	free->service = service;
-	free->instance = instance;
-	free->node = node;
-	free->port = port;
-	free->valid = true;
-	log_warning("pmic-glink: QRTR server add service=%u instance=%u node=%u port=%u\n",
-		    service, instance, node, port);
-}
-
-static void qpg_qrtr_parse_ctrl(struct qpg *pg, u32 type, u32 src_node,
-				u32 src_port, const void *payload, size_t len)
-{
-	const struct qpg_qrtr_ctrl_pkt *ctrl = payload;
-	u32 cmd, service, instance, node, port;
-
-	if (len < sizeof(*ctrl)) {
-		log_warning("pmic-glink: QRTR ctrl short type=%u len=%zu need=%zu\n",
-			    type, len, sizeof(*ctrl));
-		return;
-	}
-
-	cmd = le32_to_cpu(ctrl->cmd);
-	log_warning("pmic-glink: QRTR ctrl type=%u cmd=%u from=%u:%u\n",
-		    type, cmd, src_node, src_port);
-
-	switch (type) {
-	case QRTR_TYPE_NEW_SERVER:
-	case QRTR_TYPE_DEL_SERVER:
-		service = le32_to_cpu(ctrl->u.server.service);
-		instance = le32_to_cpu(ctrl->u.server.instance);
-		node = le32_to_cpu(ctrl->u.server.node);
-		port = le32_to_cpu(ctrl->u.server.port);
-		log_warning("pmic-glink: QRTR server cmd=%u service=%u instance=%u node=%u port=%u\n",
-			    cmd, service, instance, node, port);
-		qpg_qrtr_store_server(pg, service, instance, node, port,
-				      type == QRTR_TYPE_NEW_SERVER);
-		break;
-	case QRTR_TYPE_DEL_CLIENT:
-	case QRTR_TYPE_RESUME_TX:
-		node = le32_to_cpu(ctrl->u.client.node);
-		port = le32_to_cpu(ctrl->u.client.port);
-		log_warning("pmic-glink: QRTR client cmd=%u node=%u port=%u\n",
-			    cmd, node, port);
-		break;
-	case QRTR_TYPE_HELLO:
-	case QRTR_TYPE_BYE:
-	case QRTR_TYPE_NEW_LOOKUP:
-		break;
-	default:
-		break;
-	}
-}
-
-static void qpg_log_ipcrtr(struct qpg *pg, const void *data, size_t len)
-{
-	const struct qpg_qrtr_hdr_v1 *v1 = data;
-	const struct qpg_qrtr_hdr_v2 *v2 = data;
-	const u8 *payload = data;
-	size_t hdr_len, payload_avail;
-	u32 version, type, size, src_node, src_port, dst_node, dst_port;
-
-	if (len < 4) {
-		log_warning("pmic-glink: IPCRTR short frame len=%zu\n", len);
-		return;
-	}
-
-	version = le32_to_cpu(*(__le32 *)data);
-	if (version == QRTR_VERSION_1) {
-		if (len < sizeof(*v1)) {
-			log_warning("pmic-glink: QRTRv1 short frame len=%zu need=%zu\n",
-				    len, sizeof(*v1));
-			return;
-		}
-
-		hdr_len = sizeof(*v1);
-		type = le32_to_cpu(v1->type);
-		size = le32_to_cpu(v1->size);
-		src_node = le32_to_cpu(v1->src_node_id);
-		src_port = le32_to_cpu(v1->src_port_id);
-		dst_node = le32_to_cpu(v1->dst_node_id);
-		dst_port = le32_to_cpu(v1->dst_port_id);
-		log_warning("pmic-glink: QRTRv1 type=%u size=%u src=%u:%u dst=%u:%u confirm=%u frame_len=%zu\n",
-			    type, size, src_node, src_port, dst_node, dst_port,
-			    le32_to_cpu(v1->confirm_rx), len);
-	} else if (*(const u8 *)data == QRTR_VERSION_2) {
-		if (len < sizeof(*v2)) {
-			log_warning("pmic-glink: QRTRv2 short frame len=%zu need=%zu\n",
-				    len, sizeof(*v2));
-			return;
-		}
-
-		hdr_len = sizeof(*v2) + v2->optlen;
-		type = v2->type;
-		size = le32_to_cpu(v2->size);
-		src_node = le16_to_cpu(v2->src_node_id);
-		src_port = le16_to_cpu(v2->src_port_id);
-		dst_node = le16_to_cpu(v2->dst_node_id);
-		dst_port = le16_to_cpu(v2->dst_port_id);
-		log_warning("pmic-glink: QRTRv2 type=%u flags=%02x optlen=%u size=%u src=%u:%u dst=%u:%u frame_len=%zu\n",
-			    type, v2->flags, v2->optlen, size,
-			    src_node, src_port, dst_node, dst_port, len);
-	} else {
-		const __le32 *words = data;
-		u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
-
-		if (len >= 4)
-			w0 = le32_to_cpu(words[0]);
-		if (len >= 8)
-			w1 = le32_to_cpu(words[1]);
-		if (len >= 12)
-			w2 = le32_to_cpu(words[2]);
-		if (len >= 16)
-			w3 = le32_to_cpu(words[3]);
-
-		log_warning("pmic-glink: IPCRTR unknown frame len=%zu w0=%08x w1=%08x w2=%08x w3=%08x\n",
-			    len, w0, w1, w2, w3);
-		return;
-	}
-
-	if (hdr_len > len) {
-		log_warning("pmic-glink: QRTR bad header hdr_len=%zu len=%zu\n",
-			    hdr_len, len);
-		return;
-	}
-
-	payload_avail = len - hdr_len;
-	if (size > payload_avail) {
-		log_warning("pmic-glink: QRTR bad size=%u payload_avail=%zu type=%u\n",
-			    size, payload_avail, type);
-		return;
-	}
-
-	if (type != QRTR_TYPE_DATA)
-		qpg_qrtr_parse_ctrl(pg, type, src_node, src_port,
-				    payload + hdr_len, size);
 }
 
 static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
@@ -863,14 +561,8 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_peek(pg, payload, sizeof(hdr), chunk_size);
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
-	if (pg->ipcrtr_opened && cid == pg->ipcrtr_rcid &&
-	    liid == pg->ipcrtr_liid) {
-		pg->ipcrtr_seen_data = true;
-		qpg_log_ipcrtr(pg, payload, chunk_size);
-		rx_done_cid = pg->ipcrtr_lcid;
-	} else if (pg->remote_opened && cid == pg->rcid && liid == 1) {
-		log_warning("pmic-glink: raw PMIC frame ignored len=%u\n",
-			    chunk_size);
+	if (pg->remote_opened && cid == pg->rcid && liid == 1) {
+		qpg_parse_pmic(altmode, payload, chunk_size);
 		rx_done_cid = pg->lcid;
 	} else {
 		log_warning("pmic-glink: RX data on unknown cid=%u liid=%u len=%u\n",
@@ -895,13 +587,6 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 		pg->riid_avail = pg->riid_size > 0;
 		log_warning("pmic-glink: RIID channel=raw rcid=%u riid=%u size=%u avail=%d\n",
 			    cid, pg->riid, pg->riid_size, pg->riid_avail);
-	} else if (pg->ipcrtr_opened && cid == pg->ipcrtr_rcid) {
-		pg->ipcrtr_riid_size = le32_to_cpu(intent->size);
-		pg->ipcrtr_riid = le32_to_cpu(intent->iid);
-		pg->ipcrtr_riid_avail = pg->ipcrtr_riid_size > 0;
-		log_warning("pmic-glink: RIID channel=IPCRTR rcid=%u riid=%u size=%u avail=%d\n",
-			    cid, pg->ipcrtr_riid, pg->ipcrtr_riid_size,
-			    pg->ipcrtr_riid_avail);
 	} else {
 		log_warning("pmic-glink: RIID unknown cid=%u size=%u iid=%u count=%u\n",
 			    cid, le32_to_cpu(intent->size),
@@ -921,20 +606,9 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 	if (!strcmp(name, QPG_CHANNEL_NAME)) {
 		pg->rcid = rcid;
 		pg->remote_opened = true;
-	} else if (!strcmp(name, QPG_IPCRTR_CHANNEL_NAME)) {
-		pg->ipcrtr_rcid = rcid;
-		if (!pg->ipcrtr_lcid)
-			pg->ipcrtr_lcid = pg->next_lcid++;
-		if (!pg->ipcrtr_liid)
-			pg->ipcrtr_liid = pg->next_liid++;
-		pg->ipcrtr_opened = true;
-		pg->ipcrtr_remote_open_seen = true;
-		pg->ipcrtr_open_ack_pending = !pg->ipcrtr_remote_open_acked;
-		pg->ipcrtr_local_open_pending = !pg->ipcrtr_local_open_sent;
-		log_warning("pmic-glink: IPCRTR remote OPEN recorded rcid=%u allocated lcid=%u liid=%u ack_pending=%d open_pending=%d\n",
-			    pg->ipcrtr_rcid, pg->ipcrtr_lcid,
-			    pg->ipcrtr_liid, pg->ipcrtr_open_ack_pending,
-			    pg->ipcrtr_local_open_pending);
+		pg->remote_open_ack_pending = !pg->remote_open_acked;
+		log_warning("pmic-glink: PMIC remote OPEN recorded rcid=%u lcid=%u\n",
+			    pg->rcid, pg->lcid);
 	}
 
 	return 0;
@@ -1073,10 +747,6 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 			pg->open_acked = true;
 			log_warning("pmic-glink: raw OPEN_ACK complete lcid=%u\n",
 				    pg->lcid);
-		} else if (pg->ipcrtr_opened && param1 == pg->ipcrtr_lcid) {
-			pg->ipcrtr_open_acked = true;
-			log_warning("pmic-glink: IPCRTR local OPEN_ACK lcid=%u rcid=%u\n",
-				    pg->ipcrtr_lcid, pg->ipcrtr_rcid);
 		}
 		break;
 	case GLINK_CMD_INTENT:
@@ -1103,10 +773,6 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		if (pg->remote_opened && param1 == pg->rcid &&
 		    param2 == pg->riid)
 			pg->riid_avail = cmd == GLINK_CMD_RX_DONE_W_REUSE;
-		else if (pg->ipcrtr_opened && param1 == pg->ipcrtr_rcid &&
-			 param2 == pg->ipcrtr_riid)
-			pg->ipcrtr_riid_avail =
-				cmd == GLINK_CMD_RX_DONE_W_REUSE;
 		break;
 	case GLINK_CMD_READ_NOTIF:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
@@ -1126,40 +792,36 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	return ret;
 }
 
-static int qpg_service_ipcrtr_open(struct qpg *pg)
+static int qpg_service_pmic_open(struct qpg *pg)
 {
 	int ret;
 
-	if (!pg->ipcrtr_remote_open_seen)
+	if (!pg->remote_opened)
 		return 0;
 
-	if (pg->ipcrtr_open_ack_pending) {
-		log_warning("pmic-glink: service IPCRTR OPEN_ACK begin rcid=%u\n",
-			    pg->ipcrtr_rcid);
-		ret = qpg_send_open_ack(pg, pg->ipcrtr_rcid,
-					QPG_IPCRTR_CHANNEL_NAME);
-		log_warning("pmic-glink: service IPCRTR OPEN_ACK end ret=%d\n",
+	if (pg->remote_open_ack_pending) {
+		log_warning("pmic-glink: service PMIC OPEN_ACK begin rcid=%u\n",
+			    pg->rcid);
+		ret = qpg_send_open_ack(pg, pg->rcid, QPG_CHANNEL_NAME);
+		log_warning("pmic-glink: service PMIC OPEN_ACK end ret=%d\n",
 			    ret);
 		if (ret)
 			return ret;
 
-		pg->ipcrtr_open_ack_pending = false;
-		pg->ipcrtr_remote_open_acked = true;
+		pg->remote_open_ack_pending = false;
+		pg->remote_open_acked = true;
 	}
 
-	if (pg->ipcrtr_local_open_pending && !pg->ipcrtr_local_open_sent) {
-		log_warning("pmic-glink: service IPCRTR local OPEN begin lcid=%u\n",
-			    pg->ipcrtr_lcid);
-		pg->ipcrtr_open_acked = false;
-		ret = qpg_send_open_for(pg, pg->ipcrtr_lcid,
-					QPG_IPCRTR_CHANNEL_NAME);
-		log_warning("pmic-glink: service IPCRTR local OPEN end ret=%d\n",
+	if (!pg->local_open_sent) {
+		log_warning("pmic-glink: service PMIC local OPEN begin lcid=%u\n",
+			    pg->lcid);
+		ret = qpg_send_open(pg);
+		log_warning("pmic-glink: service PMIC local OPEN end ret=%d\n",
 			    ret);
 		if (ret)
 			return ret;
 
-		pg->ipcrtr_local_open_pending = false;
-		pg->ipcrtr_local_open_sent = true;
+		pg->local_open_sent = true;
 	}
 
 	return 0;
@@ -1175,7 +837,7 @@ static int qpg_drain_until(struct qpg *pg, struct qcom_pmic_glink_altmode *altmo
 
 	for (i = 0; i < timeout_ms; i++) {
 		while (qpg_poll(pg, altmode) == 0) {
-			ret = qpg_service_ipcrtr_open(pg);
+			ret = qpg_service_pmic_open(pg);
 			if (ret)
 				return ret;
 
@@ -1201,22 +863,10 @@ static bool qpg_done_version(struct qpg *pg,
 static bool qpg_done_open(struct qpg *pg,
 			  struct qcom_pmic_glink_altmode *altmode)
 {
-	return pg->open_acked;
-}
-
-static bool qpg_done_ipcrtr_open(struct qpg *pg,
-				 struct qcom_pmic_glink_altmode *altmode)
-{
-	return pg->ipcrtr_remote_open_seen &&
-	       pg->ipcrtr_remote_open_acked &&
-	       pg->ipcrtr_local_open_sent &&
-	       pg->ipcrtr_open_acked;
-}
-
-static bool qpg_done_ipcrtr_data(struct qpg *pg,
-				 struct qcom_pmic_glink_altmode *altmode)
-{
-	return pg->ipcrtr_seen_data;
+	return pg->local_open_sent &&
+	       pg->open_acked &&
+	       pg->remote_opened &&
+	       pg->remote_open_acked;
 }
 
 static bool qpg_done_riid(struct qpg *pg,
@@ -1225,20 +875,7 @@ static bool qpg_done_riid(struct qpg *pg,
 	return pg->riid_avail;
 }
 
-static bool qpg_done_ipcrtr_riid(struct qpg *pg,
-				 struct qcom_pmic_glink_altmode *altmode)
-{
-	return pg->ipcrtr_riid_avail;
-}
-
-static bool __maybe_unused
-qpg_done_pan_ack(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
-{
-	return pg->pan_acked;
-}
-
-static bool __maybe_unused
-qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
+static bool qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
 	 * Accept DP Alt Mode entry regardless of HPD state.
@@ -1265,25 +902,7 @@ static int qpg_wait_riid(struct qpg *pg)
 	return ret;
 }
 
-static int qpg_wait_ipcrtr_riid(struct qpg *pg)
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	int ret;
-
-	log_warning("pmic-glink: wait IPCRTR RIID begin avail=%d riid=%u size=%u lcid=%u\n",
-		    pg->ipcrtr_riid_avail, pg->ipcrtr_riid,
-		    pg->ipcrtr_riid_size, pg->ipcrtr_lcid);
-
-	ret = qpg_drain_until(pg, &altmode, qpg_done_ipcrtr_riid, 500);
-
-	log_warning("pmic-glink: wait IPCRTR RIID end ret=%d avail=%d riid=%u size=%u\n",
-		    ret, pg->ipcrtr_riid_avail, pg->ipcrtr_riid,
-		    pg->ipcrtr_riid_size);
-
-	return ret;
-}
-
-static int __maybe_unused qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
+static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 {
 	struct qpg_usbc_write_req req = {
 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USBC_PAN),
@@ -1292,8 +911,6 @@ static int __maybe_unused qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 		.cmd = cpu_to_le32(cmd),
 		.arg = cpu_to_le32(arg),
 	};
-
-	pg->pan_acked = false;
 
 	log_warning("pmic-glink: owner=%u channel=%s altmode_cmd=%u arg=%u\n",
 		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME, cmd, arg);
@@ -1429,8 +1046,6 @@ static int qpg_init(struct qpg *pg)
 	*pg->rx_tail = 0;
 	*pg->tx_head = 0;
 	pg->lcid = 1;
-	pg->next_lcid = pg->lcid + 1;
-	pg->next_liid = 1;
 	log_warning("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
 		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
 		    le32_to_cpu(*pg->rx_tail), le32_to_cpu(*pg->rx_head));
@@ -1470,62 +1085,30 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	log_warning("pmic-glink: send OPEN ret=%d lcid=%u\n", ret, pg.lcid);
 	if (ret)
 		return ret;
+	pg.local_open_sent = true;
 
 	ret = qpg_drain_until(&pg, altmode, qpg_done_open, 1000);
-	log_warning("pmic-glink: wait OPEN ret=%d open_acked=%d remote_opened=%d rcid=%u\n",
-		    ret, pg.open_acked, pg.remote_opened, pg.rcid);
+	log_warning("pmic-glink: wait OPEN ret=%d local_sent=%d open_acked=%d remote_opened=%d remote_acked=%d rcid=%u\n",
+		    ret, pg.local_open_sent, pg.open_acked, pg.remote_opened,
+		    pg.remote_open_acked, pg.rcid);
 	if (ret)
 		return ret;
 
-	if (!pg.remote_opened) {
-		log_warning("pmic-glink: direct channel %s not advertised; ipcrtr_opened=%d ipcrtr_rcid=%u ipcrtr_lcid=%u ipcrtr_ack=%d\n",
-			    QPG_CHANNEL_NAME, pg.ipcrtr_opened, pg.ipcrtr_rcid,
-			    pg.ipcrtr_lcid, pg.ipcrtr_open_acked);
+	ret = qpg_send_rx_intent_for(&pg, pg.lcid, 1);
+	log_warning("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
+		    ret, pg.lcid, 1);
+	if (ret)
+		return ret;
 
-		if (!pg.ipcrtr_opened) {
-			ret = qpg_drain_until(&pg, altmode, qpg_done_ipcrtr_open,
-					      1000);
-			log_warning("pmic-glink: wait IPCRTR OPEN ret=%d opened=%d ack=%d lcid=%u rcid=%u\n",
-				    ret, pg.ipcrtr_opened, pg.ipcrtr_open_acked,
-				    pg.ipcrtr_lcid, pg.ipcrtr_rcid);
-			if (ret)
-				return -ENODEV;
-		}
+	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
+	log_warning("pmic-glink: send PAN_EN ret=%d\n", ret);
+	if (ret)
+		return ret;
 
-		if (!pg.ipcrtr_open_acked) {
-			ret = qpg_drain_until(&pg, altmode, qpg_done_ipcrtr_open,
-					      1000);
-			log_warning("pmic-glink: wait IPCRTR OPEN_ACK ret=%d opened=%d ack=%d lcid=%u rcid=%u\n",
-				    ret, pg.ipcrtr_opened, pg.ipcrtr_open_acked,
-				    pg.ipcrtr_lcid, pg.ipcrtr_rcid);
-			if (ret)
-				return -ENODEV;
-		}
+	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode, 1000);
+	log_warning("pmic-glink: wait altmode ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
+		    ret, altmode->dp, altmode->orientation, altmode->pin_assignment,
+		    altmode->hpd, altmode->hpd_irq);
 
-		ret = qpg_send_rx_intent_for(&pg, pg.ipcrtr_lcid, pg.ipcrtr_liid);
-		log_warning("pmic-glink: send IPCRTR RX_INTENT ret=%d lcid=%u liid=%u\n",
-			    ret, pg.ipcrtr_lcid, pg.ipcrtr_liid);
-		if (ret)
-			return -ENODEV;
-
-		ret = qpg_send_qrtr_ctrl(&pg, QRTR_TYPE_HELLO, 0, 0);
-		if (ret)
-			return -ENODEV;
-
-		ret = qpg_send_qrtr_ctrl(&pg, QRTR_TYPE_NEW_LOOKUP, 0, 0);
-		if (ret)
-			return -ENODEV;
-
-		pg.ipcrtr_seen_data = false;
-		ret = qpg_drain_until(&pg, altmode, qpg_done_ipcrtr_data,
-				      QPG_IPCRTR_DRAIN_MS);
-		log_warning("pmic-glink: wait IPCRTR/QRTR data ret=%d seen=%d\n",
-			    ret, pg.ipcrtr_seen_data);
-
-		log_warning("pmic-glink: QRTR/IPCRTR discovery complete enough for service logging; PMIC altmode send remains disabled\n");
-		return -ENODEV;
-	}
-
-	log_warning("pmic-glink: direct PMIC_RTR_ADSP_APPS channel is advertised; raw path still disabled in this debug build\n");
-	return -ENODEV;
+	return ret;
 }
