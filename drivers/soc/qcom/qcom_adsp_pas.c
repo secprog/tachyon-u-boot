@@ -35,7 +35,8 @@
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_MODEM_PARTITION			"modem_a"
-#define QCOM_ADSP_DIAG_SKIP_AUTH_RESET		1
+#define QCOM_ADSP_DIAG_SKIP_AUTH_RESET		0
+#define QCOM_ADSP_DIAG_START_THEN_SHUTDOWN	1
 
 #define QCOM_MDT_TYPE_MASK			(7 << 24)
 #define QCOM_MDT_TYPE_HASH			(2 << 24)
@@ -47,6 +48,7 @@
 #define QCOM_SCM_PIL_PAS_INIT_IMAGE		0x01
 #define QCOM_SCM_PIL_PAS_MEM_SETUP		0x02
 #define QCOM_SCM_PIL_PAS_AUTH_AND_RESET		0x05
+#define QCOM_SCM_PIL_PAS_SHUTDOWN		0x06
 #define QCOM_SCM_V2_EBUSY			-12
 #define QCOM_SCM_ENOMEM			-5
 #define QCOM_SCM_EOPNOTSUPP			-4
@@ -255,6 +257,27 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	ret = qcom_scm_call(&desc, &res);
 	if (ret || res.result[0])
 		log_warning("qcom-adsp-pas: auth_and_reset ret=%d scm_result=%llu\n",
+			    ret, res.result[0]);
+
+	return ret ? ret : (int)res.result[0];
+}
+
+static int qcom_scm_pas_shutdown(u32 pas_id)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_PIL,
+		.cmd = QCOM_SCM_PIL_PAS_SHUTDOWN,
+		.arginfo = QCOM_SCM_ARGS(1),
+		.args[0] = pas_id,
+	};
+	struct qcom_scm_res res;
+	int ret;
+
+	log_warning("qcom-adsp-pas: shutdown pas_id=%u\n", pas_id);
+
+	ret = qcom_scm_call(&desc, &res);
+	if (ret || res.result[0])
+		log_warning("qcom-adsp-pas: shutdown ret=%d scm_result=%llu\n",
 			    ret, res.result[0]);
 
 	return ret ? ret : (int)res.result[0];
@@ -813,6 +836,15 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	if (ret)
 		goto out_free_metadata;
+
+#if QCOM_ADSP_DIAG_START_THEN_SHUTDOWN
+	log_warning("qcom-adsp-pas: diag auth_and_reset returned, delaying before shutdown\n");
+	mdelay(10);
+	ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+	log_warning("qcom-adsp-pas: diag shutdown ret=%d\n", ret);
+	ret = -ENODEV;
+	goto out_free_metadata;
+#endif
 
 	qpas_booted = true;
 	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
