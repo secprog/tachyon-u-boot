@@ -35,8 +35,6 @@
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_MODEM_PARTITION			"modem_a"
-#define QCOM_ADSP_DIAG_SKIP_AUTH_RESET		0
-#define QCOM_ADSP_DIAG_START_THEN_SHUTDOWN	1
 
 #define QCOM_MDT_TYPE_MASK			(7 << 24)
 #define QCOM_MDT_TYPE_HASH			(2 << 24)
@@ -826,25 +824,15 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-#if QCOM_ADSP_DIAG_SKIP_AUTH_RESET
-	log_warning("qcom-adsp-pas: diag skipping auth_and_reset reloc_base=%llx\n",
-		    (unsigned long long)reloc_base);
-	ret = -ENODEV;
-	goto out_free_metadata;
-#endif
-
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	if (ret)
 		goto out_free_metadata;
 
-#if QCOM_ADSP_DIAG_START_THEN_SHUTDOWN
 	log_warning("qcom-adsp-pas: diag auth_and_reset returned, delaying before shutdown\n");
 	mdelay(10);
-	ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-	log_warning("qcom-adsp-pas: diag shutdown ret=%d\n", ret);
-	ret = -ENODEV;
+	qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+	log_warning("qcom-adsp-pas: diag shutdown\n");
 	goto out_free_metadata;
-#endif
 
 	qpas_booted = true;
 	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",

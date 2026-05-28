@@ -37,14 +37,6 @@
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
-/*
- * Debug isolation:
- * 0 - full PMIC-GLINK path
- * 1 - no ADSP boot, no SMEM/IPCC/FIFO/GLINK
- * 2 - ADSP boot only, return before SMEM/IPCC/FIFO/GLINK
- * 3 - ADSP + SMEM/IPCC/FIFO discovery, no FIFO pointer reset, no GLINK TX
- */
-#define QPG_DIAG_STAGE				2
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -1061,12 +1053,8 @@ static int qpg_init(struct qpg *pg)
 		return -ENOENT;
 	}
 
-#if QPG_DIAG_STAGE != 3
 	*pg->rx_tail = 0;
 	*pg->tx_head = 0;
-#else
-	log_warning("pmic-glink: diag stage 3 leaving FIFO pointers unchanged\n");
-#endif
 	pg->lcid = 1;
 	log_warning("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
 		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
@@ -1078,7 +1066,6 @@ static int qpg_init(struct qpg *pg)
 int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 {
 	struct qpg pg = {};
-	static bool diag_done;
 	int ret;
 
 	if (!altmode)
@@ -1087,46 +1074,6 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	memset(altmode, 0, sizeof(*altmode));
 
 	log_warning("pmic-glink: get_altmode start\n");
-
-#if QPG_DIAG_STAGE == 1
-	if (diag_done) {
-		log_warning("pmic-glink: diag stage 1 already ran; still skipping ADSP/SMEM/GLINK\n");
-		return -ENODEV;
-	}
-	diag_done = true;
-
-	log_warning("pmic-glink: diag stage 1 returning before ADSP/SMEM/IPCC/FIFO/GLINK\n");
-	return -ENODEV;
-#elif QPG_DIAG_STAGE == 2
-	if (diag_done) {
-		log_warning("pmic-glink: diag stage 2 already ran; skipping ADSP/SMEM/GLINK\n");
-		return -ENODEV;
-	}
-	diag_done = true;
-
-	ret = qcom_adsp_pas_boot();
-	log_warning("pmic-glink: diag stage 2 ADSP boot ret=%d\n", ret);
-	if (ret)
-		return ret;
-	mdelay(100);
-
-	log_warning("pmic-glink: diag stage 2 returning before SMEM/IPCC/FIFO/GLINK\n");
-	return -ENODEV;
-#elif QPG_DIAG_STAGE == 3
-	if (diag_done) {
-		log_warning("pmic-glink: diag stage 3 already ran; skipping SMEM/GLINK\n");
-		return -ENODEV;
-	}
-	diag_done = true;
-
-	ret = qpg_init(&pg);
-	log_warning("pmic-glink: diag stage 3 qpg_init ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	log_warning("pmic-glink: diag stage 3 returning before VERSION/OPEN/GLINK TX\n");
-	return -ENODEV;
-#endif
 
 	ret = qpg_init(&pg);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
