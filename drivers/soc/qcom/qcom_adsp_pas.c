@@ -22,13 +22,16 @@
 #include <memalign.h>
 #include <part.h>
 #include <power-domain.h>
+#include <smem.h>
 #include <string.h>
 #include <scsi.h>
+#include <time.h>
 #include <ufs.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/sizes.h>
@@ -37,8 +40,12 @@
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_MODEM_PARTITION			"modem_a"
-#define QCOM_ADSP_START_WAIT_MS			5000
+#define QCOM_ADSP_START_TIMEOUT_MS		5000
 #define QPAS_MAX_POWER_DOMAINS			4
+#define QPAS_SMP2P_MAX_ENTRY			16
+#define QPAS_SMP2P_MAX_ENTRY_NAME		16
+#define QPAS_SMP2P_MAGIC			0x504d5324
+#define QPAS_SMP2P_VERSION			1
 
 #define QCOM_MDT_TYPE_MASK			(7 << 24)
 #define QCOM_MDT_TYPE_HASH			(2 << 24)
@@ -99,6 +106,32 @@ struct qpas_power_domains {
 	struct power_domain pd[QPAS_MAX_POWER_DOMAINS];
 	int count;
 	int enabled;
+};
+
+struct qpas_smp2p_info {
+	ofnode node;
+	ofnode inbound;
+	u32 remote_pid;
+	u32 inbound_item;
+	u32 fatal_bit;
+	u32 ready_bit;
+	char entry_name[QPAS_SMP2P_MAX_ENTRY_NAME];
+};
+
+struct qpas_smp2p_smem_item {
+	__le32 magic;
+	u8 version;
+	u8 features[3];
+	__le16 local_pid;
+	__le16 remote_pid;
+	__le16 total_entries;
+	__le16 valid_entries;
+	__le32 flags;
+
+	struct {
+		u8 name[QPAS_SMP2P_MAX_ENTRY_NAME];
+		__le32 value;
+	} entries[QPAS_SMP2P_MAX_ENTRY];
 };
 
 static bool qpas_booted;
@@ -194,17 +227,242 @@ static void qpas_disable_power_domains(struct qpas_power_domains *pds)
 	}
 }
 
-static int qpas_wait_for_start(ofnode node)
+static int qpas_get_remote_pid(ofnode node, u32 *remote_pid)
 {
-	(void)node;
+	ofnode child;
+	int ret;
 
-	log_warning("qcom-adsp-pas: waiting ADSP start gate timeout=%d ms\n",
-		    QCOM_ADSP_START_WAIT_MS);
-	log_warning("qcom-adsp-pas: SMP2P ready/fatal polling unavailable in this U-Boot path; delaying before GLINK\n");
-	mdelay(QCOM_ADSP_START_WAIT_MS);
-	log_warning("qcom-adsp-pas: ADSP start gate complete\n");
+	ofnode_for_each_subnode(child, node) {
+		ret = ofnode_read_u32(child, "qcom,remote-pid", remote_pid);
+		if (!ret)
+			return 0;
+	}
+
+	return -ENOENT;
+}
+
+static int qpas_find_smp2p_irq_bits(ofnode node, struct qpas_smp2p_info *info)
+{
+	struct ofnode_phandle_args args;
+	const char *name;
+	int count;
+	int ret;
+	int i;
+
+	count = ofnode_read_string_count(node, "interrupt-names");
+	if (count < 0)
+		return count;
+
+	info->fatal_bit = U32_MAX;
+	info->ready_bit = U32_MAX;
+
+	for (i = 0; i < count; i++) {
+		ret = ofnode_read_string_index(node, "interrupt-names", i,
+					       &name);
+		if (ret)
+			return ret;
+
+		if (strcmp(name, "fatal") && strcmp(name, "ready"))
+			continue;
+
+		ret = ofnode_parse_phandle_with_args(node,
+						     "interrupts-extended",
+						     "#interrupt-cells", 0,
+						     i, &args);
+		if (ret)
+			return ret;
+
+		if (!ofnode_equal(args.node, info->inbound))
+			continue;
+
+		if (args.args_count < 1 || args.args[0] >= 32)
+			return -EINVAL;
+
+		if (!strcmp(name, "fatal"))
+			info->fatal_bit = args.args[0];
+		else
+			info->ready_bit = args.args[0];
+	}
+
+	if (info->fatal_bit == U32_MAX || info->ready_bit == U32_MAX)
+		return -ENOENT;
 
 	return 0;
+}
+
+static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
+{
+	const char *entry_name;
+	ofnode child;
+	ofnode smp2p;
+	u32 smem[2];
+	u32 remote_pid;
+	int ret;
+
+	ret = qpas_get_remote_pid(node, &remote_pid);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P remote-pid lookup ret=%d\n",
+			    ret);
+		return ret;
+	}
+
+	ofnode_for_each_compatible_node(smp2p, "qcom,smp2p") {
+		ret = ofnode_read_u32(smp2p, "qcom,remote-pid",
+				      &info->remote_pid);
+		if (ret || info->remote_pid != remote_pid)
+			continue;
+
+		ret = ofnode_read_u32_array(smp2p, "qcom,smem", smem,
+					    ARRAY_SIZE(smem));
+		if (ret)
+			return ret;
+
+		ofnode_for_each_subnode(child, smp2p) {
+			if (!ofnode_read_bool(child, "interrupt-controller"))
+				continue;
+
+			entry_name = ofnode_read_string(child,
+							"qcom,entry-name");
+			if (!entry_name)
+				continue;
+
+			info->node = smp2p;
+			info->inbound = child;
+			info->inbound_item = smem[1];
+			strncpy(info->entry_name, entry_name,
+				sizeof(info->entry_name));
+			info->entry_name[sizeof(info->entry_name) - 1] = '\0';
+
+			ret = qpas_find_smp2p_irq_bits(node, info);
+			if (ret)
+				return ret;
+
+			log_warning("qcom-adsp-pas: SMP2P remote_pid=%u inbound_item=%u entry='%s' fatal_bit=%u ready_bit=%u\n",
+				    info->remote_pid, info->inbound_item,
+				    info->entry_name, info->fatal_bit,
+				    info->ready_bit);
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static bool qpas_smp2p_entry_name_eq(const u8 name[QPAS_SMP2P_MAX_ENTRY_NAME],
+				     const char *want)
+{
+	char buf[QPAS_SMP2P_MAX_ENTRY_NAME + 1];
+
+	memcpy(buf, name, QPAS_SMP2P_MAX_ENTRY_NAME);
+	buf[QPAS_SMP2P_MAX_ENTRY_NAME] = '\0';
+
+	return !strncmp(buf, want, QPAS_SMP2P_MAX_ENTRY_NAME);
+}
+
+static int qpas_smp2p_read_entry(struct udevice *smem,
+				 const struct qpas_smp2p_info *info,
+				 u32 *value)
+{
+	struct qpas_smp2p_smem_item *item;
+	size_t size = 0;
+	u16 total;
+	u16 valid;
+	u32 magic;
+	int i;
+
+	item = smem_get(smem, info->remote_pid, info->inbound_item, &size);
+	if (IS_ERR_OR_NULL(item))
+		return -EAGAIN;
+
+	if (size < sizeof(*item))
+		return -EINVAL;
+
+	magic = le32_to_cpu(item->magic);
+	if (magic != QPAS_SMP2P_MAGIC || item->version != QPAS_SMP2P_VERSION)
+		return -EAGAIN;
+
+	total = le16_to_cpu(item->total_entries);
+	valid = le16_to_cpu(item->valid_entries);
+	if (total > QPAS_SMP2P_MAX_ENTRY || valid > total)
+		return -EINVAL;
+
+	for (i = 0; i < valid; i++) {
+		if (!qpas_smp2p_entry_name_eq(item->entries[i].name,
+					      info->entry_name))
+			continue;
+
+		*value = le32_to_cpu(item->entries[i].value);
+		return 0;
+	}
+
+	return -EAGAIN;
+}
+
+static int qpas_wait_for_start(ofnode node)
+{
+	struct qpas_smp2p_info info = {};
+	struct udevice *smem;
+	ulong start;
+	u32 last_value = U32_MAX;
+	u32 value;
+	bool pending_logged = false;
+	int ret;
+
+	ret = qpas_find_smp2p(node, &info);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P discovery ret=%d\n", ret);
+		return ret;
+	}
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &smem);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P smem lookup ret=%d\n", ret);
+		return ret;
+	}
+
+	log_warning("qcom-adsp-pas: waiting ADSP SMP2P ready timeout=%d ms\n",
+		    QCOM_ADSP_START_TIMEOUT_MS);
+
+	start = get_timer(0);
+	do {
+		ret = qpas_smp2p_read_entry(smem, &info, &value);
+		if (ret == -EAGAIN) {
+			if (!pending_logged) {
+				log_warning("qcom-adsp-pas: waiting for SMP2P entry '%s'\n",
+					    info.entry_name);
+				pending_logged = true;
+			}
+			mdelay(10);
+			continue;
+		}
+		if (ret) {
+			log_warning("qcom-adsp-pas: SMP2P read ret=%d\n", ret);
+			return ret;
+		}
+
+		if (value != last_value) {
+			log_warning("qcom-adsp-pas: SMP2P entry '%s' value=%08x\n",
+				    info.entry_name, value);
+			last_value = value;
+		}
+
+		if (value & BIT(info.fatal_bit)) {
+			log_warning("qcom-adsp-pas: ADSP fatal asserted value=%08x bit=%u\n",
+				    value, info.fatal_bit);
+			return -EIO;
+		}
+
+		if (value & BIT(info.ready_bit)) {
+			log_warning("qcom-adsp-pas: ADSP ready asserted value=%08x bit=%u\n",
+				    value, info.ready_bit);
+			return 0;
+		}
+
+		mdelay(10);
+	} while (get_timer(start) < QCOM_ADSP_START_TIMEOUT_MS);
+
+	log_warning("qcom-adsp-pas: ADSP SMP2P ready timeout\n");
+	return -ETIMEDOUT;
 }
 
 static int qcom_scm_remap_error(long err)

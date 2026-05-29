@@ -950,7 +950,6 @@ static int qpg_init(struct qpg *pg)
 	log_warning("pmic-glink: ADSP PAS boot ret=%d\n", ret);
 	if (ret)
 		return ret;
-	mdelay(100);
 
 	adsp = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-adsp-pas");
 	if (ofnode_valid(adsp))
