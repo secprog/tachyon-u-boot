@@ -670,7 +670,7 @@ static void qpas_aoss_qmp_power_up(void)
 	log_warning("qcom-adsp-pas: AOSS QMP_QPIC_REQ after=%08x elapsed=%lu ms\n",
 		    val, get_timer(start));
 
-	unmap_sysmem(qmp);
+	unmap_sysmem((void *)qmp);
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id)
