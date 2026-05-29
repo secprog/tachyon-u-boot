@@ -78,7 +78,7 @@ DECLARE_GLOBAL_DATA_PTR;
  * but rather power domains / memory-region mapping / earlier steps.
  * Set back to 0 for normal operation.
  */
-#define QCOM_ADSP_SKIP_BOOT			1
+#define QCOM_ADSP_SKIP_BOOT			0
 
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
@@ -1244,9 +1244,23 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-	/* Short delay to let ADSP firmware initialize before polling */
-	log_warning("qcom-adsp-pas: delay 500ms before SMP2P poll...\n");
-	mdelay(500);
+	/* Fixed delay with heartbeats — NO SMP2P polling.
+	 * Use this to determine if the board survives without touching
+	 * the ADSP SMEM region, and exactly when it powers off.
+	 */
+	log_warning("qcom-adsp-pas: heartbeat-only delay (no SMP2P poll)...\n");
+	{
+		ulong hb_start = get_timer(0);
+		int i;
+		for (i = 0; i < 50; i++) {
+			mdelay(100);
+			log_warning("qcom-adsp-pas: heartbeat %d elapsed=%lu ms\n",
+				    i, get_timer(hb_start));
+		}
+	}
+	log_warning("qcom-adsp-pas: heartbeat delay complete (5s elapsed)\n");
+
+	/* Now do the real SMP2P poll */
 	log_warning("qcom-adsp-pas: starting SMP2P wait\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
