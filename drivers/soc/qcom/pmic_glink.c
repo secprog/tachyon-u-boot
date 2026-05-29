@@ -957,7 +957,8 @@ static int qpg_init(struct qpg *pg)
 		ofnode_for_each_subnode(glink, adsp) {
 			const char *label = ofnode_read_string(glink, "label");
 
-			if (label && !strcmp(label, "lpass"))
+			if (label && (!strcmp(label, "adsp") ||
+				      !strcmp(label, "lpass")))
 				break;
 		}
 	log_warning("pmic-glink: adsp node valid=%d glink node valid=%d\n",
@@ -968,7 +969,7 @@ static int qpg_init(struct qpg *pg)
 	}
 
 	if (!ofnode_valid(glink)) {
-		log_warning("pmic-glink: missing lpass GLINK edge node\n");
+		log_warning("pmic-glink: missing ADSP GLINK edge node\n");
 		return -ENOENT;
 	}
 

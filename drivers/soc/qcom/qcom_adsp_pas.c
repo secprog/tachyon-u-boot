@@ -11,6 +11,7 @@
 #include <cpu_func.h>
 #include <dm.h>
 #include <dm/ofnode.h>
+#include <dm/read.h>
 #include <dm/uclass.h>
 #include <elf.h>
 #include <errno.h>
@@ -20,6 +21,7 @@
 #include <mapmem.h>
 #include <memalign.h>
 #include <part.h>
+#include <power-domain.h>
 #include <string.h>
 #include <scsi.h>
 #include <ufs.h>
@@ -35,6 +37,8 @@
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_MODEM_PARTITION			"modem_a"
+#define QCOM_ADSP_START_WAIT_MS			5000
+#define QPAS_MAX_POWER_DOMAINS			4
 
 #define QCOM_MDT_TYPE_MASK			(7 << 24)
 #define QCOM_MDT_TYPE_HASH			(2 << 24)
@@ -91,6 +95,12 @@ struct qpas_fw {
 	char path[128];
 };
 
+struct qpas_power_domains {
+	struct power_domain pd[QPAS_MAX_POWER_DOMAINS];
+	int count;
+	int enabled;
+};
+
 static bool qpas_booted;
 
 static int qpas_enable_clocks(struct udevice *dev)
@@ -109,6 +119,87 @@ static int qpas_enable_clocks(struct udevice *dev)
 	log_warning("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
 		    ret, clocks.count);
 	return ret;
+}
+
+static int qpas_enable_power_domains(struct udevice *dev,
+				     struct qpas_power_domains *pds)
+{
+	int count;
+	int ret;
+	int i;
+
+	count = dev_count_phandle_with_args(dev, "power-domains",
+					    "#power-domain-cells", 0);
+	if (count == -ENOENT) {
+		log_warning("qcom-adsp-pas: no power-domains in DT\n");
+		return 0;
+	}
+
+	if (count < 0) {
+		log_warning("qcom-adsp-pas: power-domain count ret=%d\n",
+			    count);
+		return count;
+	}
+
+	if (count > QPAS_MAX_POWER_DOMAINS) {
+		log_warning("qcom-adsp-pas: too many power domains count=%d max=%d\n",
+			    count, QPAS_MAX_POWER_DOMAINS);
+		return -E2BIG;
+	}
+
+	pds->count = count;
+
+	for (i = 0; i < count; i++) {
+		ret = power_domain_get_by_index(dev, &pds->pd[i], i);
+		if (ret) {
+			log_warning("qcom-adsp-pas: power_domain_get index=%d ret=%d\n",
+				    i, ret);
+			goto err_off;
+		}
+
+		ret = power_domain_on(&pds->pd[i]);
+		log_warning("qcom-adsp-pas: power_domain_on index=%d id=%lu ret=%d\n",
+			    i, pds->pd[i].id, ret);
+		if (ret)
+			goto err_off;
+
+		pds->enabled++;
+	}
+
+	return 0;
+
+err_off:
+	while (pds->enabled > 0) {
+		pds->enabled--;
+		power_domain_off(&pds->pd[pds->enabled]);
+	}
+
+	return ret;
+}
+
+static void qpas_disable_power_domains(struct qpas_power_domains *pds)
+{
+	int ret;
+
+	while (pds->enabled > 0) {
+		pds->enabled--;
+		ret = power_domain_off(&pds->pd[pds->enabled]);
+		log_warning("qcom-adsp-pas: power_domain_off index=%d id=%lu ret=%d\n",
+			    pds->enabled, pds->pd[pds->enabled].id, ret);
+	}
+}
+
+static int qpas_wait_for_start(ofnode node)
+{
+	(void)node;
+
+	log_warning("qcom-adsp-pas: waiting ADSP start gate timeout=%d ms\n",
+		    QCOM_ADSP_START_WAIT_MS);
+	log_warning("qcom-adsp-pas: SMP2P ready/fatal polling unavailable in this U-Boot path; delaying before GLINK\n");
+	mdelay(QCOM_ADSP_START_WAIT_MS);
+	log_warning("qcom-adsp-pas: ADSP start gate complete\n");
+
+	return 0;
 }
 
 static int qcom_scm_remap_error(long err)
@@ -771,6 +862,7 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 
 static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 {
+	struct qpas_power_domains pds = {};
 	struct qpas_fw fw = {};
 	const char *fw_name;
 	phys_addr_t mem_phys;
@@ -791,11 +883,19 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
 	}
 
+	if (dev) {
+		ret = qpas_enable_power_domains(dev, &pds);
+		if (ret)
+			return ret;
+	} else {
+		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
+	}
+
 	ret = qpas_get_memory_region(node, &mem_phys, &mem_size, &mem_region);
 	if (ret) {
 		log_warning("qcom-adsp-pas: memory-region lookup failed ret=%d\n",
 			    ret);
-		return ret;
+		goto out_power_domains;
 	}
 
 	fw_name = ofnode_read_string(node, "firmware-name");
@@ -828,11 +928,11 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-	log_warning("qcom-adsp-pas: diag auth_and_reset returned, delaying before shutdown\n");
-	mdelay(10);
-	qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-	log_warning("qcom-adsp-pas: diag shutdown\n");
-	goto out_free_metadata;
+	ret = qpas_wait_for_start(node);
+	if (ret) {
+		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		goto out_free_metadata;
+	}
 
 	qpas_booted = true;
 	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
@@ -844,6 +944,9 @@ out_free_fw:
 	free(fw.data);
 out_unmap:
 	unmap_sysmem(mem_region);
+out_power_domains:
+	if (ret)
+		qpas_disable_power_domains(&pds);
 	return ret;
 }
 
@@ -862,6 +965,7 @@ U_BOOT_DRIVER(qcom_adsp_pas) = {
 	.id = UCLASS_MISC,
 	.of_match = qcom_adsp_pas_ids,
 	.probe = qcom_adsp_pas_probe,
+	.flags = DM_FLAG_DEFAULT_PD_CTRL_OFF,
 };
 
 int qcom_adsp_pas_boot(void)

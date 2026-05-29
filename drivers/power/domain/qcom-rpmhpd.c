@@ -31,6 +31,16 @@ struct rpmhpd_desc {
 	size_t num_pds;
 };
 
+static struct rpmhpd cx = {
+	.res_name = "cx.lvl",
+	.enable_corner = RPMHPD_CORNER_MAX,
+};
+
+static struct rpmhpd mx = {
+	.res_name = "mx.lvl",
+	.enable_corner = RPMHPD_CORNER_MAX,
+};
+
 static struct rpmhpd lcx = {
 	.res_name = "lcx.lvl",
 	.enable_corner = RPMHPD_CORNER_MAX,
@@ -61,6 +71,8 @@ static const struct rpmhpd_desc sa8775p_desc = {
 };
 
 static struct rpmhpd *sc7280_rpmhpds[] = {
+	[SC7280_CX] = &cx,
+	[SC7280_MX] = &mx,
 	[SC7280_LMX] = &lmx,
 	[SC7280_LCX] = &lcx,
 };
