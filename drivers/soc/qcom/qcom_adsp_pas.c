@@ -27,6 +27,7 @@
 #include <scsi.h>
 #include <time.h>
 #include <ufs.h>
+#include <asm-generic/global_data.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
@@ -35,6 +36,8 @@
 #include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/sizes.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 #define QCOM_ADSP_PAS_ID			1
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
@@ -406,6 +409,7 @@ static int qpas_wait_for_start(ofnode node)
 	u32 last_value = U32_MAX;
 	u32 value;
 	bool pending_logged = false;
+	ulong last_heartbeat = 0;
 	int ret;
 
 	ret = qpas_find_smp2p(node, &info);
@@ -420,16 +424,16 @@ static int qpas_wait_for_start(ofnode node)
 		return ret;
 	}
 
-	log_warning("qcom-adsp-pas: waiting ADSP SMP2P ready timeout=%d ms\n",
-		    QCOM_ADSP_START_TIMEOUT_MS);
+	log_warning("qcom-adsp-pas: waiting ADSP SMP2P ready (remote_pid=%u) timeout=%d ms\n",
+		    info.remote_pid, QCOM_ADSP_START_TIMEOUT_MS);
 
 	start = get_timer(0);
 	do {
 		ret = qpas_smp2p_read_entry(smem, &info, &value);
 		if (ret == -EAGAIN) {
 			if (!pending_logged) {
-				log_warning("qcom-adsp-pas: waiting for SMP2P entry '%s'\n",
-					    info.entry_name);
+				log_warning("qcom-adsp-pas: waiting for SMP2P entry '%s' (elapsed=%lu ms)\n",
+					    info.entry_name, get_timer(start));
 				pending_logged = true;
 			}
 			mdelay(10);
@@ -453,9 +457,16 @@ static int qpas_wait_for_start(ofnode node)
 		}
 
 		if (value & BIT(info.ready_bit)) {
-			log_warning("qcom-adsp-pas: ADSP ready asserted value=%08x bit=%u\n",
-				    value, info.ready_bit);
+			log_warning("qcom-adsp-pas: ADSP ready asserted value=%08x bit=%u (elapsed=%lu ms)\n",
+				    value, info.ready_bit, get_timer(start));
 			return 0;
+		}
+
+		/* Periodic heartbeat to track how long board survives */
+		if (get_timer(last_heartbeat) >= 500) {
+			log_warning("qcom-adsp-pas: SMP2P heartbeat elapsed=%lu ms value=%08x\n",
+				    get_timer(start), value);
+			last_heartbeat = get_timer(0);
 		}
 
 		mdelay(10);
@@ -1117,6 +1128,11 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 	if (!vaddr)
 		return -ENOMEM;
 
+	log_warning("qcom-adsp-pas: memory-region phys=%llx size=%llx vaddr=%p\n",
+		    (unsigned long long)res.start,
+		    (unsigned long long)resource_size(&res),
+		    vaddr);
+
 	*addrp = res.start;
 	*sizep = resource_size(&res);
 	*vaddrp = vaddr;
@@ -1137,6 +1153,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	if (qpas_booted)
 		return 0;
+
+	/* Dump U-Boot memory layout to check for ADSP region overlap */
+	log_warning("qcom-adsp-pas: U-Boot mem: ram_base=%llx ram_size=%llx ram_top=%llx\n",
+		    (unsigned long long)gd->ram_base,
+		    (unsigned long long)gd->ram_size,
+		    (unsigned long long)gd->ram_top);
+	log_warning("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
+		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
 
 	if (dev) {
 		ret = qpas_enable_clocks(dev);
@@ -1168,6 +1192,13 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: boot start firmware=%s mem=%llx size=%zu\n",
 		    fw_name, (unsigned long long)mem_phys, mem_size);
 
+	/* Check if ADSP memory region overlaps U-Boot heap */
+	if (mem_phys < gd->ram_top && (mem_phys + mem_size) > gd->malloc_base) {
+		log_warning("qcom-adsp-pas: WARNING ADSP region [%llx-%llx] overlaps U-Boot memory!\n",
+			    (unsigned long long)mem_phys,
+			    (unsigned long long)(mem_phys + mem_size - 1));
+	}
+
 	ret = qpas_read_firmware(&fw, fw_name);
 	if (ret)
 		goto out_unmap;
@@ -1187,10 +1218,20 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
+	log_warning("qcom-adsp-pas: load complete, segments=%zu reloc_base=%llx\n",
+		    (size_t)((const Elf32_Ehdr *)fw.data)->e_phnum,
+		    (unsigned long long)reloc_base);
+
+	log_warning("qcom-adsp-pas: calling SCM auth_and_reset...\n");
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
+	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
 		goto out_free_metadata;
 
+	/* Short delay to let ADSP firmware initialize before polling */
+	log_warning("qcom-adsp-pas: delay 500ms before SMP2P poll...\n");
+	mdelay(500);
+	log_warning("qcom-adsp-pas: starting SMP2P wait\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
