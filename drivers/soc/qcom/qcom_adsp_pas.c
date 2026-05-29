@@ -71,6 +71,15 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_SCM_EBUSY_WAIT_MS			30
 #define QCOM_SCM_EBUSY_MAX_RETRY		20
 
+/*
+ * DEBUG: Set to 1 to skip SCM auth_and_reset + SMP2P wait entirely.
+ * Use this to verify the board stays alive without starting the ADSP.
+ * If the board still powers off, the issue is NOT the ADSP firmware itself
+ * but rather power domains / memory-region mapping / earlier steps.
+ * Set back to 0 for normal operation.
+ */
+#define QCOM_ADSP_SKIP_BOOT			1
+
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -1221,6 +1230,13 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: load complete, segments=%zu reloc_base=%llx\n",
 		    (size_t)((const Elf32_Ehdr *)fw.data)->e_phnum,
 		    (unsigned long long)reloc_base);
+
+	if (QCOM_ADSP_SKIP_BOOT) {
+		log_warning("qcom-adsp-pas: SKIP_BOOT: bypassing auth_and_reset + SMP2P wait\n");
+		qpas_booted = true;
+		ret = 0;
+		goto out_free_metadata;
+	}
 
 	log_warning("qcom-adsp-pas: calling SCM auth_and_reset...\n");
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
