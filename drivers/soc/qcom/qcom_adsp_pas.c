@@ -127,6 +127,9 @@ struct qpas_smp2p_info {
 	ofnode inbound;
 	u32 remote_pid;
 	u32 inbound_item;
+	u32 outbound_item;
+	u32 stop_bit;
+	bool stop_bit_valid;
 	u32 fatal_bit;
 	u32 ready_bit;
 	char entry_name[QPAS_SMP2P_MAX_ENTRY_NAME];
@@ -412,6 +415,128 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 	return -EAGAIN;
 }
 
+/*
+ * Find outbound SMP2P "stop" SMEM state from DT qcom,smem-states.
+ * This is needed because the ADSP firmware waits for the host to
+ * release "stop" before completing its boot sequence. Linux does
+ * this in qcom_q6v5_prepare() before auth_and_reset.
+ */
+static int qpas_smp2p_outbound_setup(ofnode node, struct udevice **smemp,
+				     struct qpas_smp2p_info *info)
+{
+	struct ofnode_phandle_args args;
+	struct udevice *smem_dev;
+	ofnode smp2p_node;
+	u32 smem[2];
+	int ret;
+
+	/* Parse qcom,smem-states from the remoteproc node */
+	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
+					     NULL, 0, 0, &args);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: no qcom,smem-states ret=%d\n", ret);
+		return ret;
+	}
+
+	if (args.args_count < 1) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: no bit in smem-states\n");
+		return -EINVAL;
+	}
+
+	info->stop_bit = args.args[0];
+	info->stop_bit_valid = true;
+
+	/* Get the parent smp2p node to find the SMEM item */
+	smp2p_node = ofnode_get_parent(args.node);
+	if (!ofnode_valid(smp2p_node)) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: no smp2p parent\n");
+		return -ENOENT;
+	}
+
+	ret = ofnode_read_u32_array(smp2p_node, "qcom,smem", smem,
+				    ARRAY_SIZE(smem));
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: qcom,smem read ret=%d\n", ret);
+		return ret;
+	}
+
+	info->outbound_item = smem[0];
+
+	/* Get remote-pid for the SMEM lookup */
+	ret = ofnode_read_u32(smp2p_node, "qcom,remote-pid",
+			      &info->remote_pid);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: remote-pid read ret=%d\n", ret);
+		return ret;
+	}
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P outbound: SMEM lookup ret=%d\n", ret);
+		return ret;
+	}
+
+	*smemp = smem_dev;
+
+	log_warning("qcom-adsp-pas: SMP2P outbound: remote_pid=%u item=%u stop_bit=%u\n",
+		    info->remote_pid, info->outbound_item, info->stop_bit);
+	return 0;
+}
+
+/*
+ * Write the SMP2P outbound "stop" bit. When stop=1 the ADSP is held in reset;
+ * when stop=0 the ADSP is released. The ADSP firmware will not complete boot
+ * until it sees the stop bit cleared.
+ */
+static int qpas_smp2p_write_stop(struct udevice *smem,
+				 struct qpas_smp2p_info *info, bool stop)
+{
+	struct qpas_smp2p_smem_item *item;
+	size_t size = 0;
+	int ret;
+
+	item = smem_get(smem, info->remote_pid, info->outbound_item, &size);
+	if (IS_ERR_OR_NULL(item)) {
+		/* Item not yet allocated — create it */
+		ret = smem_alloc(smem, info->remote_pid,
+				 info->outbound_item,
+				 sizeof(struct qpas_smp2p_smem_item));
+		if (ret && ret != -EEXIST) {
+			log_warning("qcom-adsp-pas: SMP2P outbound alloc ret=%d\n", ret);
+			return ret;
+		}
+		item = smem_get(smem, info->remote_pid,
+				info->outbound_item, &size);
+		if (IS_ERR_OR_NULL(item))
+			return -EAGAIN;
+	}
+
+	if (size < sizeof(*item))
+		return -EINVAL;
+
+	/* Initialize if not yet set up */
+	if (le32_to_cpu(item->magic) != QPAS_SMP2P_MAGIC) {
+		memset(item, 0, sizeof(*item));
+		item->magic = cpu_to_le32(QPAS_SMP2P_MAGIC);
+		item->version = QPAS_SMP2P_VERSION;
+		item->local_pid = cpu_to_le16(0);
+		item->remote_pid = cpu_to_le16(info->remote_pid);
+		item->total_entries = cpu_to_le16(1);
+		item->valid_entries = cpu_to_le16(1);
+		memcpy(item->entries[0].name, "stop",
+		       min(sizeof(item->entries[0].name), (size_t)4));
+		item->entries[0].value = cpu_to_le32(stop ? 1 : 0);
+	} else {
+		if (info->stop_bit < le16_to_cpu(item->valid_entries))
+			item->entries[info->stop_bit].value =
+				cpu_to_le32(stop ? 1 : 0);
+	}
+
+	log_warning("qcom-adsp-pas: SMP2P outbound stop=%d bit=%u\n",
+		    stop, info->stop_bit);
+	return 0;
+}
+
 static int qpas_wait_for_start(ofnode node)
 {
 	struct qpas_smp2p_info info = {};
@@ -636,41 +761,71 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 }
 
 /*
- * Minimal AOSS QMP power-up request for ADSP (PAS_ID=1).
- * The ADSP references qcom,qmp = <&aoss_qmp> at 0x0c300000.
- * Linux does this via qcom_q6v5_prepare() before auth_and_reset.
- * Write BIT(0) to request DSP power-up, poll for ACK in BIT(1).
+ * Minimal AOSS QMP interaction — mimics Linux qcom_q6v5_prepare().
+ *
+ * Linux sends a QMP message to toggle ADSP load_state:
+ *   qmp_send(qmp, "{class: image, res: load_state, name: adsp, val: on}");
+ *
+ * The QMP MSGRAM is at AOSS base (0x0c300000, offset=0 for SC7280).
+ * Protocol: write magic + version + msg_len + msg_body, then kick IPCC.
+ * AOP processes the message and responds with QMP_MAGIC_REPLY.
  */
 #define AOSS_QMP_BASE		0x0c300000
-#define AOSS_QMP_QPIC_REQ	0x20	/* QPIC power request offset for ADSP */
-static void qpas_aoss_qmp_power_up(void)
+#define IPCC_BASE		0x408000
+#define IPCC_REG_SEND_ID	0x0c
+#define QMP_MAGIC		0x4d41494c	/* "MAIL" little-endian */
+#define QMP_MAGIC_REPLY		0x4c49414d	/* "LIAM" */
+#define QMP_VERSION		1
+#define QMP_MSGRAM_SIZE		0x200
+
+static int qpas_aoss_qmp_load_state(bool on)
 {
-	volatile u32 *qmp = (volatile u32 *)map_sysmem(AOSS_QMP_BASE, 0x100);
-	ulong start;
-	u32 val;
+	volatile u32 *msgram = (volatile u32 *)map_sysmem(AOSS_QMP_BASE, QMP_MSGRAM_SIZE);
+	volatile u32 *ipcc = (volatile u32 *)map_sysmem(IPCC_BASE, 0x1000);
+	char msg[128];
+	u32 hwirq;
+	int msglen;
+	int retry;
+	u32 magic;
 
-	log_warning("qcom-adsp-pas: AOSS QMP base=%p\n", qmp);
+	if (!msgram || !ipcc) {
+		log_warning("qcom-adsp-pas: AOSS QMP map failed\n");
+		return -ENOMEM;
+	}
 
-	/* Read current state */
-	val = readl(qmp + (AOSS_QMP_QPIC_REQ / 4));
-	log_warning("qcom-adsp-pas: AOSS QMP_QPIC_REQ=0x%08x\n", val);
+	msglen = snprintf(msg, sizeof(msg),
+			  "{class: image, res: load_state, name: adsp, val: %s}",
+			  on ? "on" : "off");
 
-	/* Request ADSP power-up */
-	writel(val | BIT(0), qmp + (AOSS_QMP_QPIC_REQ / 4));
+	log_warning("qcom-adsp-pas: QMP load_state %s msg='%s' len=%d\n",
+		    on ? "on" : "off", msg, msglen);
 
-	/* Poll for ACK (BIT(1) set by AOSS) */
-	start = get_timer(0);
-	do {
-		val = readl(qmp + (AOSS_QMP_QPIC_REQ / 4));
-		if (val & BIT(1))
+	/* Write QMP message to MSGRAM */
+	writel(QMP_MAGIC, msgram + 0);		/* offset 0x00: magic */
+	writel(QMP_VERSION, msgram + 1);	/* offset 0x04: version */
+	writel(0, msgram + 2);			/* offset 0x08: features */
+	writel(msglen, msgram + 3);		/* offset 0x0c: msg_len */
+	memcpy((void *)(msgram + 4), msg, msglen); /* offset 0x10: msg body */
+
+	/* Kick IPCC to notify AOP: client=AOP(0), signal=GLINK_QMP(0) */
+	hwirq = (0 << 16) | 0;
+	writel(hwirq, ipcc + (IPCC_REG_SEND_ID / 4));
+
+	/* Poll for QMP reply with timeout */
+	for (retry = 0; retry < 20; retry++) {
+		mdelay(5);
+		magic = readl(msgram + 0);
+		if (magic == QMP_MAGIC_REPLY)
 			break;
-		mdelay(1);
-	} while (get_timer(start) < 1000);
+	}
 
-	log_warning("qcom-adsp-pas: AOSS QMP_QPIC_REQ after=%08x elapsed=%lu ms\n",
-		    val, get_timer(start));
+	log_warning("qcom-adsp-pas: QMP reply magic=%08x retry=%d\n",
+		    magic, retry);
 
-	unmap_sysmem((void *)qmp);
+	unmap_sysmem((void *)msgram);
+	unmap_sysmem((void *)ipcc);
+
+	return (magic == QMP_MAGIC_REPLY) ? 0 : -ETIMEDOUT;
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id)
@@ -1296,31 +1451,37 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_metadata;
 	}
 
-	log_warning("qcom-adsp-pas: calling SCM auth_and_reset...\n");
-	qpas_aoss_qmp_power_up();
+	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
+
+	/* Assert SMP2P outbound "stop" before boot (like Linux q6v5_prepare) */
+	{
+		struct qpas_smp2p_info stop_info = {};
+		struct udevice *stop_smem;
+
+		if (!qpas_smp2p_outbound_setup(node, &stop_smem, &stop_info)) {
+			qpas_smp2p_write_stop(stop_smem, &stop_info, true);
+		}
+	}
+
+	/* QMP load_state on (Linux q6v5_prepare) — tells AOSS DSP is starting */
+	qpas_aoss_qmp_load_state(true);
+
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
 		goto out_free_metadata;
 
-	/* Fixed delay with heartbeats — NO SMP2P polling.
-	 * Use this to determine if the board survives without touching
-	 * the ADSP SMEM region, and exactly when it powers off.
-	 */
-	log_warning("qcom-adsp-pas: heartbeat-only delay (no SMP2P poll)...\n");
+	/* Deassert "stop" immediately to release ADSP */
 	{
-		ulong hb_start = get_timer(0);
-		int i;
-		for (i = 0; i < 50; i++) {
-			mdelay(100);
-			log_warning("qcom-adsp-pas: heartbeat %d elapsed=%lu ms\n",
-				    i, get_timer(hb_start));
+		struct qpas_smp2p_info stop_info = {};
+		struct udevice *stop_smem;
+
+		if (!qpas_smp2p_outbound_setup(node, &stop_smem, &stop_info)) {
+			qpas_smp2p_write_stop(stop_smem, &stop_info, false);
 		}
 	}
-	log_warning("qcom-adsp-pas: heartbeat delay complete (5s elapsed)\n");
 
-	/* Now do the real SMP2P poll */
-	log_warning("qcom-adsp-pas: starting SMP2P wait\n");
+	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
