@@ -28,6 +28,7 @@
 #include <time.h>
 #include <ufs.h>
 #include <asm-generic/global_data.h>
+#include <asm/io.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
@@ -627,11 +628,48 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	log_warning("qcom-adsp-pas: auth_and_reset pas_id=%u\n", pas_id);
 
 	ret = qcom_scm_call(&desc, &res);
-	if (ret || res.result[0])
-		log_warning("qcom-adsp-pas: auth_and_reset ret=%d scm_result=%llu\n",
-			    ret, res.result[0]);
+	log_warning("qcom-adsp-pas: auth_and_reset ret=%d scm_result0=%llu scm_result1=%llu scm_result2=%llu\n",
+		    ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
+}
+
+/*
+ * Minimal AOSS QMP power-up request for ADSP (PAS_ID=1).
+ * The ADSP references qcom,qmp = <&aoss_qmp> at 0x0c300000.
+ * Linux does this via qcom_q6v5_prepare() before auth_and_reset.
+ * Write BIT(0) to request DSP power-up, poll for ACK in BIT(1).
+ */
+#define AOSS_QMP_BASE		0x0c300000
+#define AOSS_QMP_QPIC_REQ	0x20	/* QPIC power request offset for ADSP */
+static void qpas_aoss_qmp_power_up(void)
+{
+	volatile u32 *qmp = (volatile u32 *)map_sysmem(AOSS_QMP_BASE, 0x100);
+	ulong start;
+	u32 val;
+
+	log_warning("qcom-adsp-pas: AOSS QMP base=%p\n", qmp);
+
+	/* Read current state */
+	val = readl(qmp + (AOSS_QMP_QPIC_REQ / 4));
+	log_warning("qcom-adsp-pas: AOSS QMP_QPIC_REQ=0x%08x\n", val);
+
+	/* Request ADSP power-up */
+	writel(val | BIT(0), qmp + (AOSS_QMP_QPIC_REQ / 4));
+
+	/* Poll for ACK (BIT(1) set by AOSS) */
+	start = get_timer(0);
+	do {
+		val = readl(qmp + (AOSS_QMP_QPIC_REQ / 4));
+		if (val & BIT(1))
+			break;
+		mdelay(1);
+	} while (get_timer(start) < 1000);
+
+	log_warning("qcom-adsp-pas: AOSS QMP_QPIC_REQ after=%08x elapsed=%lu ms\n",
+		    val, get_timer(start));
+
+	unmap_sysmem(qmp);
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id)
@@ -1250,6 +1288,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	}
 
 	log_warning("qcom-adsp-pas: calling SCM auth_and_reset...\n");
+	qpas_aoss_qmp_power_up();
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
