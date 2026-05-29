@@ -1208,6 +1208,17 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 			    (unsigned long long)(mem_phys + mem_size - 1));
 	}
 
+	/*
+	 * Shut down any stale ADSP state left by ABL before loading
+	 * firmware. This ensures clean power/cache/SMMU state even if
+	 * the DSP wasn't fully booted by the previous stage.
+	 */
+	log_warning("qcom-adsp-pas: pre-boot shutdown pas_id=%u\n",
+		    QCOM_ADSP_PAS_ID);
+	qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+	mdelay(100);
+	log_warning("qcom-adsp-pas: pre-boot shutdown complete\n");
+
 	ret = qpas_read_firmware(&fw, fw_name);
 	if (ret)
 		goto out_unmap;
