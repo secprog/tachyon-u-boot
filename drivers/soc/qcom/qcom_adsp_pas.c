@@ -29,6 +29,7 @@
 #include <ufs.h>
 #include <asm-generic/global_data.h>
 #include <asm/io.h>
+#include <asm/cache.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
@@ -1245,6 +1246,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 			    (unsigned long long)mem_phys,
 			    (unsigned long long)(mem_phys + mem_size - 1));
 	}
+
+	/*
+	 * Snapdragon board code marks all reserved-memory regions (including
+	 * adsp_mem) as PTE_TYPE_FAULT. Re-enable normal cacheable mapping so
+	 * we can actually write firmware segments to physical RAM.
+	 */
+	log_warning("qcom-adsp-pas: re-enabling cacheable mapping for ADSP region\n");
+	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_DEFAULT_OPTION);
 
 	/*
 	 * Shut down any stale ADSP state left by ABL before loading
