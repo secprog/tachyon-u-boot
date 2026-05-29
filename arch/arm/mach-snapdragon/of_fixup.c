@@ -120,6 +120,9 @@ static void fixup_power_domains(void)
 	struct property *prop;
 	const __be32 *val;
 
+	if (IS_ENABLED(CONFIG_QCOM_RPMH_POWER_DOMAIN))
+		return;
+
 	/* All Qualcomm platforms name the rpm(h)pd "power-controller" */
 	for_each_of_allnodes(pd) {
 		if (pd->name && !strcmp("power-controller", pd->name))

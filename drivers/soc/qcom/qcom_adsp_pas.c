@@ -131,14 +131,19 @@ static int qpas_enable_power_domains(struct udevice *dev,
 	count = dev_count_phandle_with_args(dev, "power-domains",
 					    "#power-domain-cells", 0);
 	if (count == -ENOENT) {
-		log_warning("qcom-adsp-pas: no power-domains in DT\n");
-		return 0;
+		log_warning("qcom-adsp-pas: missing required power-domains in DT\n");
+		return -ENODEV;
 	}
 
 	if (count < 0) {
 		log_warning("qcom-adsp-pas: power-domain count ret=%d\n",
 			    count);
 		return count;
+	}
+
+	if (!count) {
+		log_warning("qcom-adsp-pas: empty required power-domains list\n");
+		return -ENODEV;
 	}
 
 	if (count > QPAS_MAX_POWER_DOMAINS) {
