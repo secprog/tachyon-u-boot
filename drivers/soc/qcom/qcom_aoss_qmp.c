@@ -3,15 +3,20 @@
  * Qualcomm AOSS QMP (Qualcomm Messaging Protocol) driver
  *
  * Communicates with the AOP (Always-On Processor) via shared memory
- * (MSGRAM) + IPCC doorbell. Used to toggle remote processor load states,
- * request clocks, and other AOP-managed resources.
+ * (MSGRAM) + IPCC doorbell. Used to toggle remote processor load states
+ * (e.g. ADSP load_state in qcom_q6v5_prepare()), request clocks, and
+ * other AOP-managed resources.
  *
- * This follows the Linux drivers/soc/qcom/qcom_aoss.c on-wire protocol —
- * the descriptor table layout, handshake sequence, and message format are
- * identical.  Linux uses wait_event_timeout() driven by hardware
- * interrupts; U-Boot's wait_event_timeout() polls with
- * get_timer()/cpu_relax() (U-Boot is single-threaded and lacks wait
- * queues / interrupt-driven wakeups).
+ * The on-wire protocol — descriptor table layout, handshake sequence, and
+ * message format — matches Linux drivers/soc/qcom/qcom_aoss.c.  However,
+ * Linux's wait_event_timeout() is driven by IPCC hardware interrupt
+ * wakeups on a dedicated wait queue; U-Boot's wait_event_timeout() polls
+ * with get_timer()/cpu_relax() — U-Boot is single-threaded with no wait
+ * queues, so interrupt-driven wakeups are not possible.
+ *
+ * On the Q6V5 side: Linux calls qmp->load_state() in qcom_q6v5_prepare()
+ * before the remoteproc PAS auth-and-reset.  U-Boot's qcom_adsp_pas.c
+ * does the same via qcom_aoss_qmp_load_state().
  *
  *   - probe: qmp_open() link+channel handshake via descriptor table
  *   - qmp_send(): write msg body at (msgram + mbox_offset + 4), length at
@@ -245,9 +250,8 @@ int qcom_aoss_qmp_send(struct udevice *dev, const char *fmt, ...)
 	len = vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 
-	if (len >= QMP_MSG_LEN) {
-		dev_err(dev, "qcom-aoss-qmp: message too long (%d > %d)\n",
-			len, QMP_MSG_LEN - 1);
+	if (len < 0 || len >= QMP_MSG_LEN) {
+		dev_err(dev, "qcom-aoss-qmp: bad message length %d\n", len);
 		return -EINVAL;
 	}
 

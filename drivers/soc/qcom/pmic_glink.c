@@ -179,7 +179,7 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 		return ret;
 	}
 
-	const struct mbox_ops *ops = ipcc_dev->driver->ops;
+	ops = ipcc_dev->driver->ops;
 	chan->dev = ipcc_dev;
 	chan->con_priv = NULL;
 
