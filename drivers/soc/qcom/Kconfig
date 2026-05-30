@@ -39,10 +39,21 @@ config QCOM_ADSP_PAS
 	  Peripheral Authentication Service using firmware stored in the
 	  modem_a FAT partition.
 
+config QCOM_AOSS_QMP
+	bool "Qualcomm AOSS QMP driver"
+	depends on DM_MAILBOX && QCOM_IPCC && ARCH_SNAPDRAGON
+	help
+	  Enable support for the Qualcomm AOSS QMP (Qualcomm Messaging
+	  Protocol) driver. This communicates with the Always-On Processor
+	  (AOP) via shared memory (MSGRAM) and IPCC doorbell to toggle
+	  remote processor load states and other AOP-managed resources.
+
 config QCOM_PMIC_GLINK
 	bool "Qualcomm PMIC GLINK transport"
 	depends on MSM_SMEM && ARM64 && OF_CONTROL && BLK
 	select QCOM_ADSP_PAS
+	select DM_MAILBOX
+	select QCOM_IPCC
 	help
 	  Enable a small Qualcomm PMIC-GLINK transport over the LPASS/ADSP
 	  GLINK-SMEM edge. This is used during early boot to query USB-C

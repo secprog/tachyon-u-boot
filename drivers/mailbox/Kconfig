@@ -58,4 +58,13 @@ config ZYNQMP_IPI
 	help
 	  This enables support for the Xilinx ZynqMP Inter Processor Interrupt
 	  communication controller.
+
+config QCOM_IPCC
+	bool "Qualcomm IPCC controller support"
+	depends on DM_MAILBOX && ARCH_SNAPDRAGON
+	help
+	  This enables support for the Qualcomm IPCC (Inter-Processor
+	  Communication Controller) hardware module, which implements
+	  doorbells between the applications processor and remote
+	  processors (AOP, ADSP, CDSP, MPSS, etc.).
 endmenu

@@ -10,11 +10,11 @@
 
 #define LOG_CATEGORY UCLASS_MISC
 
-#include <asm/io.h>
 #include <dm.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
 #include <errno.h>
+#include <asm/io.h>
 #include <linux/err.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
@@ -22,7 +22,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <log.h>
-#include <mapmem.h>
+#include <mailbox.h>
 #include <smem.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/pmic_glink.h>
@@ -32,7 +32,6 @@
 #define QPG_SMEM_XPRT_FIFO_0			479
 #define QPG_SMEM_XPRT_FIFO_1			480
 
-#define QPG_IPCC_REG_SEND_ID			0x0c
 #define QPG_FIFO_FULL_RESERVE			8
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
@@ -115,10 +114,8 @@ struct qpg_intent_pair {
 
 struct qpg {
 	struct udevice *smem;
-	void __iomem *ipcc;
+	struct mbox_chan mbox_chan;
 	u32 remote_pid;
-	u16 ipcc_client;
-	u16 ipcc_signal;
 	__le32 *tx_tail;
 	__le32 *tx_head;
 	__le32 *rx_tail;
@@ -141,9 +138,50 @@ struct qpg {
 	bool pan_acked;
 };
 
-static u32 qpg_hwirq(u16 client, u16 signal)
+/**
+ * qpg_mbox_from_glink() - Get IPCC mailbox channel from glink-edge DT node.
+ *
+ * The glink-edge subnode of remoteproc_adsp has:
+ *   mboxes = <&ipcc IPCC_CLIENT_LPASS IPCC_MPROC_SIGNAL_GLINK_QMP>;
+ * Since pmic-glink is a library (not bound to that node), we manually parse
+ * the phandle and construct an mbox_chan for use with mbox_send().
+ */
+static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 {
-	return ((u32)client << 16) | signal;
+	struct ofnode_phandle_args args;
+	struct udevice *ipcc_dev;
+	int ret;
+
+	ret = ofnode_parse_phandle_with_args(glink, "mboxes",
+					     "#mbox-cells", 0, 0, &args);
+	if (ret) {
+		log_warning("pmic-glink: glink mboxes parse ret=%d\n", ret);
+		return ret;
+	}
+
+	if (args.args_count != 2 || !ofnode_valid(args.node)) {
+		log_warning("pmic-glink: bad mboxes args_count=%d\n",
+			    args.args_count);
+		return -EINVAL;
+	}
+
+	/* Get the IPCC mailbox device by its DT node */
+	ret = uclass_get_device_by_ofnode(UCLASS_MAILBOX, args.node,
+					  &ipcc_dev);
+	if (ret) {
+		log_warning("pmic-glink: IPCC dev lookup ret=%d\n", ret);
+		return ret;
+	}
+
+	/* Set up channel: pack client_id<<16 | signal_id (matches IPCC hw) */
+	chan->dev = ipcc_dev;
+	chan->id = ((u32)args.args[0] << 16) | (u32)args.args[1];
+	chan->con_priv = NULL;
+
+	log_warning("pmic-glink: IPCC mbox chan dev=%s id=%08lx\n",
+		    ipcc_dev->name, chan->id);
+
+	return 0;
 }
 
 static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
@@ -231,12 +269,11 @@ static u32 qpg_tx_write_one(struct qpg *pg, u32 head, const void *data,
 
 static void qpg_kick(struct qpg *pg)
 {
-	log_warning("pmic-glink: kick hwirq=%08x client=%u signal=%u\n",
-		    qpg_hwirq(pg->ipcc_client, pg->ipcc_signal),
-		    pg->ipcc_client, pg->ipcc_signal);
+	int ret;
 
-	writel(qpg_hwirq(pg->ipcc_client, pg->ipcc_signal),
-	       pg->ipcc + QPG_IPCC_REG_SEND_ID);
+	ret = mbox_send(&pg->mbox_chan, NULL);
+	if (ret)
+		log_warning("pmic-glink: IPCC kick failed ret=%d\n", ret);
 }
 
 static int qpg_tx(struct qpg *pg, const void *hdr, size_t hlen,
@@ -930,11 +967,8 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 
 static int qpg_init(struct qpg *pg)
 {
-	struct ofnode_phandle_args args;
-	ofnode ipcc = ofnode_null();
 	ofnode adsp;
 	ofnode glink = ofnode_null();
-	fdt_addr_t addr;
 	size_t size;
 	__le32 *descs;
 	ulong start;
@@ -978,38 +1012,16 @@ static int qpg_init(struct qpg *pg)
 		return ret;
 	}
 
-	ret = ofnode_parse_phandle_with_args(glink, "mboxes",
-					     "#mbox-cells", 0, 0,
-					     &args);
+	/*
+	 * Get IPCC mailbox channel via DT lookup.
+	 * glink-edge DT node: mboxes = <&ipcc IPCC_CLIENT_LPASS IPCC_MPROC_SIGNAL_GLINK_QMP>;
+	 * Routes through the qcom-ipcc mailbox driver (no more hardcoded MMIO).
+	 */
+	ret = qpg_mbox_from_glink(glink, &pg->mbox_chan);
 	if (ret) {
-		log_warning("pmic-glink: missing/invalid mboxes ret=%d\n", ret);
+		log_warning("pmic-glink: failed to get IPCC mbox ret=%d\n", ret);
 		return ret;
 	}
-
-	if (args.args_count < 2 || !ofnode_valid(args.node)) {
-		log_warning("pmic-glink: invalid mboxes args_count=%d node_valid=%d\n",
-			    args.args_count, ofnode_valid(args.node));
-		return -EINVAL;
-	}
-
-	ipcc = args.node;
-	pg->ipcc_client = args.args[0];
-	pg->ipcc_signal = args.args[1];
-	log_warning("pmic-glink: DT remote_pid=%u ipcc_client=%u ipcc_signal=%u\n",
-		    pg->remote_pid, pg->ipcc_client, pg->ipcc_signal);
-
-	log_warning("pmic-glink: ipcc node valid=%d name=%s\n",
-		    ofnode_valid(ipcc),
-		    ofnode_valid(ipcc) ? ofnode_get_name(ipcc) : "<none>");
-
-	addr = ofnode_get_addr(ipcc);
-	log_warning("pmic-glink: ipcc addr=%llx\n",
-		    (unsigned long long)addr);
-	if (addr == FDT_ADDR_T_NONE)
-		return -EINVAL;
-
-	pg->ipcc = map_sysmem(addr, 0x1000);
-	log_warning("pmic-glink: ipcc mapped=%p\n", pg->ipcc);
 
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 32);

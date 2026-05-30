@@ -3,4 +3,5 @@
 obj-$(CONFIG_QCOM_COMMAND_DB) += cmd-db.o
 obj-$(CONFIG_QCOM_RPMH) += rpmh-rsc.o rpmh.o
 obj-$(CONFIG_QCOM_ADSP_PAS) += qcom_adsp_pas.o
+obj-$(CONFIG_QCOM_AOSS_QMP) += qcom_aoss_qmp.o
 obj-$(CONFIG_QCOM_PMIC_GLINK) += pmic_glink.o

@@ -822,8 +822,8 @@
 &remoteproc_adsp {
 	firmware-name = "tachyon/adsp.mdt";
 	status = "okay";
-	power-domains = <&rpmhpd SC7280_CX>, <&rpmhpd SC7280_LCX>, <&rpmhpd SC7280_LMX>;
-	power-domain-names = "cx", "lcx", "lmx";
+	power-domains = <&rpmhpd SC7280_LCX>, <&rpmhpd SC7280_LMX>;
+	power-domain-names = "lcx", "lmx";
 };
 
 &remoteproc_cdsp {

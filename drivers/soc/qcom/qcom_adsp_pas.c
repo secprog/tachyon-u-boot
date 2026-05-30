@@ -31,6 +31,7 @@
 #include <asm/io.h>
 #include <asm/cache.h>
 #include <soc/qcom/qcom_adsp_pas.h>
+#include <soc/qcom/qcom_aoss_qmp.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
@@ -493,47 +494,49 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 {
 	struct qpas_smp2p_smem_item *item;
 	size_t size = 0;
-	int ret;
 
 	item = smem_get(smem, info->remote_pid, info->outbound_item, &size);
 	if (IS_ERR_OR_NULL(item)) {
-		/* Item not yet allocated — create it */
-		ret = smem_alloc(smem, info->remote_pid,
-				 info->outbound_item,
-				 sizeof(struct qpas_smp2p_smem_item));
-		if (ret && ret != -EEXIST) {
-			log_warning("qcom-adsp-pas: SMP2P outbound alloc ret=%d\n", ret);
-			return ret;
-		}
-		item = smem_get(smem, info->remote_pid,
-				info->outbound_item, &size);
-		if (IS_ERR_OR_NULL(item))
-			return -EAGAIN;
+		log_warning("qcom-adsp-pas: SMP2P outbound SMEM item not found (remote_pid=%u item=%u)\n",
+			    info->remote_pid, info->outbound_item);
+		return -ENOENT;
 	}
 
-	if (size < sizeof(*item))
+	if (size < sizeof(*item)) {
+		log_warning("qcom-adsp-pas: SMP2P outbound SMEM item too small size=%zu\n",
+			    size);
 		return -EINVAL;
-
-	/* Initialize if not yet set up */
-	if (le32_to_cpu(item->magic) != QPAS_SMP2P_MAGIC) {
-		memset(item, 0, sizeof(*item));
-		item->magic = cpu_to_le32(QPAS_SMP2P_MAGIC);
-		item->version = QPAS_SMP2P_VERSION;
-		item->local_pid = cpu_to_le16(0);
-		item->remote_pid = cpu_to_le16(info->remote_pid);
-		item->total_entries = cpu_to_le16(1);
-		item->valid_entries = cpu_to_le16(1);
-		memcpy(item->entries[0].name, "stop",
-		       min(sizeof(item->entries[0].name), (size_t)4));
-		item->entries[0].value = cpu_to_le32(stop ? 1 : 0);
-	} else {
-		if (info->stop_bit < le16_to_cpu(item->valid_entries))
-			item->entries[info->stop_bit].value =
-				cpu_to_le32(stop ? 1 : 0);
 	}
 
-	log_warning("qcom-adsp-pas: SMP2P outbound stop=%d bit=%u\n",
-		    stop, info->stop_bit);
+	/* SMEM item must already be initialized by an earlier boot stage
+	 * (ABL/Linux). Do NOT allocate or manually initialize it — that could
+	 * corrupt state the ADSP firmware already sees.
+	 */
+	if (le32_to_cpu(item->magic) != QPAS_SMP2P_MAGIC ||
+	    item->version != QPAS_SMP2P_VERSION) {
+		log_warning("qcom-adsp-pas: SMP2P outbound SMEM item uninitialized (magic=%08x version=%u)\n",
+			    le32_to_cpu(item->magic), item->version);
+		return -ENOENT;
+	}
+
+	/* qcom,smem-states provides a BIT INDEX (0..31), not an entry index.
+	 * Linux uses BIT(stop_bit) with qcom_smem_state_update_bits().
+	 * Update entry[0].value with bitmask semantics.
+	 */
+	{
+		u32 value = le32_to_cpu(item->entries[0].value);
+
+		if (stop)
+			value |= BIT(info->stop_bit);
+		else
+			value &= ~BIT(info->stop_bit);
+
+		item->entries[0].value = cpu_to_le32(value);
+	}
+
+	log_warning("qcom-adsp-pas: SMP2P outbound stop=%d bit=%u value=%08x\n",
+		    stop, info->stop_bit,
+		    le32_to_cpu(item->entries[0].value));
 	return 0;
 }
 
@@ -758,74 +761,6 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 		    ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
-}
-
-/*
- * Minimal AOSS QMP interaction — mimics Linux qcom_q6v5_prepare().
- *
- * Linux sends a QMP message to toggle ADSP load_state:
- *   qmp_send(qmp, "{class: image, res: load_state, name: adsp, val: on}");
- *
- * The QMP MSGRAM is at AOSS base (0x0c300000, offset=0 for SC7280).
- * Protocol: write magic + version + msg_len + msg_body, then kick IPCC.
- * AOP processes the message and responds with QMP_MAGIC_REPLY.
- */
-#define AOSS_QMP_BASE		0x0c300000
-#define IPCC_BASE		0x408000
-#define IPCC_REG_SEND_ID	0x0c
-#define QMP_MAGIC		0x4d41494c	/* "MAIL" little-endian */
-#define QMP_MAGIC_REPLY		0x4c49414d	/* "LIAM" */
-#define QMP_VERSION		1
-#define QMP_MSGRAM_SIZE		0x200
-
-static int qpas_aoss_qmp_load_state(bool on)
-{
-	volatile u32 *msgram = (volatile u32 *)map_sysmem(AOSS_QMP_BASE, QMP_MSGRAM_SIZE);
-	volatile u32 *ipcc = (volatile u32 *)map_sysmem(IPCC_BASE, 0x1000);
-	char msg[128];
-	u32 hwirq;
-	int msglen;
-	int retry;
-	u32 magic;
-
-	if (!msgram || !ipcc) {
-		log_warning("qcom-adsp-pas: AOSS QMP map failed\n");
-		return -ENOMEM;
-	}
-
-	msglen = snprintf(msg, sizeof(msg),
-			  "{class: image, res: load_state, name: adsp, val: %s}",
-			  on ? "on" : "off");
-
-	log_warning("qcom-adsp-pas: QMP load_state %s msg='%s' len=%d\n",
-		    on ? "on" : "off", msg, msglen);
-
-	/* Write QMP message to MSGRAM */
-	writel(QMP_MAGIC, msgram + 0);		/* offset 0x00: magic */
-	writel(QMP_VERSION, msgram + 1);	/* offset 0x04: version */
-	writel(0, msgram + 2);			/* offset 0x08: features */
-	writel(msglen, msgram + 3);		/* offset 0x0c: msg_len */
-	memcpy((void *)(msgram + 4), msg, msglen); /* offset 0x10: msg body */
-
-	/* Kick IPCC to notify AOP: client=AOP(0), signal=GLINK_QMP(0) */
-	hwirq = (0 << 16) | 0;
-	writel(hwirq, ipcc + (IPCC_REG_SEND_ID / 4));
-
-	/* Poll for QMP reply with timeout */
-	for (retry = 0; retry < 20; retry++) {
-		mdelay(5);
-		magic = readl(msgram + 0);
-		if (magic == QMP_MAGIC_REPLY)
-			break;
-	}
-
-	log_warning("qcom-adsp-pas: QMP reply magic=%08x retry=%d\n",
-		    magic, retry);
-
-	unmap_sysmem((void *)msgram);
-	unmap_sysmem((void *)ipcc);
-
-	return (magic == QMP_MAGIC_REPLY) ? 0 : -ETIMEDOUT;
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id)
@@ -1453,38 +1388,53 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
 
-	/* Assert SMP2P outbound "stop" before boot (like Linux q6v5_prepare) */
+	/*
+	 * QMP load_state on (Linux qcom_q6v5_prepare) — tells AOSS DSP is
+	 * starting. Use the DT-driven QMP driver instead of hardcoded
+	 * addresses. The aoss_qmp node's mboxes property drives IPCC kick.
+	 * Linux does NOT assert the SMP2P "stop" bit during boot; the stop
+	 * bit is used only in qcom_q6v5_request_stop() for shutdown.
+	 */
 	{
-		struct qpas_smp2p_info stop_info = {};
-		struct udevice *stop_smem;
+		struct udevice *qmp_dev;
 
-		if (!qpas_smp2p_outbound_setup(node, &stop_smem, &stop_info)) {
-			qpas_smp2p_write_stop(stop_smem, &stop_info, true);
+		ret = uclass_get_device_by_driver(UCLASS_MISC,
+			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev);
+		if (ret) {
+			log_warning("qcom-adsp-pas: QMP driver not found ret=%d, falling back to legacy QMP\n",
+				    ret);
+			/* Fallback: older U-Boot without QMP driver — use SBL1 AOP polling.
+			 * AOP polls MSGRAM, so auth_and_reset may still work without QMP. */
+		} else {
+			ret = qcom_aoss_qmp_load_state(qmp_dev, true);
+			if (ret) {
+				log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
+					    ret);
+				goto out_free_metadata;
+			}
 		}
 	}
 
-	/* QMP load_state on (Linux q6v5_prepare) — tells AOSS DSP is starting */
-	qpas_aoss_qmp_load_state(true);
-
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
-	if (ret)
+	if (ret) {
+		struct udevice *qmp_dev;
+
+		if (!uclass_get_device_by_driver(UCLASS_MISC,
+			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev))
+			qcom_aoss_qmp_load_state(qmp_dev, false);
 		goto out_free_metadata;
-
-	/* Deassert "stop" immediately to release ADSP */
-	{
-		struct qpas_smp2p_info stop_info = {};
-		struct udevice *stop_smem;
-
-		if (!qpas_smp2p_outbound_setup(node, &stop_smem, &stop_info)) {
-			qpas_smp2p_write_stop(stop_smem, &stop_info, false);
-		}
 	}
 
 	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
+		struct udevice *qmp_dev;
+
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		if (!uclass_get_device_by_driver(UCLASS_MISC,
+			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev))
+			qcom_aoss_qmp_load_state(qmp_dev, false);
 		goto out_free_metadata;
 	}
 
