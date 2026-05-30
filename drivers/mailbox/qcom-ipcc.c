@@ -95,7 +95,7 @@ static const struct udevice_id qcom_ipcc_ids[] = {
 	{ }
 };
 
-struct mbox_ops qcom_ipcc_mbox_ops = {
+static const struct mbox_ops qcom_ipcc_mbox_ops = {
 	.of_xlate	= qcom_ipcc_of_xlate,
 	.request	= qcom_ipcc_request,
 	.rfree		= qcom_ipcc_free,
