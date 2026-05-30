@@ -23,6 +23,7 @@
 #include <linux/string.h>
 #include <log.h>
 #include <mailbox.h>
+#include <mailbox-uclass.h>
 #include <smem.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/pmic_glink.h>
@@ -143,12 +144,17 @@ struct qpg {
  *
  * The glink-edge subnode of remoteproc_adsp has:
  *   mboxes = <&ipcc IPCC_CLIENT_LPASS IPCC_MPROC_SIGNAL_GLINK_QMP>;
- * Since pmic-glink is a library (not bound to that node), we manually parse
- * the phandle and construct an mbox_chan for use with mbox_send().
+ *
+ * Since pmic-glink is not a DM device bound to the glink-edge node,
+ * we manually parse the phandle, get the IPCC device, and call the
+ * mailbox provider's .of_xlate() and .request() to construct the
+ * channel properly (matching what mbox_get_by_index() would do for a
+ * bound device).
  */
 static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 {
 	struct ofnode_phandle_args args;
+	struct mbox_ops *ops;
 	struct udevice *ipcc_dev;
 	int ret;
 
@@ -173,10 +179,27 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 		return ret;
 	}
 
-	/* Set up channel: pack client_id<<16 | signal_id (matches IPCC hw) */
+	ops = (struct mbox_ops *)ipcc_dev->driver->ops;
 	chan->dev = ipcc_dev;
-	chan->id = ((u32)args.args[0] << 16) | (u32)args.args[1];
 	chan->con_priv = NULL;
+
+	/* Use the provider's .of_xlate() to construct chan->id */
+	if (ops->of_xlate)
+		ret = ops->of_xlate(chan, &args);
+	else
+		chan->id = args.args[0];
+	if (ret) {
+		log_warning("pmic-glink: IPCC of_xlate failed ret=%d\n", ret);
+		return ret;
+	}
+
+	/* Call provider's .request() to complete channel setup */
+	if (ops->request)
+		ret = ops->request(chan);
+	if (ret) {
+		log_warning("pmic-glink: IPCC request failed ret=%d\n", ret);
+		return ret;
+	}
 
 	log_warning("pmic-glink: IPCC mbox chan dev=%s id=%08lx\n",
 		    ipcc_dev->name, chan->id);

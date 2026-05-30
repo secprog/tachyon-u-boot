@@ -418,9 +418,11 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 
 /*
  * Find outbound SMP2P "stop" SMEM state from DT qcom,smem-states.
- * This is needed because the ADSP firmware waits for the host to
- * release "stop" before completing its boot sequence. Linux does
- * this in qcom_q6v5_prepare() before auth_and_reset.
+ *
+ * NOTE: This is reserved for a future controlled stop / panic path
+ * (equivalent to Linux qcom_q6v5_request_stop()). The current boot path
+ * does NOT assert/deassert the stop bit; it is NOT used as a
+ * start/release gate for the ADSP.
  */
 static int qpas_smp2p_outbound_setup(ofnode node, struct udevice **smemp,
 				     struct qpas_smp2p_info *info)
@@ -485,9 +487,12 @@ static int qpas_smp2p_outbound_setup(ofnode node, struct udevice **smemp,
 }
 
 /*
- * Write the SMP2P outbound "stop" bit. When stop=1 the ADSP is held in reset;
- * when stop=0 the ADSP is released. The ADSP firmware will not complete boot
- * until it sees the stop bit cleared.
+ * Write the SMP2P outbound "stop" bit.
+ *
+ * NOTE: Reserved for a future controlled stop / panic path
+ * (Linux qcom_q6v5_request_stop()). Not used in the current boot flow.
+ * When stop=1 the ADSP receives a stop request; when stop=0 the
+ * request is cleared. This is NOT a boot-time start/reset gate.
  */
 static int qpas_smp2p_write_stop(struct udevice *smem,
 				 struct qpas_smp2p_info *info, bool stop)
@@ -1390,23 +1395,20 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	/*
 	 * QMP load_state on (Linux qcom_q6v5_prepare) — tells AOSS DSP is
-	 * starting. Use the DT-driven QMP driver instead of hardcoded
-	 * addresses. The aoss_qmp node's mboxes property drives IPCC kick.
+	 * starting. Look up the QMP device via the remoteproc node's
+	 * qcom,qmp = <&aoss_qmp>; phandle (matches Linux's qmp_get(&pdev->dev)).
 	 * Linux does NOT assert the SMP2P "stop" bit during boot; the stop
 	 * bit is used only in qcom_q6v5_request_stop() for shutdown.
 	 */
 	{
 		struct udevice *qmp_dev;
 
-		ret = uclass_get_device_by_driver(UCLASS_MISC,
-			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev);
+		ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
 		if (ret) {
-			log_warning("qcom-adsp-pas: QMP driver not found ret=%d, falling back to legacy QMP\n",
+			log_warning("qcom-adsp-pas: QMP phandle lookup failed ret=%d\n",
 				    ret);
-			/* Fallback: older U-Boot without QMP driver — use SBL1 AOP polling.
-			 * AOP polls MSGRAM, so auth_and_reset may still work without QMP. */
 		} else {
-			ret = qcom_aoss_qmp_load_state(qmp_dev, true);
+			ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
 			if (ret) {
 				log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
 					    ret);
@@ -1420,9 +1422,8 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret) {
 		struct udevice *qmp_dev;
 
-		if (!uclass_get_device_by_driver(UCLASS_MISC,
-			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev))
-			qcom_aoss_qmp_load_state(qmp_dev, false);
+		if (!qcom_aoss_qmp_get_by_node(node, &qmp_dev))
+			qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 		goto out_free_metadata;
 	}
 
@@ -1432,9 +1433,8 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		struct udevice *qmp_dev;
 
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		if (!uclass_get_device_by_driver(UCLASS_MISC,
-			DM_DRIVER_GET(qcom_aoss_qmp), &qmp_dev))
-			qcom_aoss_qmp_load_state(qmp_dev, false);
+		if (!qcom_aoss_qmp_get_by_node(node, &qmp_dev))
+			qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 		goto out_free_metadata;
 	}
 
