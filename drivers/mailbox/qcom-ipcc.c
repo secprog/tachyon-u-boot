@@ -67,8 +67,13 @@ static int qcom_ipcc_send(struct mbox_chan *chan, const void *data)
 static int qcom_ipcc_recv(struct mbox_chan *chan, void *data)
 {
 	/*
-	 * IPCC interrupts/receives are not needed in U-Boot.
-	 * PMIC-GLINK polls SMEM FIFOs. QMP polls MSGRAM for reply magic.
+	 * IPCC interrupts are not supported in U-Boot (the mailbox framework
+	 * lacks an IRQ-driven path).  Callers must poll for replies:
+	 * PMIC-GLINK polls SMEM FIFOs directly; QMP polls MSGRAM using
+	 * wait_event_timeout() (get_timer()/cpu_relax()).
+	 * Linux, by contrast, uses wait_event_timeout() driven by IPCC
+	 * hardware interrupts.
+	 *
 	 * Return -ENODATA so mbox_recv() callers get a clean "no data".
 	 */
 	return -ENODATA;

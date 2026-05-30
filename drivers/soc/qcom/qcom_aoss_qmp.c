@@ -6,10 +6,16 @@
  * (MSGRAM) + IPCC doorbell. Used to toggle remote processor load states,
  * request clocks, and other AOP-managed resources.
  *
- * This follows Linux drivers/soc/qcom/qcom_aoss.c protocol exactly:
- *   - probe: full qmp_open() link+channel handshake via descriptor table
+ * This follows the Linux drivers/soc/qcom/qcom_aoss.c on-wire protocol —
+ * the descriptor table layout, handshake sequence, and message format are
+ * identical.  Linux uses wait_event_timeout() driven by hardware
+ * interrupts; U-Boot's wait_event_timeout() polls with
+ * get_timer()/cpu_relax() (U-Boot is single-threaded and lacks wait
+ * queues / interrupt-driven wakeups).
+ *
+ *   - probe: qmp_open() link+channel handshake via descriptor table
  *   - qmp_send(): write msg body at (msgram + mbox_offset + 4), length at
- *     (msgram + mbox_offset), kick IPCC, poll for AOP to clear the length
+ *     (msgram + mbox_offset), kick IPCC, wait_event_timeout() for ack
  *   - remove: qmp_close() by writing QMP_STATE_DOWN to both states
  *
  * MSGRAM layout (first 0x40 bytes = descriptor table):
@@ -39,8 +45,9 @@
 #include <soc/qcom/qcom_aoss_qmp.h>
 #include <asm/io.h>
 #include <linux/bitfield.h>
-#include <linux/delay.h>
+#include <linux/compat.h>
 #include <linux/kernel.h>
+#include <stdarg.h>
 
 /* Descriptor table offsets (u32 words relative to MSGRAM base) */
 #define QMP_DESC_MAGIC			0x0
@@ -69,11 +76,9 @@
 
 #define QMP_MAGIC			0x4d41494c	/* "MAIL" LE */
 #define QMP_VERSION			1
-#define QMP_MSG_LEN			64		/* Linux uses 64-byte msgs */
+#define QMP_MSG_LEN			64		/* 64-byte messages */
 #define QMP_HANDSHAKE_TIMEOUT_MS	1000
-#define QMP_HANDSHAKE_POLL_MS		10
 #define QMP_REPLY_TIMEOUT_MS		2000
-#define QMP_REPLY_POLL_MS		10
 
 struct qcom_aoss_qmp_priv {
 	void __iomem *msgram;		/* MSGRAM base */
@@ -82,47 +87,16 @@ struct qcom_aoss_qmp_priv {
 	u32 mbox_size;			/* size of message area */
 };
 
-static void qmp_kick(struct qcom_aoss_qmp_priv *priv)
+static int qmp_kick(struct qcom_aoss_qmp_priv *priv)
 {
-	mbox_send(&priv->mbox_chan, NULL);
+	return mbox_send(&priv->mbox_chan, NULL);
 }
 
 /*
- * Poll a predicate (expr) every POLL_MS for up to TIMEOUT_MS.
- * Returns 0 on success, -ETIMEDOUT on timeout.
- * Logs a warning with 'label' if timed out.
- */
-static int qmp_poll_timeout(struct udevice *dev, const char *label,
-			    int (*pred)(void __iomem *, u32, u32),
-			    void __iomem *base, u32 off, u32 expected,
-			    unsigned int timeout_ms, unsigned int poll_ms)
-{
-	unsigned int elapsed;
-
-	for (elapsed = 0; elapsed < timeout_ms; elapsed += poll_ms) {
-		if (pred(base, off, expected))
-			return 0;
-		mdelay(poll_ms);
-	}
-
-	dev_err(dev, "qcom-aoss-qmp: %s timeout after %u ms\n",
-		label, timeout_ms);
-	return -ETIMEDOUT;
-}
-
-/* Predicates for qmp_poll_timeout */
-static int pred_eq(void __iomem *base, u32 off, u32 expected)
-{
-	return readl(base + off) == expected;
-}
-
-static int pred_zero(void __iomem *base, u32 off, u32 expected)
-{
-	return readl(base + off) == 0;
-}
-
-/*
- * qmp_open() — full Linux-equivalent link+channel handshake.
+ * qmp_open() — link+channel handshake (same on-wire sequence as Linux).
+ *
+ * Linux uses wait_event_timeout() driven by hardware interrupts; U-Boot's
+ * wait_event_timeout() polls with get_timer()/cpu_relax().
  *
  * 1. Validate magic and version
  * 2. Read our mailbox offset and size from descriptor table
@@ -173,42 +147,58 @@ static int qmp_open(struct udevice *dev, struct qcom_aoss_qmp_priv *priv)
 
 	/* Set local core's link state to UP */
 	writel(QMP_STATE_UP, priv->msgram + QMP_DESC_MCORE_LINK_STATE);
-	qmp_kick(priv);
-
-	ret = qmp_poll_timeout(dev, "link ack", pred_eq,
-			       priv->msgram,
-			       QMP_DESC_MCORE_LINK_STATE_ACK,
-			       QMP_STATE_UP,
-			       QMP_HANDSHAKE_TIMEOUT_MS,
-			       QMP_HANDSHAKE_POLL_MS);
-	if (ret)
+	ret = qmp_kick(priv);
+	if (ret) {
+		dev_err(dev, "qcom-aoss-qmp: link kick failed ret=%d\n", ret);
 		goto timeout_close_link;
+	}
+
+	ret = wait_event_timeout(NULL,
+		readl(priv->msgram + QMP_DESC_MCORE_LINK_STATE_ACK) ==
+			QMP_STATE_UP,
+		QMP_HANDSHAKE_TIMEOUT_MS);
+	if (!ret) {
+		dev_err(dev, "qcom-aoss-qmp: link ack timeout after %u ms\n",
+			QMP_HANDSHAKE_TIMEOUT_MS);
+		goto timeout_close_link;
+	}
 
 	/* Step 4: channel handshake */
 	writel(QMP_STATE_UP, priv->msgram + QMP_DESC_MCORE_CH_STATE);
-	qmp_kick(priv);
-
-	ret = qmp_poll_timeout(dev, "ucore channel up", pred_eq,
-			       priv->msgram,
-			       QMP_DESC_UCORE_CH_STATE,
-			       QMP_STATE_UP,
-			       QMP_HANDSHAKE_TIMEOUT_MS,
-			       QMP_HANDSHAKE_POLL_MS);
-	if (ret)
+	ret = qmp_kick(priv);
+	if (ret) {
+		dev_err(dev, "qcom-aoss-qmp: channel kick failed ret=%d\n", ret);
 		goto timeout_close_channel;
+	}
+
+	ret = wait_event_timeout(NULL,
+		readl(priv->msgram + QMP_DESC_UCORE_CH_STATE) == QMP_STATE_UP,
+		QMP_HANDSHAKE_TIMEOUT_MS);
+	if (!ret) {
+		dev_err(dev, "qcom-aoss-qmp: ucore channel up timeout after %u ms\n",
+			QMP_HANDSHAKE_TIMEOUT_MS);
+		goto timeout_close_channel;
+	}
 
 	/* Ack remote core's channel state */
 	writel(QMP_STATE_UP, priv->msgram + QMP_DESC_UCORE_CH_STATE_ACK);
-	qmp_kick(priv);
+	ret = qmp_kick(priv);
+	if (ret) {
+		dev_err(dev, "qcom-aoss-qmp: channel ack kick failed ret=%d\n", ret);
+		goto timeout_close_channel;
+	}
 
-	ret = qmp_poll_timeout(dev, "channel ack", pred_eq,
-			       priv->msgram,
-			       QMP_DESC_MCORE_CH_STATE_ACK,
-			       QMP_STATE_UP,
-			       QMP_HANDSHAKE_TIMEOUT_MS,
-			       QMP_HANDSHAKE_POLL_MS);
-	if (!ret)
-		return 0;
+	ret = wait_event_timeout(NULL,
+		readl(priv->msgram + QMP_DESC_MCORE_CH_STATE_ACK) ==
+			QMP_STATE_UP,
+		QMP_HANDSHAKE_TIMEOUT_MS);
+	if (!ret) {
+		dev_err(dev, "qcom-aoss-qmp: channel ack timeout after %u ms\n",
+			QMP_HANDSHAKE_TIMEOUT_MS);
+		goto timeout_close_channel;
+	}
+
+	return 0;
 
 timeout_close_channel:
 	writel(QMP_STATE_DOWN, priv->msgram + QMP_DESC_MCORE_CH_STATE);
@@ -217,11 +207,11 @@ timeout_close_link:
 	writel(QMP_STATE_DOWN, priv->msgram + QMP_DESC_MCORE_LINK_STATE);
 	qmp_kick(priv);
 
-	return ret;
+	return -ETIMEDOUT;
 }
 
 /*
- * qmp_close() — Linux-equivalent shutdown.
+ * qmp_close() — shutdown (same on-wire sequence as Linux).
  * Writes DOWN to our channel and link states, kicks AOP.
  */
 static void qmp_close(struct qcom_aoss_qmp_priv *priv)
@@ -232,14 +222,14 @@ static void qmp_close(struct qcom_aoss_qmp_priv *priv)
 }
 
 /*
- * qmp_send() — Linux-equivalent message transmission.
+ * qmp_send() — message transmission (same on-wire sequence as Linux).
  *
  * 1. Format message into 64-byte buffer (zero-padded)
  * 2. Write body word-by-word at msgram + mbox_offset + sizeof(u32)
  * 3. Write length (always 64) at msgram + mbox_offset
  * 4. Read back the length to flush (acts as barrier)
  * 5. Kick IPCC
- * 6. Poll for AOP to clear the length field (ack)
+ * 6. wait_event_timeout() for AOP to clear the length field (ack)
  */
 int qcom_aoss_qmp_send(struct udevice *dev, const char *fmt, ...)
 {
@@ -282,16 +272,23 @@ int qcom_aoss_qmp_send(struct udevice *dev, const char *fmt, ...)
 	readl(priv->msgram + priv->mbox_offset);
 
 	/* Kick IPCC to wake AOP */
-	qmp_kick(priv);
-
-	/* Wait for AOP to acknowledge by clearing the length field */
-	ret = qmp_poll_timeout(dev, "reply", pred_zero,
-			       priv->msgram, priv->mbox_offset, 0,
-			       QMP_REPLY_TIMEOUT_MS, QMP_REPLY_POLL_MS);
+	ret = qmp_kick(priv);
 	if (ret) {
-		/* Clear message from buffer so channel is ready for reuse */
+		dev_err(dev, "qcom-aoss-qmp: send kick failed ret=%d\n", ret);
 		writel(0, priv->msgram + priv->mbox_offset);
 		return ret;
+	}
+
+	/* Wait for AOP to acknowledge by clearing the length field */
+	ret = wait_event_timeout(NULL,
+		readl(priv->msgram + priv->mbox_offset) == 0,
+		QMP_REPLY_TIMEOUT_MS);
+	if (!ret) {
+		dev_err(dev, "qcom-aoss-qmp: reply timeout after %u ms\n",
+			QMP_REPLY_TIMEOUT_MS);
+		/* Clear message from buffer so channel is ready for reuse */
+		writel(0, priv->msgram + priv->mbox_offset);
+		return -ETIMEDOUT;
 	}
 
 	return 0;
@@ -349,7 +346,7 @@ static int qcom_aoss_qmp_probe(struct udevice *dev)
 	dev_dbg(dev, "qcom-aoss-qmp: IPCC mbox chan id=%08lx\n",
 		priv->mbox_chan.id);
 
-	/* Full Linux-style link+channel handshake */
+	/* Link+channel handshake (same on-wire sequence as Linux) */
 	ret = qmp_open(dev, priv);
 	if (ret) {
 		dev_err(dev, "qcom-aoss-qmp: handshake failed ret=%d\n", ret);

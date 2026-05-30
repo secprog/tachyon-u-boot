@@ -154,7 +154,7 @@ struct qpg {
 static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 {
 	struct ofnode_phandle_args args;
-	struct mbox_ops *ops;
+	const struct mbox_ops *ops;
 	struct udevice *ipcc_dev;
 	int ret;
 
@@ -179,7 +179,7 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 		return ret;
 	}
 
-	ops = (struct mbox_ops *)ipcc_dev->driver->ops;
+	const struct mbox_ops *ops = ipcc_dev->driver->ops;
 	chan->dev = ipcc_dev;
 	chan->con_priv = NULL;
 
