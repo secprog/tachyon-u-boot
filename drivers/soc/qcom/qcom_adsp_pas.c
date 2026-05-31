@@ -233,25 +233,23 @@ static int qpas_enable_power_domains(struct udevice *dev,
 			goto err_off;
 		}
 
-		ret = power_domain_on(&pds->pd[i]);
-		log_warning("qcom-adsp-pas: power_domain_on index=%d id=%lu ret=%d\n",
-			    i, pds->pd[i].id, ret);
-		if (ret)
-			goto err_off;
-
 		/*
-		 * Vote maximum performance state for proxy power domains
-		 * (LCX, LMX).  Linux uses dev_pm_genpd_set_performance_state
-		 * with INT_MAX; we call power_domain_set_performance_state()
-		 * with UINT_MAX.  The qcom-rpmhpd driver maps this to the
-		 * highest corner.  If the provider doesn't support the op,
-		 * -ENOSYS is silently ignored.
+		 * Linux sets INT_MAX performance state before
+		 * pm_runtime_get_sync() for proxy PDs (LCX, LMX).
+		 * Do the same here: vote max corner first, then
+		 * enable the domain.  -ENOSYS is silently ignored.
 		 */
 		ret = power_domain_set_performance_state(&pds->pd[i],
 							 (unsigned int)-1);
 		if (ret && ret != -ENOSYS)
 			log_warning("qcom-adsp-pas: perf_state index=%d ret=%d\n",
 				    i, ret);
+
+		ret = power_domain_on(&pds->pd[i]);
+		log_warning("qcom-adsp-pas: power_domain_on index=%d id=%lu ret=%d\n",
+			    i, pds->pd[i].id, ret);
+		if (ret)
+			goto err_off;
 
 		pds->enabled++;
 	}
@@ -261,6 +259,7 @@ static int qpas_enable_power_domains(struct udevice *dev,
 err_off:
 	while (pds->enabled > 0) {
 		pds->enabled--;
+		power_domain_set_performance_state(&pds->pd[pds->enabled], 0);
 		power_domain_off(&pds->pd[pds->enabled]);
 	}
 
@@ -273,6 +272,7 @@ static void qpas_disable_power_domains(struct qpas_power_domains *pds)
 
 	while (pds->enabled > 0) {
 		pds->enabled--;
+		power_domain_set_performance_state(&pds->pd[pds->enabled], 0);
 		ret = power_domain_off(&pds->pd[pds->enabled]);
 		log_warning("qcom-adsp-pas: power_domain_off index=%d id=%lu ret=%d\n",
 			    pds->enabled, pds->pd[pds->enabled].id, ret);

@@ -103,7 +103,9 @@ static int rpmhpd_send_corner(struct rpmhpd *pd, enum rpmh_state state,
 static int rpmhpd_power_on(struct power_domain *pd)
 {
 	const struct rpmhpd_desc *desc;
+	unsigned int enable_corner;
 	struct rpmhpd *curr;
+	unsigned int corner;
 	int ret;
 
 	desc = (const struct rpmhpd_desc *)dev_get_driver_data(pd->dev);
@@ -119,10 +121,15 @@ static int rpmhpd_power_on(struct power_domain *pd)
 		return 0;
 	}
 
-	ret = rpmhpd_send_corner(curr, RPMH_ACTIVE_ONLY_STATE,
-				 curr->enable_corner);
-	log_warning("qcom-rpmhpd: power_on id=%ld res=%s corner=%u ret=%d\n",
-		    pd->id, curr->res_name, curr->enable_corner, ret);
+	enable_corner = curr->enable_corner;
+	if (enable_corner >= curr->level_count)
+		return -EINVAL;
+
+	corner = curr->level[enable_corner];
+
+	ret = rpmhpd_send_corner(curr, RPMH_ACTIVE_ONLY_STATE, corner);
+	log_warning("qcom-rpmhpd: power_on id=%ld res=%s enable_idx=%u corner=%u ret=%d\n",
+		    pd->id, curr->res_name, enable_corner, corner, ret);
 	if (!ret)
 		curr->enabled = true;
 
@@ -160,6 +167,7 @@ static int rpmhpd_set_performance_state(struct power_domain *pd,
 {
 	const struct rpmhpd_desc *desc;
 	struct rpmhpd *curr;
+	unsigned int corner;
 	int ret;
 
 	desc = (const struct rpmhpd_desc *)dev_get_driver_data(pd->dev);
@@ -175,15 +183,22 @@ static int rpmhpd_set_performance_state(struct power_domain *pd,
 		return -ENODEV;
 	}
 
-	/* Map INT_MAX to the maximum corner (Linux convention) */
-	if (state == (unsigned int)-1 && curr->level_count)
+	if (!curr->level_count)
+		return -EINVAL;
+
+	/* Map INT_MAX / UINT_MAX to the maximum corner */
+	if (state == (unsigned int)-1)
 		state = curr->level_count - 1;
 
-	ret = rpmhpd_send_corner(curr, RPMH_ACTIVE_ONLY_STATE, state);
+	if (state >= curr->level_count)
+		return -EINVAL;
+
+	corner = curr->level[state];
+
+	ret = rpmhpd_send_corner(curr, RPMH_ACTIVE_ONLY_STATE, corner);
 
 	log_warning("qcom-rpmhpd: set_perf_state id=%ld res=%s state=%u corner=%u ret=%d\n",
-		    pd->id, curr->res_name, state,
-		    state < curr->level_count ? curr->level[state] : 0, ret);
+		    pd->id, curr->res_name, state, corner, ret);
 
 	return ret;
 }
