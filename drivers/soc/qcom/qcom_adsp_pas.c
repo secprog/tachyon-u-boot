@@ -219,6 +219,14 @@ static int qpas_enable_power_domains(struct udevice *dev,
 		if (ret)
 			goto err_off;
 
+		/*
+		 * Linux votes maximum performance state for proxy power
+		 * domains (LCX, LMX) via dev_pm_genpd_set_performance_state()
+		 * with INT_MAX.  U-Boot's power-domain API does not expose a
+		 * performance-state call; the RPMhPD .on() path is our best
+		 * effort.
+		 */
+
 		pds->enabled++;
 	}
 
@@ -1306,19 +1314,24 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
 
 	if (dev) {
-		ret = qpas_enable_clocks(dev);
-		if (ret)
-			return ret;
-	} else {
-		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
-	}
-
-	if (dev) {
 		ret = qpas_enable_power_domains(dev, &pds);
 		if (ret)
 			return ret;
 	} else {
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
+	}
+
+	/*
+	 * Linux order: power domains first, then clocks.
+	 * The RPMh power-domain driver needs the PD active before clocks
+	 * can be voted on the same rail.
+	 */
+	if (dev) {
+		ret = qpas_enable_clocks(dev);
+		if (ret)
+			goto out_power_domains;
+	} else {
+		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
 	}
 
 	ret = qpas_get_memory_region(node, &mem_phys, &mem_size, &mem_region);
@@ -1349,17 +1362,6 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 */
 	log_warning("qcom-adsp-pas: re-enabling cacheable mapping for ADSP region\n");
 	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_DEFAULT_OPTION);
-
-	/*
-	 * Shut down any stale ADSP state left by ABL before loading
-	 * firmware. This ensures clean power/cache/SMMU state even if
-	 * the DSP wasn't fully booted by the previous stage.
-	 */
-	log_warning("qcom-adsp-pas: pre-boot shutdown pas_id=%u\n",
-		    QCOM_ADSP_PAS_ID);
-	qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-	mdelay(100);
-	log_warning("qcom-adsp-pas: pre-boot shutdown complete\n");
 
 	ret = qpas_read_firmware(&fw, fw_name);
 	if (ret)
@@ -1395,25 +1397,25 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	/*
 	 * QMP load_state on (Linux qcom_q6v5_prepare) — tells AOSS DSP is
-	 * starting. Look up the QMP device via the remoteproc node's
-	 * qcom,qmp = <&aoss_qmp>; phandle (matches Linux's qmp_get(&pdev->dev)).
-	 * Linux does NOT assert the SMP2P "stop" bit during boot; the stop
-	 * bit is used only in qcom_q6v5_request_stop() for shutdown.
+	 * starting. On SC7280/QCM6490, the DT has qcom,qmp; failure to
+	 * resolve or probe it is fatal (unlike some SoCs where QMP may be
+	 * genuinely absent).
 	 */
 	{
 		struct udevice *qmp_dev;
 
 		ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
 		if (ret) {
-			log_warning("qcom-adsp-pas: QMP phandle lookup failed ret=%d\n",
+			log_warning("qcom-adsp-pas: QMP phandle lookup failed ret=%d (fatal)\n",
 				    ret);
-		} else {
-			ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
-			if (ret) {
-				log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
-					    ret);
-				goto out_free_metadata;
-			}
+			goto out_free_metadata;
+		}
+
+		ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
+		if (ret) {
+			log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
+				    ret);
+			goto out_free_metadata;
 		}
 	}
 

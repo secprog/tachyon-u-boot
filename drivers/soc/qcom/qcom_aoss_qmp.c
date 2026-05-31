@@ -139,12 +139,6 @@ static int qmp_open(struct udevice *dev, struct qcom_aoss_qmp_priv *priv)
 		return -EINVAL;
 	}
 
-	if (priv->mbox_offset + priv->mbox_size > 0x400) {
-		dev_err(dev, "qcom-aoss-qmp: mailbox beyond MSGRAM (off=%x size=%x)\n",
-			priv->mbox_offset, priv->mbox_size);
-		return -EINVAL;
-	}
-
 	/* Step 3: link handshake */
 	/* Ack remote core's link state */
 	val = readl(priv->msgram + QMP_DESC_UCORE_LINK_STATE);

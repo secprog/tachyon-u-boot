@@ -891,20 +891,16 @@ static int qpg_service_pmic_open(struct qpg *pg)
 	return 0;
 }
 
-static int qpg_drain_until(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
+static int qpg_drain_until(struct qpg *pg,
+			   struct qcom_pmic_glink_altmode *altmode,
 			   bool (*done)(struct qpg *,
 					struct qcom_pmic_glink_altmode *),
 			   u32 timeout_ms)
 {
 	u32 i;
-	int ret;
 
 	for (i = 0; i < timeout_ms; i++) {
 		while (qpg_poll(pg, altmode) == 0) {
-			ret = qpg_service_pmic_open(pg);
-			if (ret)
-				return ret;
-
 			if (done(pg, altmode))
 				return 0;
 		}
@@ -924,13 +920,17 @@ static bool qpg_done_version(struct qpg *pg,
 	return pg->version_acked;
 }
 
+static bool qpg_done_remote_opened(struct qpg *pg,
+				  struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->remote_opened;
+}
+
 static bool qpg_done_open(struct qpg *pg,
 			  struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->local_open_sent &&
-	       pg->open_acked &&
-	       pg->remote_opened &&
-	       pg->remote_open_acked;
+	       pg->open_acked;
 }
 
 static bool qpg_done_riid(struct qpg *pg,
@@ -1126,16 +1126,32 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
-	ret = qpg_send_open(&pg);
-	log_warning("pmic-glink: send OPEN ret=%d lcid=%u\n", ret, pg.lcid);
+	/*
+	 * Linux-aligned channel open (two-phase):
+	 * 1. Wait for remote (ADSP) to advertise PMIC_RTR_ADSP_APPS via
+	 *    GLINK_CMD_OPEN.
+	 * 2. Once seen, send OPEN_ACK + local OPEN in a single servicing
+	 *    step.
+	 * 3. Wait for local OPEN_ACK from the remote.
+	 *
+	 * We never send local OPEN before the remote has advertised the
+	 * channel.
+	 */
+	ret = qpg_drain_until(&pg, altmode, qpg_done_remote_opened, 2000);
+	log_warning("pmic-glink: wait remote OPEN ret=%d remote_opened=%d rcid=%u\n",
+		    ret, pg.remote_opened, pg.rcid);
 	if (ret)
 		return ret;
-	pg.local_open_sent = true;
 
-	ret = qpg_drain_until(&pg, altmode, qpg_done_open, 1000);
-	log_warning("pmic-glink: wait OPEN ret=%d local_sent=%d open_acked=%d remote_opened=%d remote_acked=%d rcid=%u\n",
-		    ret, pg.local_open_sent, pg.open_acked, pg.remote_opened,
-		    pg.remote_open_acked, pg.rcid);
+	ret = qpg_service_pmic_open(&pg);
+	log_warning("pmic-glink: service PMIC OPEN ret=%d local_sent=%d remote_acked=%d\n",
+		    ret, pg.local_open_sent, pg.remote_open_acked);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(&pg, altmode, qpg_done_open, 2000);
+	log_warning("pmic-glink: wait local OPEN_ACK ret=%d open_acked=%d\n",
+		    ret, pg.open_acked);
 	if (ret)
 		return ret;
 
