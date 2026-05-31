@@ -83,6 +83,15 @@ DECLARE_GLOBAL_DATA_PTR;
  */
 #define QCOM_ADSP_SKIP_BOOT			0
 
+/*
+ * TEST: idle survival ladder — leave ADSP running for N ms after
+ * auth_and_reset, then shutdown.  No SMP2P, no GLINK, no PMIC-RTR.
+ * 0 = immediate shutdown (baseline).  Increase to find crash threshold:
+ *   10, 50, 100, 250, 500, 1000.
+ * Set to -1 to restore normal SMP2P wait path.
+ */
+#define QCOM_ADSP_IDLE_SURVIVAL_MS		10
+
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -1457,29 +1466,37 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_metadata;
 
 	/*
-	 * Test 1 — immediate PAS shutdown, no SMP2P/SMEM access.
-	 * If the board resets before "immediate shutdown ret", ADSP
-	 * execution itself causes the reset.  If it survives to print
-	 * the ret value, then leaving ADSP running (or SMP2P/ready
-	 * path) is the trigger.
+	 * Timed idle survival test: leave ADSP running for
+	 * QCOM_ADSP_IDLE_SURVIVAL_MS with no SMP2P access.
+	 * - Value 0 = immediate shutdown (baseline, confirmed survives)
+	 * - Value -1 = restore normal SMP2P-ready path
+	 * - Any positive N ms = idle N ms then shutdown
 	 */
-	log_warning("qcom-adsp-pas: ADSP released, immediate shutdown test begin\n");
-	ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-	log_warning("qcom-adsp-pas: ADSP immediate shutdown ret=%d\n", ret);
-	return -ENODEV;
+	if (QCOM_ADSP_IDLE_SURVIVAL_MS == -1) {
+		/* Step 6: wait SMP2P ready */
+		log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
+		ret = qpas_wait_for_start(node);
+		if (ret) {
+			qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+			goto out_free_metadata;
+		}
 
-	/* Step 6: wait SMP2P ready */
-	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
-	ret = qpas_wait_for_start(node);
-	if (ret) {
-		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		goto out_free_metadata;
+		qpas_booted = true;
+		log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
+			    (unsigned long long)reloc_base);
+	} else {
+		if (QCOM_ADSP_IDLE_SURVIVAL_MS)
+			log_warning("qcom-adsp-pas: ADSP released, %dms idle begin\n",
+				    QCOM_ADSP_IDLE_SURVIVAL_MS);
+		if (QCOM_ADSP_IDLE_SURVIVAL_MS)
+			mdelay(QCOM_ADSP_IDLE_SURVIVAL_MS);
+		log_warning("qcom-adsp-pas: ADSP %s, shutdown begin\n",
+			    QCOM_ADSP_IDLE_SURVIVAL_MS ? "survived" : "released");
+		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		log_warning("qcom-adsp-pas: ADSP shutdown after %dms ret=%d\n",
+			    QCOM_ADSP_IDLE_SURVIVAL_MS, ret);
+		return -ENODEV;
 	}
-
-	qpas_booted = true;
-	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
-		    (unsigned long long)reloc_base);
-
 out_free_metadata:
 	free(metadata_ctx);
 out_free_fw:
