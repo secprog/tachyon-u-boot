@@ -83,15 +83,6 @@ DECLARE_GLOBAL_DATA_PTR;
  */
 #define QCOM_ADSP_SKIP_BOOT			0
 
-/*
- * TEST: idle survival ladder — leave ADSP running for N ms after
- * auth_and_reset, then shutdown.  No SMP2P, no GLINK, no PMIC-RTR.
- * 0 = immediate shutdown (baseline).  Increase to find crash threshold:
- *   10, 50, 100, 250, 500, 1000.
- * Set to -1 to restore normal SMP2P wait path.
- */
-#define QCOM_ADSP_IDLE_SURVIVAL_MS		1000
-
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -148,6 +139,9 @@ struct qpas_smp2p_info {
 	bool stop_bit_valid;
 	u32 fatal_bit;
 	u32 ready_bit;
+	u32 handover_bit;
+	u32 stop_ack_bit;
+	u32 shutdown_ack_bit;
 	char entry_name[QPAS_SMP2P_MAX_ENTRY_NAME];
 };
 
@@ -316,6 +310,9 @@ static int qpas_find_smp2p_irq_bits(ofnode node, struct qpas_smp2p_info *info)
 
 	info->fatal_bit = U32_MAX;
 	info->ready_bit = U32_MAX;
+	info->handover_bit = U32_MAX;
+	info->stop_ack_bit = U32_MAX;
+	info->shutdown_ack_bit = U32_MAX;
 
 	for (i = 0; i < count; i++) {
 		ret = ofnode_read_string_index(node, "interrupt-names", i,
@@ -323,7 +320,9 @@ static int qpas_find_smp2p_irq_bits(ofnode node, struct qpas_smp2p_info *info)
 		if (ret)
 			return ret;
 
-		if (strcmp(name, "fatal") && strcmp(name, "ready"))
+		if (strcmp(name, "fatal") && strcmp(name, "ready") &&
+		    strcmp(name, "handover") && strcmp(name, "stop-ack") &&
+		    strcmp(name, "shutdown-ack"))
 			continue;
 
 		ret = ofnode_parse_phandle_with_args(node,
@@ -341,8 +340,14 @@ static int qpas_find_smp2p_irq_bits(ofnode node, struct qpas_smp2p_info *info)
 
 		if (!strcmp(name, "fatal"))
 			info->fatal_bit = args.args[0];
-		else
+		else if (!strcmp(name, "ready"))
 			info->ready_bit = args.args[0];
+		else if (!strcmp(name, "handover"))
+			info->handover_bit = args.args[0];
+		else if (!strcmp(name, "stop-ack"))
+			info->stop_ack_bit = args.args[0];
+		else
+			info->shutdown_ack_bit = args.args[0];
 	}
 
 	if (info->fatal_bit == U32_MAX || info->ready_bit == U32_MAX)
@@ -398,10 +403,12 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 			if (ret)
 				return ret;
 
-			log_warning("qcom-adsp-pas: SMP2P remote_pid=%u inbound_item=%u entry='%s' fatal_bit=%u ready_bit=%u\n",
+			log_warning("qcom-adsp-pas: SMP2P remote_pid=%u item=%u entry='%s' fatal=%u ready=%u handover=%u stop_ack=%u shutdown_ack=%u\n",
 				    info->remote_pid, info->inbound_item,
 				    info->entry_name, info->fatal_bit,
-				    info->ready_bit);
+				    info->ready_bit, info->handover_bit,
+				    info->stop_ack_bit,
+				    info->shutdown_ack_bit);
 			return 0;
 		}
 	}
@@ -588,15 +595,29 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 	return 0;
 }
 
-static int qpas_wait_for_start(ofnode node)
+/*
+ * qpas_wait_for_start() — poll ADSP SMP2P state every 20 ms.
+ *
+ * Mirrors Linux's Q6V5 IRQ-driven wait: watches fatal, ready, handover,
+ * stop-ack, and shutdown-ack bits.  On handover (Linux qcom_pas_handover),
+ * releases proxy clocks and power domains and continues waiting for ready.
+ * On fatal, shuts down ADSP via PAS.
+ *
+ * @node:     remoteproc DT node
+ * @clks:     proxy clocks to release on handover (may be NULL)
+ * @pds:      proxy power domains to release on handover (may be NULL)
+ * @return:   0 on ready, -EIO on fatal, -ETIMEDOUT on timeout
+ */
+static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
+			       struct qpas_power_domains *pds)
 {
 	struct qpas_smp2p_info info = {};
 	struct udevice *smem;
 	ulong start;
-	u32 last_value = U32_MAX;
 	u32 value;
+	bool handover_seen = false;
 	bool pending_logged = false;
-	ulong last_heartbeat = 0;
+	ulong last_trace = 0;
 	int ret;
 
 	ret = qpas_find_smp2p(node, &info);
@@ -623,7 +644,7 @@ static int qpas_wait_for_start(ofnode node)
 					    info.entry_name, get_timer(start));
 				pending_logged = true;
 			}
-			mdelay(10);
+			mdelay(20);
 			continue;
 		}
 		if (ret) {
@@ -631,35 +652,57 @@ static int qpas_wait_for_start(ofnode node)
 			return ret;
 		}
 
-		if (value != last_value) {
-			log_warning("qcom-adsp-pas: SMP2P entry '%s' value=%08x\n",
-				    info.entry_name, value);
-			last_value = value;
+		/* Trace all bits every 20ms once the entry is readable */
+		if (get_timer(last_trace) >= 20 || !last_trace) {
+			log_warning("qcom-adsp-pas: t=%lu smp2p=%08x fatal=%d ready=%d handover=%d stop=%d shutdown=%d\n",
+				    get_timer(start), value,
+				    !!(value & BIT(info.fatal_bit)),
+				    !!(value & BIT(info.ready_bit)),
+				    info.handover_bit != U32_MAX ?
+					    !!(value & BIT(info.handover_bit)) : -1,
+				    info.stop_ack_bit != U32_MAX ?
+					    !!(value & BIT(info.stop_ack_bit)) : -1,
+				    info.shutdown_ack_bit != U32_MAX ?
+					    !!(value & BIT(info.shutdown_ack_bit)) : -1);
+			last_trace = get_timer(0);
 		}
 
+		/* Fatal: ADSP crashed — shutdown and report */
 		if (value & BIT(info.fatal_bit)) {
-			log_warning("qcom-adsp-pas: ADSP fatal asserted value=%08x bit=%u\n",
-				    value, info.fatal_bit);
+			log_warning("qcom-adsp-pas: ADSP fatal at %lu ms value=%08x\n",
+				    get_timer(start), value);
+			qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
 			return -EIO;
 		}
 
+		/*
+		 * Handover: ADSP has taken ownership of proxy resources.
+		 * Linux qcom_pas_handover() releases XO/aggre2 clocks and
+		 * drops proxy PD votes.  Do the same here, once.
+		 */
+		if (!handover_seen && info.handover_bit != U32_MAX &&
+		    (value & BIT(info.handover_bit))) {
+			log_warning("qcom-adsp-pas: ADSP handover at %lu ms, releasing proxy resources\n",
+				    get_timer(start));
+			handover_seen = true;
+			if (clks)
+				qpas_disable_clocks(clks);
+			if (pds)
+				qpas_disable_power_domains(pds);
+		}
+
+		/* Ready: ADSP booted successfully */
 		if (value & BIT(info.ready_bit)) {
-			log_warning("qcom-adsp-pas: ADSP ready asserted value=%08x bit=%u (elapsed=%lu ms)\n",
-				    value, info.ready_bit, get_timer(start));
+			log_warning("qcom-adsp-pas: ADSP ready at %lu ms value=%08x\n",
+				    get_timer(start), value);
 			return 0;
 		}
 
-		/* Periodic heartbeat to track how long board survives */
-		if (get_timer(last_heartbeat) >= 500) {
-			log_warning("qcom-adsp-pas: SMP2P heartbeat elapsed=%lu ms value=%08x\n",
-				    get_timer(start), value);
-			last_heartbeat = get_timer(0);
-		}
-
-		mdelay(10);
+		mdelay(20);
 	} while (get_timer(start) < QCOM_ADSP_START_TIMEOUT_MS);
 
-	log_warning("qcom-adsp-pas: ADSP SMP2P ready timeout\n");
+	log_warning("qcom-adsp-pas: ADSP SMP2P ready timeout after %lu ms\n",
+		    get_timer(start));
 	return -ETIMEDOUT;
 }
 
@@ -1465,38 +1508,18 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-	/*
-	 * Timed idle survival test: leave ADSP running for
-	 * QCOM_ADSP_IDLE_SURVIVAL_MS with no SMP2P access.
-	 * - Value 0 = immediate shutdown (baseline, confirmed survives)
-	 * - Value -1 = restore normal SMP2P-ready path
-	 * - Any positive N ms = idle N ms then shutdown
-	 */
-	if (QCOM_ADSP_IDLE_SURVIVAL_MS == -1) {
-		/* Step 6: wait SMP2P ready */
-		log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
-		ret = qpas_wait_for_start(node);
-		if (ret) {
-			qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-			goto out_free_metadata;
-		}
-
-		qpas_booted = true;
-		log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
-			    (unsigned long long)reloc_base);
-	} else {
-		if (QCOM_ADSP_IDLE_SURVIVAL_MS)
-			log_warning("qcom-adsp-pas: ADSP released, %dms idle begin\n",
-				    QCOM_ADSP_IDLE_SURVIVAL_MS);
-		if (QCOM_ADSP_IDLE_SURVIVAL_MS)
-			mdelay(QCOM_ADSP_IDLE_SURVIVAL_MS);
-		log_warning("qcom-adsp-pas: ADSP %s, shutdown begin\n",
-			    QCOM_ADSP_IDLE_SURVIVAL_MS ? "survived" : "released");
-		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		log_warning("qcom-adsp-pas: ADSP shutdown after %dms ret=%d\n",
-			    QCOM_ADSP_IDLE_SURVIVAL_MS, ret);
-		return -ENODEV;
+	/* Step 6: poll SMP2P for ready/fatal/handover */
+	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
+	ret = qpas_wait_for_start(node, &clks, &pds);
+	if (ret) {
+		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		goto out_free_metadata;
 	}
+
+	qpas_booted = true;
+	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
+		    (unsigned long long)reloc_base);
+
 out_free_metadata:
 	free(metadata_ctx);
 out_free_fw:
