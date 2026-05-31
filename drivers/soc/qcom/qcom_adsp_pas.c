@@ -123,6 +123,12 @@ struct qpas_power_domains {
 	int enabled;
 };
 
+struct qpas_clocks {
+	struct clk_bulk bulk;
+	bool valid;
+	bool enabled;
+};
+
 struct qpas_smp2p_info {
 	ofnode node;
 	ofnode inbound;
@@ -154,31 +160,36 @@ struct qpas_smp2p_smem_item {
 
 static bool qpas_booted;
 
-static int qpas_enable_clocks(struct udevice *dev)
+static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
 {
-	struct clk_bulk clocks;
 	int ret;
 
-	ret = clk_get_bulk(dev, &clocks);
+	ret = clk_get_bulk(dev, &clks->bulk);
 	if (ret) {
 		log_warning("qcom-adsp-pas: clk_get_bulk ret=%d; XO may be unmanaged in U-Boot\n",
 			    ret);
-		/* Return success — no clocks to manage */
+		/* Return success — no clocks to manage for this DT */
 		return 0;
 	}
 
-	ret = clk_enable_bulk(&clocks);
+	clks->valid = true;
+
+	ret = clk_enable_bulk(&clks->bulk);
 	log_warning("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
-		    ret, clocks.count);
-	/*
-	 * Note: we don't save the clk_bulk handle for later disable
-	 * because clk_get_bulk allocates internally; U-Boot's clk API
-	 * makes it impractical to stash for unwind.  On failure paths
-	 * we rely on PD-off to also drop clock votes through RPMh.
-	 * TODO: if U-Boot gains clk_disable_bulk with a saved handle,
-	 * add explicit clock-disable unwind here.
-	 */
-	return ret;
+		    ret, clks->bulk.count);
+	if (ret)
+		return ret;
+
+	clks->enabled = true;
+	return 0;
+}
+
+static void qpas_disable_clocks(struct qpas_clocks *clks)
+{
+	if (clks->enabled)
+		clk_disable_bulk(&clks->bulk);
+	if (clks->valid)
+		clk_release_bulk(&clks->bulk);
 }
 
 static int qpas_enable_power_domains(struct udevice *dev,
@@ -1308,8 +1319,10 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 {
 	struct qpas_power_domains pds = {};
+	struct qpas_clocks clks = {};
 	struct udevice *qmp_dev;
 	struct qpas_fw fw = {};
+	bool qmp_on = false;
 	const char *fw_name;
 	phys_addr_t mem_phys;
 	phys_addr_t reloc_base;
@@ -1356,6 +1369,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 			    ret);
 		return ret;
 	}
+	qmp_on = true;
 
 	/* Step 2: proxy power domains on */
 	if (dev) {
@@ -1368,7 +1382,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	/* Step 3: clocks on (XO, aggre2) */
 	if (dev) {
-		ret = qpas_enable_clocks(dev);
+		ret = qpas_enable_clocks(dev, &clks);
 		if (ret)
 			goto out_power_domains;
 	} else {
@@ -1463,11 +1477,14 @@ out_free_fw:
 	free(fw.data);
 out_unmap:
 	unmap_sysmem(mem_region);
+out_clocks:
+	if (ret)
+		qpas_disable_clocks(&clks);
 out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
 out_qmp_off:
-	if (ret)
+	if (ret && qmp_on)
 		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 	return ret;
 }
