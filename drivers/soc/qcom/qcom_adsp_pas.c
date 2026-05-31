@@ -438,9 +438,15 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 	u32 magic;
 	int i;
 
-	log_warning("qcom-adsp-pas: smem_get begin remote_pid=%u item=%u\n",
-		    info->remote_pid, info->inbound_item);
-	item = smem_get(smem, info->remote_pid, info->inbound_item, &size);
+	/*
+	 * SMP2P items are in the global SMEM heap (not per-processor
+	 * partitions), so use host=0 (SMEM_HOST_APPS) to bypass the
+	 * ADSP-private partition search that returns -ENOENT for
+	 * host=2.  This matches what Linux does with SMEM_HOST_ANY.
+	 */
+	log_warning("qcom-adsp-pas: smem_get begin item=%u\n",
+		    info->inbound_item);
+	item = smem_get(smem, 0, info->inbound_item, &size);
 	log_warning("qcom-adsp-pas: smem_get done item=%p size=%zu\n",
 		    item, size);
 	if (IS_ERR_OR_NULL(item))
