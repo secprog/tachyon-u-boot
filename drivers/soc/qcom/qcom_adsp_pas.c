@@ -1456,6 +1456,11 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
+	log_warning("qcom-adsp-pas: ADSP released, pre-idle\n");
+	mdelay(1000);
+	log_warning("qcom-adsp-pas: ADSP survived 1000ms before SMP2P poll\n");
+	return -ENODEV;
+
 	/* Step 6: wait SMP2P ready */
 	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
 	ret = qpas_wait_for_start(node);
