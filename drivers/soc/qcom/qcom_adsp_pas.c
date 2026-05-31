@@ -1456,9 +1456,51 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-	log_warning("qcom-adsp-pas: ADSP released, pre-idle\n");
-	mdelay(1000);
-	log_warning("qcom-adsp-pas: ADSP survived 1000ms before SMP2P poll\n");
+	/*
+	 * Diagnostic idle test: poll SMP2P for fatal/wdog/watchdog bits
+	 * during the post-auth idle period.  This mirrors Linux's
+	 * qcom_q6v5 fatal/wdog IRQ handlers which read the remote crash
+	 * reason from SMEM.
+	 */
+	{
+		struct qpas_smp2p_info info = {};
+		struct udevice *smem;
+		ulong start;
+		u32 value;
+		bool entry_found = false;
+		int rd;
+
+		rd = qpas_find_smp2p(node, &info);
+		if (!rd) {
+			rd = uclass_first_device_err(UCLASS_SMEM, &smem);
+			if (!rd) {
+				entry_found = true;
+				log_warning("qcom-adsp-pas: diag remote_pid=%u item=%u entry='%s' fatal=%u ready=%u\n",
+					    info.remote_pid, info.inbound_item,
+					    info.entry_name, info.fatal_bit,
+					    info.ready_bit);
+			}
+		}
+
+		start = get_timer(0);
+		do {
+			if (entry_found) {
+				rd = qpas_smp2p_read_entry(smem, &info, &value);
+				if (!rd) {
+					log_warning("qcom-adsp-pas: diag SMP2P value=%08x elapsed=%lu ms\n",
+						    value, get_timer(start));
+					if (value & BIT(info.fatal_bit)) {
+						log_warning("qcom-adsp-pas: ADSP FATAL bit=%u value=%08x at %lu ms\n",
+							    info.fatal_bit, value, get_timer(start));
+						goto out_free_metadata;
+					}
+				}
+			}
+			mdelay(10);
+		} while (get_timer(start) < 1000);
+
+		log_warning("qcom-adsp-pas: ADSP survived 1000ms idle (no SMP2P fatal/ready)\n");
+	}
 	return -ENODEV;
 
 	/* Step 6: wait SMP2P ready */
