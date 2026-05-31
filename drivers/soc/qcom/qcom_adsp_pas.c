@@ -53,6 +53,8 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QPAS_SMP2P_MAGIC			0x504d5324
 #define QPAS_SMP2P_VERSION			1
 
+#define SMEM_HOST_APPS				0
+
 #define QCOM_MDT_TYPE_MASK			(7 << 24)
 #define QCOM_MDT_TYPE_HASH			(2 << 24)
 #define QCOM_MDT_RELOCATABLE			BIT(27)
@@ -1515,6 +1517,32 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	/* Step 5: SCM auth_and_reset */
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
+
+	/*
+	 * U-Boot replaces ABL/XBL as APPSBL on this device. ABL normally
+	 * allocates SMP2P inbound SMEM items before releasing remotes.
+	 * Do that here: discover the SMP2P inbound item from DT and
+	 * allocate it in the global SMEM partition. ADSP firmware will
+	 * write the magic/version/entries after auth_and_reset.
+	 */
+	{
+		struct qpas_smp2p_info smp2p_info = {};
+		struct udevice *smem_dev;
+		int rd;
+
+		rd = qpas_find_smp2p(node, &smp2p_info);
+		if (!rd) {
+			rd = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
+			if (!rd) {
+				rd = smem_alloc(smem_dev, SMEM_HOST_APPS,
+						smp2p_info.inbound_item,
+						sizeof(struct qpas_smp2p_smem_item));
+				log_warning("qcom-adsp-pas: smem_alloc item=%u ret=%d\n",
+					    smp2p_info.inbound_item, rd);
+			}
+		}
+	}
+
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
