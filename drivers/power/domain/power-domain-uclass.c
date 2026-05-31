@@ -125,6 +125,19 @@ int power_domain_off(struct power_domain *power_domain)
 	return ops->off ? ops->off(power_domain) : 0;
 }
 
+int power_domain_set_performance_state(struct power_domain *power_domain,
+				       unsigned int state)
+{
+	struct power_domain_ops *ops = power_domain_dev_ops(power_domain->dev);
+
+	debug("%s(power_domain=%p state=%u)\n", __func__, power_domain, state);
+
+	if (ops->set_performance_state)
+		return ops->set_performance_state(power_domain, state);
+
+	return -ENOSYS;
+}
+
 #if CONFIG_IS_ENABLED(OF_REAL)
 static int dev_power_domain_ctrl(struct udevice *dev, bool on)
 {

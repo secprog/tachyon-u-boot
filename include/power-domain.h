@@ -179,6 +179,29 @@ static inline int power_domain_off(struct power_domain *power_domain)
 #endif
 
 /**
+ * power_domain_set_performance_state - Set performance state for a domain.
+ *
+ * This corresponds to Linux dev_pm_genpd_set_performance_state(). For
+ * Qualcomm RPMh power domains the state is a corner/level index. Not all
+ * power domain providers implement this; callers should check the return
+ * value and treat -ENOSYS as a no-op.
+ *
+ * @power_domain:	The power domain.
+ * @state:		Performance state to request (provider-specific).
+ * Return: 0 if OK, or a negative error code (e.g. -ENOSYS if unsupported).
+ */
+#if CONFIG_IS_ENABLED(POWER_DOMAIN)
+int power_domain_set_performance_state(struct power_domain *power_domain,
+				       unsigned int state);
+#else
+static inline int power_domain_set_performance_state(
+	struct power_domain *power_domain, unsigned int state)
+{
+	return -ENOSYS;
+}
+#endif
+
+/**
  * dev_power_domain_on - Enable power domains for a device .
  *
  * @dev:		The client device.

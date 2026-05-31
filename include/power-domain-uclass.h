@@ -76,6 +76,21 @@ struct power_domain_ops {
 	 * @return 0 if OK, or a negative error code.
 	 */
 	int (*off)(struct power_domain *power_domain);
+	/**
+	 * set_performance_state - Set the performance state (corner/level)
+	 * for a power domain.
+	 *
+	 * Linux equivalent: dev_pm_genpd_set_performance_state().
+	 * For Qualcomm RPMh power domains, this votes a specific corner
+	 * via the RPMh RSC; the value is provider-specific (e.g. 0 = off,
+	 * n-1 = maximum turbo).
+	 *
+	 * @power_domain:	The power domain.
+	 * @state:		Performance state to request.
+	 * @return 0 if OK, or a negative error code.
+	 */
+	int (*set_performance_state)(struct power_domain *power_domain,
+				     unsigned int state);
 };
 
 #endif

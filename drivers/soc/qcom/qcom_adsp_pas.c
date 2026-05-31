@@ -163,12 +163,21 @@ static int qpas_enable_clocks(struct udevice *dev)
 	if (ret) {
 		log_warning("qcom-adsp-pas: clk_get_bulk ret=%d; XO may be unmanaged in U-Boot\n",
 			    ret);
+		/* Return success — no clocks to manage */
 		return 0;
 	}
 
 	ret = clk_enable_bulk(&clocks);
 	log_warning("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
 		    ret, clocks.count);
+	/*
+	 * Note: we don't save the clk_bulk handle for later disable
+	 * because clk_get_bulk allocates internally; U-Boot's clk API
+	 * makes it impractical to stash for unwind.  On failure paths
+	 * we rely on PD-off to also drop clock votes through RPMh.
+	 * TODO: if U-Boot gains clk_disable_bulk with a saved handle,
+	 * add explicit clock-disable unwind here.
+	 */
 	return ret;
 }
 
@@ -220,12 +229,18 @@ static int qpas_enable_power_domains(struct udevice *dev,
 			goto err_off;
 
 		/*
-		 * Linux votes maximum performance state for proxy power
-		 * domains (LCX, LMX) via dev_pm_genpd_set_performance_state()
-		 * with INT_MAX.  U-Boot's power-domain API does not expose a
-		 * performance-state call; the RPMhPD .on() path is our best
-		 * effort.
+		 * Vote maximum performance state for proxy power domains
+		 * (LCX, LMX).  Linux uses dev_pm_genpd_set_performance_state
+		 * with INT_MAX; we call power_domain_set_performance_state()
+		 * with UINT_MAX.  The qcom-rpmhpd driver maps this to the
+		 * highest corner.  If the provider doesn't support the op,
+		 * -ENOSYS is silently ignored.
 		 */
+		ret = power_domain_set_performance_state(&pds->pd[i],
+							 (unsigned int)-1);
+		if (ret && ret != -ENOSYS)
+			log_warning("qcom-adsp-pas: perf_state index=%d ret=%d\n",
+				    i, ret);
 
 		pds->enabled++;
 	}
@@ -1293,6 +1308,7 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 {
 	struct qpas_power_domains pds = {};
+	struct udevice *qmp_dev;
 	struct qpas_fw fw = {};
 	const char *fw_name;
 	phys_addr_t mem_phys;
@@ -1313,19 +1329,44 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
 		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
 
+	/*
+	 * Linux qcom_q6v5_pas start order:
+	 *   1. qcom_q6v5_prepare()   — QMP load_state on
+	 *   2. proxy power domains on (with INT_MAX perf state)
+	 *   3. XO / aggre2 clocks on
+	 *   4. qcom_mdt_pas_load()
+	 *   5. qcom_scm_pas_auth_and_reset()
+	 *   6. qcom_q6v5_wait_for_start()
+	 *
+	 * We follow the same order here.  On SC7280/QCM6490 the DT has
+	 * qcom,qmp; failure to resolve/probe it is fatal.
+	 */
+
+	/* Step 1: QMP load_state on (Linux qcom_q6v5_prepare) */
+	ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
+	if (ret) {
+		log_warning("qcom-adsp-pas: QMP phandle lookup failed ret=%d (fatal)\n",
+			    ret);
+		return ret;
+	}
+
+	ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
+	if (ret) {
+		log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
+			    ret);
+		return ret;
+	}
+
+	/* Step 2: proxy power domains on */
 	if (dev) {
 		ret = qpas_enable_power_domains(dev, &pds);
 		if (ret)
-			return ret;
+			goto out_qmp_off;
 	} else {
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
 	}
 
-	/*
-	 * Linux order: power domains first, then clocks.
-	 * The RPMh power-domain driver needs the PD active before clocks
-	 * can be voted on the same rail.
-	 */
+	/* Step 3: clocks on (XO, aggre2) */
 	if (dev) {
 		ret = qpas_enable_clocks(dev);
 		if (ret)
@@ -1334,6 +1375,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
 	}
 
+	/* Step 4: memory + firmware load */
 	ret = qpas_get_memory_region(node, &mem_phys, &mem_size, &mem_region);
 	if (ret) {
 		log_warning("qcom-adsp-pas: memory-region lookup failed ret=%d\n",
@@ -1393,50 +1435,21 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_metadata;
 	}
 
+	/* Step 5: SCM auth_and_reset */
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
-
-	/*
-	 * QMP load_state on (Linux qcom_q6v5_prepare) — tells AOSS DSP is
-	 * starting. On SC7280/QCM6490, the DT has qcom,qmp; failure to
-	 * resolve or probe it is fatal (unlike some SoCs where QMP may be
-	 * genuinely absent).
-	 */
-	{
-		struct udevice *qmp_dev;
-
-		ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
-		if (ret) {
-			log_warning("qcom-adsp-pas: QMP phandle lookup failed ret=%d (fatal)\n",
-				    ret);
-			goto out_free_metadata;
-		}
-
-		ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
-		if (ret) {
-			log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
-				    ret);
-			goto out_free_metadata;
-		}
-	}
-
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret) {
-		struct udevice *qmp_dev;
-
-		if (!qcom_aoss_qmp_get_by_node(node, &qmp_dev))
-			qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
+		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 		goto out_free_metadata;
 	}
 
+	/* Step 6: wait SMP2P ready */
 	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
-		struct udevice *qmp_dev;
-
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		if (!qcom_aoss_qmp_get_by_node(node, &qmp_dev))
-			qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
+		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 		goto out_free_metadata;
 	}
 
@@ -1453,6 +1466,9 @@ out_unmap:
 out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
+out_qmp_off:
+	if (ret)
+		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 	return ret;
 }
 

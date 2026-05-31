@@ -155,6 +155,39 @@ static int rpmhpd_power_off(struct power_domain *pd)
 	return ret;
 }
 
+static int rpmhpd_set_performance_state(struct power_domain *pd,
+					unsigned int state)
+{
+	const struct rpmhpd_desc *desc;
+	struct rpmhpd *curr;
+	int ret;
+
+	desc = (const struct rpmhpd_desc *)dev_get_driver_data(pd->dev);
+	if (!desc)
+		return -EINVAL;
+
+	if (pd->id >= desc->num_pds)
+		return -EINVAL;
+
+	curr = desc->rpmhpds[pd->id];
+	if (!curr) {
+		log_warning("Power domain id (%ld) not supported\n", pd->id);
+		return -ENODEV;
+	}
+
+	/* Map INT_MAX to the maximum corner (Linux convention) */
+	if (state == (unsigned int)-1 && curr->level_count)
+		state = curr->level_count - 1;
+
+	ret = rpmhpd_send_corner(curr, RPMH_ACTIVE_ONLY_STATE, state);
+
+	log_warning("qcom-rpmhpd: set_perf_state id=%ld res=%s state=%u corner=%u ret=%d\n",
+		    pd->id, curr->res_name, state,
+		    state < curr->level_count ? curr->level[state] : 0, ret);
+
+	return ret;
+}
+
 static int rpmhpd_update_level_mapping(struct rpmhpd *rpmhpd)
 {
 	const u16 *buf;
@@ -241,6 +274,7 @@ static int rpmhpd_probe(struct udevice *dev)
 static const struct power_domain_ops qcom_rpmhpd_power_ops = {
 	.on = rpmhpd_power_on,
 	.off = rpmhpd_power_off,
+	.set_performance_state = rpmhpd_set_performance_state,
 };
 
 static const struct udevice_id rpmhpd_match_table[] = {
