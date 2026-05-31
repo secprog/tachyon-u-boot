@@ -90,7 +90,7 @@ DECLARE_GLOBAL_DATA_PTR;
  *   10, 50, 100, 250, 500, 1000.
  * Set to -1 to restore normal SMP2P wait path.
  */
-#define QCOM_ADSP_IDLE_SURVIVAL_MS		10
+#define QCOM_ADSP_IDLE_SURVIVAL_MS		50
 
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
