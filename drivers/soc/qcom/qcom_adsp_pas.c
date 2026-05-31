@@ -595,6 +595,8 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 	return 0;
 }
 
+static int qcom_scm_pas_shutdown(u32 pas_id);
+
 /*
  * qpas_wait_for_start() — poll ADSP SMP2P state every 20 ms.
  *
