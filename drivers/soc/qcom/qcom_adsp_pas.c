@@ -1384,7 +1384,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (dev) {
 		ret = qpas_enable_clocks(dev, &clks);
 		if (ret)
-			goto out_power_domains;
+			goto out_clocks;
 	} else {
 		log_warning("qcom-adsp-pas: no bound device; skipping clk_get_bulk\n");
 	}
@@ -1394,7 +1394,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret) {
 		log_warning("qcom-adsp-pas: memory-region lookup failed ret=%d\n",
 			    ret);
-		goto out_power_domains;
+		goto out_clocks;
 	}
 
 	fw_name = ofnode_read_string(node, "firmware-name");
@@ -1453,17 +1453,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
-	if (ret) {
-		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
+	if (ret)
 		goto out_free_metadata;
-	}
 
 	/* Step 6: wait SMP2P ready */
 	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
 	ret = qpas_wait_for_start(node);
 	if (ret) {
 		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
 		goto out_free_metadata;
 	}
 
