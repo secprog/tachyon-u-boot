@@ -398,6 +398,7 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 			info->node = smp2p;
 			info->inbound = child;
 			info->inbound_item = smem[1];
+			info->outbound_item = smem[0];
 			strncpy(info->entry_name, entry_name,
 				sizeof(info->entry_name));
 			info->entry_name[sizeof(info->entry_name) - 1] = '\0';
@@ -417,6 +418,95 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 	}
 
 	return -ENOENT;
+}
+
+/*
+ * qpas_smp2p_init() — Linux qcom_smp2p_alloc_outbound_item() equivalent.
+ *
+ * 1. Allocate outbound SMEM item (item 428), write full header:
+ *    magic, local_pid=0, remote_pid, total_entries=16, valid_entries=0,
+ *    features, write barrier, version=2.
+ * 2. Kick remote via IPCC.
+ * 3. Allocate inbound SMEM item (item 429) — just the raw allocation;
+ *    ADSP firmware writes the header after auth_and_reset.
+ *
+ * Returns the remote_pid for subsequent smem_get calls.
+ */
+static int qpas_smp2p_init(struct udevice *smem, ofnode node,
+			   struct qpas_smp2p_info *info)
+{
+	struct qpas_smp2p_smem_item *out;
+	int ret;
+
+	ret = qpas_find_smp2p(node, info);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P discovery ret=%d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Allocate outbound item (APPS → ADSP).
+	 * Linux qcom_smem_alloc(remote_pid, item, size).
+	 */
+	ret = smem_alloc(smem, info->remote_pid, info->outbound_item,
+			 sizeof(*out));
+	if (ret && ret != -EEXIST) {
+		log_warning("qcom-adsp-pas: smem_alloc out item=%u ret=%d\n",
+			    info->outbound_item, ret);
+		return ret;
+	}
+
+	out = smem_get(smem, info->remote_pid, info->outbound_item, NULL);
+	if (IS_ERR_OR_NULL(out)) {
+		ret = PTR_ERR(out);
+		log_warning("qcom-adsp-pas: smem_get out item=%u ret=%d\n",
+			    info->outbound_item, ret);
+		return ret ?: -EIO;
+	}
+
+	/*
+	 * Write the APSS-side header.  ADSP firmware will do the same
+	 * for the inbound item (429) after auth_and_reset.  This
+	 * matches Linux qcom_smp2p_alloc_outbound_item() exactly.
+	 */
+	memset(out, 0, sizeof(*out));
+	out->magic = QPAS_SMP2P_MAGIC;
+	out->local_pid = SMEM_HOST_APPS;
+	out->remote_pid = info->remote_pid;
+	out->total_entries = QPAS_SMP2P_MAX_ENTRY;
+	out->valid_entries = 0;
+	/* Linux writes SMP2P_ALL_FEATURES, then negotiates; we just
+	 * set SSR_ACK if the remote expects it.
+	 */
+	out->features = 0;
+
+	/*
+	 * Write barrier: ensure header is visible before version.
+	 * Linux uses wmb(); in U-Boot this is dmb() for ARM.
+	 */
+	dmb();
+	out->version = 2;
+
+	log_warning("qcom-adsp-pas: SMP2P out item=%u init done magic=%08x ver=%u local_pid=%u remote_pid=%u\n",
+		    info->outbound_item, out->magic,
+		    out->version, out->local_pid, out->remote_pid);
+
+	/*
+	 * Allocate inbound item (ADSP → APPS).  ADSP firmware writes
+	 * the header into this item after auth_and_reset.  We just
+	 * need the raw allocation to exist.
+	 */
+	ret = smem_alloc(smem, SMEM_HOST_APPS, info->inbound_item,
+			 sizeof(struct qpas_smp2p_smem_item));
+	if (ret && ret != -EEXIST) {
+		log_warning("qcom-adsp-pas: smem_alloc in item=%u ret=%d\n",
+			    info->inbound_item, ret);
+		return ret;
+	}
+	log_warning("qcom-adsp-pas: smem_alloc in item=%u ret=%d\n",
+		    info->inbound_item, ret);
+
+	return 0;
 }
 
 static bool qpas_smp2p_entry_name_eq(const u8 name[QPAS_SMP2P_MAX_ENTRY_NAME],
@@ -1514,6 +1604,22 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		qpas_booted = true;
 		ret = 0;
 		goto out_free_metadata;
+	}
+
+	/* Step 4.5: SMP2P init — Linux smp2p.c alloc_outbound_item equivalent.
+	 * Allocates and initializes both outbound (APPS→ADSP, item 428)
+	 * and inbound (ADSP→APPS, item 429) SMEM items.
+	 */
+	{
+		struct qpas_smp2p_info smp2p_info = {};
+		struct udevice *smem_dev;
+		int rd;
+
+		rd = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
+		if (!rd) {
+			rd = qpas_smp2p_init(smem_dev, node, &smp2p_info);
+			log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", rd);
+		}
 	}
 
 	/* Step 5: SCM auth_and_reset */
