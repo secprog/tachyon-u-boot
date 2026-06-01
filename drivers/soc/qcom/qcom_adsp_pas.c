@@ -35,6 +35,7 @@
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/qcom_aoss_qmp.h>
 #include <u-boot/crc.h>
+#include <lmb.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
@@ -1031,6 +1032,79 @@ static int qcom_scm_call(const struct qcom_scm_desc *desc,
 
 static size_t qpas_metadata_aligned;
 
+struct qpas_metadata_ctx {
+	void *vaddr;
+	phys_addr_t phys;
+	size_t size;
+	bool lmb;
+};
+
+static struct qpas_metadata_ctx qpas_metadata;
+
+static int qpas_alloc_low_metadata(size_t size)
+{
+	phys_addr_t addr;
+	size_t aligned;
+	void *vaddr;
+
+	memset(&qpas_metadata, 0, sizeof(qpas_metadata));
+
+	aligned = ALIGN(size, SZ_4K);
+	qpas_metadata_aligned = aligned;
+
+	/* Force allocation strictly below 4 GiB */
+	addr = lmb_alloc_base(aligned, SZ_4K, 0x100000000ULL, LMB_NONE);
+	if (!addr) {
+		log_warning("qcom-adsp-pas: LMB low metadata alloc failed below 4G size=%zu\n",
+			    aligned);
+		return -ENOMEM;
+	}
+
+	if (addr + aligned > 0x100000000ULL) {
+		log_warning("qcom-adsp-pas: LMB metadata not below 4G addr=%llx size=%zu\n",
+			    (unsigned long long)addr, aligned);
+		lmb_free(addr, aligned);
+		return -ENOMEM;
+	}
+
+	vaddr = map_sysmem(addr, aligned);
+	if (!vaddr) {
+		lmb_free(addr, aligned);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Linux uses dma_alloc_coherent() for PAS metadata; make this
+	 * buffer non-cacheable before copying into it.
+	 */
+	mmu_set_region_dcache_behaviour(addr, aligned, DCACHE_OFF);
+
+	qpas_metadata.vaddr = vaddr;
+	qpas_metadata.phys = addr;
+	qpas_metadata.size = aligned;
+	qpas_metadata.lmb = true;
+
+	return 0;
+}
+
+static void qpas_free_low_metadata(void)
+{
+	if (!qpas_metadata.vaddr)
+		return;
+
+	/* Restore cacheable mapping before freeing */
+	mmu_set_region_dcache_behaviour(qpas_metadata.phys,
+					qpas_metadata.size,
+					DCACHE_DEFAULT_OPTION);
+
+	unmap_sysmem(qpas_metadata.vaddr);
+
+	if (qpas_metadata.lmb)
+		lmb_free(qpas_metadata.phys, qpas_metadata.size);
+
+	memset(&qpas_metadata, 0, sizeof(qpas_metadata));
+}
+
 static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 				   size_t size, void **ctxp)
 {
@@ -1041,55 +1115,41 @@ static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 		.args[0] = pas_id,
 	};
 	struct qcom_scm_res res;
-	void *mdata;
-	phys_addr_t phys;
-	size_t aligned;
 	int ret;
 
-	aligned = ALIGN(size, SZ_4K);
-	qpas_metadata_aligned = aligned;
-	mdata = memalign(SZ_4K, aligned);
-	if (!mdata)
-		return -ENOMEM;
+	ret = qpas_alloc_low_metadata(size);
+	if (ret)
+		return ret;
 
-	phys = map_to_sysmem(mdata);
-
-	/*
-	 * Linux uses dma_alloc_coherent() for PAS metadata: the buffer
-	 * must be non-cacheable to avoid XPU violations during the SCM
-	 * call.  Make the page range device memory before copying.
-	 */
-	mmu_set_region_dcache_behaviour(phys, aligned, DCACHE_OFF);
-
-	memset(mdata, 0, aligned);
-	memcpy(mdata, metadata, size);
+	memset(qpas_metadata.vaddr, 0, qpas_metadata.size);
+	memcpy(qpas_metadata.vaddr, metadata, size);
 
 	/*
 	 * Flush is harmless on device memory but keeps the pattern
 	 * consistent with the ADSP carveout and segment loader.
 	 */
-	flush_cache(rounddown((ulong)mdata, ARCH_DMA_MINALIGN),
-		    roundup((ulong)mdata + aligned, ARCH_DMA_MINALIGN) -
-		    rounddown((ulong)mdata, ARCH_DMA_MINALIGN));
+	flush_cache(rounddown((ulong)qpas_metadata.vaddr, ARCH_DMA_MINALIGN),
+		    roundup((ulong)qpas_metadata.vaddr + qpas_metadata.size,
+			    ARCH_DMA_MINALIGN) -
+		    rounddown((ulong)qpas_metadata.vaddr,
+			      ARCH_DMA_MINALIGN));
 
-	desc.args[1] = phys;
+	desc.args[1] = qpas_metadata.phys;
 
-	log_warning("qcom-adsp-pas: init_image pas_id=%u metadata=%p phys=%llx size=%zu below4g=%d noncache=1\n",
-		    pas_id, mdata, (unsigned long long)phys, size,
-		    phys <= 0xffffffffULL);
+	log_warning("qcom-adsp-pas: init_image pas_id=%u metadata=%p phys=%llx size=%zu below4g=%d noncache=1 lmb=1\n",
+		    pas_id, qpas_metadata.vaddr,
+		    (unsigned long long)qpas_metadata.phys, size,
+		    qpas_metadata.phys + qpas_metadata.size <= 0x100000000ULL);
 
 	ret = qcom_scm_call(&desc, &res);
 	if (ret || res.result[0]) {
 		log_warning("qcom-adsp-pas: init_image ret=%d scm_result=%llu\n",
 			    ret, res.result[0]);
-		/* Restore mapping before free or heap becomes device memory */
-		mmu_set_region_dcache_behaviour(phys, aligned,
-						DCACHE_DEFAULT_OPTION);
-		free(mdata);
+		qpas_free_low_metadata();
 		return ret ? ret : (int)res.result[0];
 	}
 
-	*ctxp = mdata;
+	*ctxp = &qpas_metadata;
 	return 0;
 }
 
@@ -2169,19 +2229,12 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 out_free_metadata:
 	/*
-	 * Restore cacheable mapping on the PAS metadata buffer before
-	 * freeing: qcom_scm_pas_init_image marks it DCACHE_OFF, and
-	 * leaving it as device memory would corrupt future malloc
-	 * allocations from the same page.
+	 * qcom_scm_pas_init_image allocates low-4GB non-cacheable
+	 * metadata via LMB.  Free it via the helper (restores
+	 * cacheable mapping, unmaps, frees LMB reservation).
 	 */
-	if (metadata_ctx) {
-		phys_addr_t meta_phys = map_to_sysmem(metadata_ctx);
-
-		mmu_set_region_dcache_behaviour(meta_phys,
-						qpas_metadata_aligned,
-						DCACHE_DEFAULT_OPTION);
-	}
-	free(metadata_ctx);
+	if (metadata_ctx)
+		qpas_free_low_metadata();
 out_free_fw:
 	free(fw.data);
 out_unmap:
