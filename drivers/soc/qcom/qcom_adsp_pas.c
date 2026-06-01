@@ -1813,6 +1813,11 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
 		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
 
+	/* Runtime DT check — U-Boot may fix up the DT at boot */
+	log_warning("qcom-adsp-pas: dt has iommus=%d interconnects=%d\n",
+		    ofnode_read_bool(node, "iommus"),
+		    ofnode_read_bool(node, "interconnects"));
+
 	/*
 	 * Linux qcom_q6v5_pas start order:
 	 *   1. qcom_q6v5_prepare()   — QMP load_state on
@@ -1835,9 +1840,8 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	}
 
 	ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
+	log_warning("qcom-adsp-pas: QMP load_state adsp on ret=%d\n", ret);
 	if (ret) {
-		log_warning("qcom-adsp-pas: QMP load_state on failed ret=%d\n",
-			    ret);
 		return ret;
 	}
 	qmp_on = true;
@@ -1884,11 +1888,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	/*
 	 * Snapdragon board code marks all reserved-memory regions (including
-	 * adsp_mem) as PTE_TYPE_FAULT. Re-enable normal cacheable mapping so
-	 * we can actually write firmware segments to physical RAM.
+	 * adsp_mem) as PTE_TYPE_FAULT.  Linux maps the ADSP carveout with
+	 * devm_ioremap_resource_wc() (write-combine, non-cacheable).  Use
+	 * DCACHE_OFF here for parity: no cache coherency gap between APPS
+	 * writes and ADSP reads, no risk of a dirty cache line surviving
+	 * flush and corrupting the firmware image the ADSP executes.
 	 */
-	log_warning("qcom-adsp-pas: re-enabling cacheable mapping for ADSP region\n");
-	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_DEFAULT_OPTION);
+	log_warning("qcom-adsp-pas: mapping ADSP region as non-cacheable\n");
+	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_OFF);
 
 	ret = qpas_read_firmware(&fw, fw_name);
 	if (ret)
@@ -2133,8 +2140,13 @@ out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
 out_qmp_off:
-	if (ret && qmp_on)
-		qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
+	if (ret && qmp_on) {
+		int qmp_off_ret;
+
+		qmp_off_ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
+		log_warning("qcom-adsp-pas: QMP load_state adsp off ret=%d\n",
+			    qmp_off_ret);
+	}
 	return ret;
 }
 
