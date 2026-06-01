@@ -583,7 +583,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	out->features[0] = SMP2P_FEATURE_SSR_ACK;
 
 	dmb();
-	out->version = SMP2P_MAX_VERSION;
+	out->version = QPAS_SMP2P_VERSION;	/* Linux 6.8: version must be 1 */
 
 	log_warning("qcom-adsp-pas: SMP2P header done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x\n",
 		    info->outbound_item,
