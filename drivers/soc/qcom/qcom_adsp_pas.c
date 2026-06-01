@@ -651,21 +651,22 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 
 	/*
 	 * Linux reads inbound items using remote_pid (e.g. host=2 for
-	 * ADSP). Try that first, then fall back to SMEM_HOST_APPS
-	 * (U-Boot compatibility — may resolve items ABL placed in the
-	 * global partition, which Linux wouldn't see since SMEM_HOST_ANY
-	 * is -1, not what SMP2P uses directly).
+	 * ADSP). Try remote_pid first, then SMEM_HOST_APPS fallback.
+	 * Log both distinctly so we can tell which path resolves (if any).
 	 */
-	log_warning("qcom-adsp-pas: inbound smem_get host=%u item=%u\n",
-		    info->remote_pid, info->inbound_item);
 	item = smem_get(smem, info->remote_pid, info->inbound_item, &size);
 	if (IS_ERR_OR_NULL(item)) {
+		log_warning("qcom-adsp-pas: inbound remote_pid=%u item=%u ptr=%p size=%zu\n",
+			    info->remote_pid, info->inbound_item, item, size);
 		size = 0;
 		item = smem_get(smem, SMEM_HOST_APPS,
 				info->inbound_item, &size);
+		log_warning("qcom-adsp-pas: inbound APPS/global item=%u ptr=%p size=%zu\n",
+			    info->inbound_item, item, size);
+	} else {
+		log_warning("qcom-adsp-pas: inbound remote_pid=%u item=%u ptr=%p size=%zu OK\n",
+			    info->remote_pid, info->inbound_item, item, size);
 	}
-	log_warning("qcom-adsp-pas: smem_get done item=%p size=%zu\n",
-		    item, size);
 	if (IS_ERR_OR_NULL(item))
 		return -EAGAIN;
 
