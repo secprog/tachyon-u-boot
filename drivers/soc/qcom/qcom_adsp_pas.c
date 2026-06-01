@@ -1703,6 +1703,13 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 		return -ENOMEM;
 	}
 
+	/*
+	 * Linux clears the entire region on first init (memset_io).
+	 * Without this, stale boot data or previous crash info can
+	 * defeat empty-slot detection.
+	 */
+	memset(vaddr, 0, region_size);
+
 	memset(name, 0, sizeof(name));
 	strncpy((char *)name, image, QPAS_PIL_RELOC_NAME_LEN);
 
@@ -1711,27 +1718,18 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 	for (i = 0; i < (int)num_entries; i++) {
 		u8 *entry = (u8 *)vaddr + (i * QPAS_PIL_RELOC_ENTRY_SIZE);
 
-		if (memcmp(entry, name, QPAS_PIL_RELOC_NAME_LEN) == 0) {
+		/*
+		 * Linux checks only the first byte of the name field:
+		 * a zero byte means the entry is unused.
+		 */
+		if (!entry[0]) {
 			slot = i;
 			break;
 		}
 
-		/* Check for empty slot (all zeros) */
-		{
-			bool empty = true;
-			int j;
-
-			for (j = 0; j < (int)QPAS_PIL_RELOC_ENTRY_SIZE; j++) {
-				if (entry[j] != 0) {
-					empty = false;
-					break;
-				}
-			}
-
-			if (empty && slot < 0) {
-				slot = i;
-				/* Keep scanning for matching name */
-			}
+		if (memcmp(entry, name, QPAS_PIL_RELOC_NAME_LEN) == 0) {
+			slot = i;
+			break;
 		}
 	}
 
@@ -1743,16 +1741,14 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 
 	{
 		u8 *entry = (u8 *)vaddr + (slot * QPAS_PIL_RELOC_ENTRY_SIZE);
-		u64 base_le;
 
 		/* Write name */
 		memcpy(entry, name, QPAS_PIL_RELOC_NAME_LEN);
 
 		/* Write base (little-endian u64 via two 32-bit writes) */
-		base_le = cpu_to_le64(base);
-		writel((u32)(base_le & 0xffffffff),
+		writel((u32)base,
 		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN));
-		writel((u32)(base_le >> 32),
+		writel((u32)((u64)base >> 32),
 		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 4));
 
 		/* Write size (little-endian u32) */
@@ -1760,8 +1756,12 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 8));
 	}
 
-	flush_cache((unsigned long)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
-		    QPAS_PIL_RELOC_ENTRY_SIZE);
+	flush_cache(rounddown((ulong)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
+			      ARCH_DMA_MINALIGN),
+		    roundup((ulong)vaddr + (slot + 1) * QPAS_PIL_RELOC_ENTRY_SIZE,
+			    ARCH_DMA_MINALIGN) -
+		    rounddown((ulong)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
+			      ARCH_DMA_MINALIGN));
 
 	unmap_sysmem(vaddr);
 
