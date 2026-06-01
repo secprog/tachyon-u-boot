@@ -2725,6 +2725,19 @@ config CMD_SCMI
 	  platforms to manage system resources.
 endmenu
 
+menu "Qualcomm commands"
+config CMD_ADSP
+	bool "adsp - boot ADSP PAS standalone"
+	depends on QCOM_ADSP_PAS
+	help
+	  Provide an 'adsp' shell command that boots the ADSP/LPASS
+	  remote processor through Peripheral Authentication Service.
+	  This is intended for bring-up testing without the DP/USB-C /
+	  PMIC-GLINK consumer path.  After boot, the diagnostic poll
+	  runs and shuts ADSP down on crash or timeout.
+
+endmenu
+
 menu "Filesystem commands"
 config CMD_BTRFS
 	bool "Enable the 'btrsubvol' command"
