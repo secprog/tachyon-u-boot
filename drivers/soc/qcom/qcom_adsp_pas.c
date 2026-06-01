@@ -1639,6 +1639,8 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
  *   - u32 little-endian size
  */
 
+static bool qpas_pil_reloc_inited;
+
 static ofnode qpas_find_compatible_recursive(ofnode parent,
 					     const char *compat)
 {
@@ -1704,11 +1706,18 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 	}
 
 	/*
-	 * Linux clears the entire region on first init (memset_io).
-	 * Without this, stale boot data or previous crash info can
-	 * defeat empty-slot detection.
+	 * Linux qcom_pil_info_init() clears the region once on first
+	 * access (memset_io).  Without this, stale boot data or
+	 * previous crash info can defeat empty-slot detection.
 	 */
-	memset(vaddr, 0, region_size);
+	if (!qpas_pil_reloc_inited) {
+		memset((void *)vaddr, 0, region_size);
+		flush_cache(rounddown((ulong)vaddr, ARCH_DMA_MINALIGN),
+			    roundup((ulong)vaddr + region_size,
+				    ARCH_DMA_MINALIGN) -
+			    rounddown((ulong)vaddr, ARCH_DMA_MINALIGN));
+		qpas_pil_reloc_inited = true;
+	}
 
 	memset(name, 0, sizeof(name));
 	strncpy((char *)name, image, QPAS_PIL_RELOC_NAME_LEN);
