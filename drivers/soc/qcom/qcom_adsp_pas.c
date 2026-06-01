@@ -427,12 +427,12 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 /*
  * qpas_smp2p_kick() — Linux qcom_smp2p_kick() equivalent.
  *
- * Tries mboxes from the SMP2P node first; falls back to qcom,ipc.
- * Failure to acquire any usable kick mechanism is fatal (matches
- * Linux's smp2p probe failure on mailbox/IPC setup).
- * mbox_send() return is logged but not fatal (Linux ignores it).
+ * Tries mboxes from the SMP2P node first; falls back to qcom,ipc
+ * (parses syscon phandle+offset+bit from the node, does readl/or/writel).
+ * Returns 0 if any kick mechanism succeeded; -ENODEV if no usable
+ * mechanism was found.  Caller treats -ENODEV as fatal.
  */
-static void qpas_smp2p_kick(const struct qpas_smp2p_info *info)
+static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 {
 	struct ofnode_phandle_args mbox_args;
 	struct udevice *ipcc_dev;
@@ -440,7 +440,7 @@ static void qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 	int ret;
 
 	if (!ofnode_valid(info->node))
-		return;
+		return -ENODEV;
 
 	/* Try SMP2P node's own mboxes */
 	ret = ofnode_parse_phandle_with_args(info->node, "mboxes",
@@ -461,13 +461,17 @@ static void qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 				if (ops->request)
 					ops->request(&mbox);
 				ret = mbox_send(&mbox, NULL);
-				log_warning("qcom-adsp-pas: SMP2P kick ret=%d\n", ret);
-				return;
+				log_warning("qcom-adsp-pas: SMP2P kick ret=%d\n",
+					    ret);
+				return 0;
 			}
 		}
 	}
 
-	/* Fallback: qcom,ipc from SMP2P node */
+	/* Fallback: qcom,ipc from SMP2P node (Linux smp2p_parse_ipc).
+	 * ipc_data[0]=syscon_phandle, ipc_data[1]=offset, ipc_data[2]=bit.
+	 * Does readl / set bit / writel to the syscon.
+	 */
 	{
 		struct ofnode_phandle_args ipc_args;
 		u32 ipc_data[3];
@@ -477,14 +481,29 @@ static void qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 		if (!ret) {
 			ret = ofnode_read_u32_array(info->node, "qcom,ipc",
 						    ipc_data, 3);
-			if (ret) {
-				log_warning("qcom-adsp-pas: SMP2P kick no usable mechanism\n");
-				return;
+			if (!ret) {
+				struct resource res;
+				void __iomem *base;
+				u32 val;
+
+				ret = ofnode_read_resource(ipc_args.node, 0,
+							   &res);
+				if (!ret) {
+					base = (void __iomem *)res.start;
+					val = readl(base + ipc_data[1]);
+					val |= BIT(ipc_data[2]);
+					writel(val, base + ipc_data[1]);
+					log_warning("qcom-adsp-pas: SMP2P kick via qcom,ipc off=%x bit=%u\n",
+						    ipc_data[1],
+						    ipc_data[2]);
+					return 0;
+				}
 			}
-			/* ipc_data[0]=phandle, ipc_data[1]=offset, ipc_data[2]=bit */
-			log_warning("qcom-adsp-pas: SMP2P kick via qcom,ipc\n");
 		}
 	}
+
+	log_warning("qcom-adsp-pas: SMP2P kick no usable mechanism\n");
+	return -ENODEV;
 }
 
 /*
@@ -564,7 +583,6 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 
 	/* Phase 2: entry → valid_entries → kick */
 	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
-					     NULL, 0, 0, &smem_states_args);
 					     NULL, 0, 0, &smem_states_args);
 	if (ret) {
 		log_warning("qcom-adsp-pas: SMP2P qcom,smem-states parse failed ret=%d\n",
