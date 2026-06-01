@@ -428,7 +428,7 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
  * qpas_smp2p_kick() — Linux qcom_smp2p_kick() equivalent.
  *
  * Tries mboxes from the SMP2P node first; falls back to qcom,ipc
- * (parses syscon phandle+offset+bit from the node, does readl/or/writel).
+ * (parses syscon phandle+offset+bit, writes BIT(bit) directly).
  * Returns 0 if any kick mechanism succeeded; -ENODEV if no usable
  * mechanism was found.  Caller treats -ENODEV as fatal.
  */
