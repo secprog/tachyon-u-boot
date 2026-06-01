@@ -1136,12 +1136,19 @@ static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 
 	desc.args[1] = qpas_metadata.phys;
 
-	log_warning("qcom-adsp-pas: init_image pas_id=%u metadata=%p phys=%llx size=%zu below4g=%d noncache=1 lmb=1\n",
-		    pas_id, qpas_metadata.vaddr,
+	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE svc=%x cmd=%x arginfo=%llx pas_id=%u metadata_phys=%llx metadata_size=%zu below4g=%d noncache=1 lmb=1\n",
+		    QCOM_SCM_SVC_PIL,
+		    QCOM_SCM_PIL_PAS_INIT_IMAGE,
+		    desc.arginfo,
+		    pas_id,
 		    (unsigned long long)qpas_metadata.phys, size,
 		    qpas_metadata.phys + qpas_metadata.size <= 0x100000000ULL);
 
 	ret = qcom_scm_call(&desc, &res);
+
+	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE ret=%d result0=%llu result1=%llu result2=%llu\n",
+		    ret, res.result[0], res.result[1], res.result[2]);
+
 	if (ret || res.result[0]) {
 		log_warning("qcom-adsp-pas: init_image ret=%d scm_result=%llu\n",
 			    ret, res.result[0]);
@@ -1166,13 +1173,18 @@ static int qcom_scm_pas_mem_setup(u32 pas_id, phys_addr_t addr, size_t size)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: mem_setup pas_id=%u addr=%llx size=%zu\n",
-		    pas_id, (unsigned long long)addr, size);
+	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP svc=%x cmd=%x arginfo=%llx pas_id=%u addr=%llx size=%llx\n",
+		    QCOM_SCM_SVC_PIL,
+		    QCOM_SCM_PIL_PAS_MEM_SETUP,
+		    desc.arginfo,
+		    pas_id,
+		    (unsigned long long)addr,
+		    (unsigned long long)size);
 
 	ret = qcom_scm_call(&desc, &res);
-	if (ret || res.result[0])
-		log_warning("qcom-adsp-pas: mem_setup ret=%d scm_result=%llu\n",
-			    ret, res.result[0]);
+
+	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP ret=%d result0=%llu result1=%llu result2=%llu\n",
+		    ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
 }
@@ -1188,10 +1200,15 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: auth_and_reset pas_id=%u\n", pas_id);
+	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET svc=%x cmd=%x arginfo=%llx pas_id=%u\n",
+		    QCOM_SCM_SVC_PIL,
+		    QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
+		    desc.arginfo,
+		    pas_id);
 
 	ret = qcom_scm_call(&desc, &res);
-	log_warning("qcom-adsp-pas: auth_and_reset ret=%d scm_result0=%llu scm_result1=%llu scm_result2=%llu\n",
+
+	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET ret=%d result0=%llu result1=%llu result2=%llu\n",
 		    ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
@@ -1560,8 +1577,22 @@ static int qpas_mdt_init_image(const struct qpas_fw *fw, phys_addr_t mem_phys,
 	int ret;
 	int i;
 
+	log_warning("qcom-adsp-pas: MDT hdr phnum=%u entry=%08x\n",
+		    ehdr->e_phnum, ehdr->e_entry);
+
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		const Elf32_Phdr *phdr = &phdrs[i];
+
+		log_warning("qcom-adsp-pas: phdr[%d] type=%08x flags=%08x off=%08x paddr=%08x filesz=%08x memsz=%08x valid=%d reloc=%d\n",
+			    i,
+			    le32_to_cpu(phdr->p_type),
+			    le32_to_cpu(phdr->p_flags),
+			    le32_to_cpu(phdr->p_offset),
+			    le32_to_cpu(phdr->p_paddr),
+			    le32_to_cpu(phdr->p_filesz),
+			    le32_to_cpu(phdr->p_memsz),
+			    qpas_mdt_phdr_loadable(phdr),
+			    !!(le32_to_cpu(phdr->p_flags) & QCOM_MDT_RELOCATABLE));
 
 		if (!qpas_mdt_phdr_loadable(phdr))
 			continue;
@@ -1576,6 +1607,13 @@ static int qpas_mdt_init_image(const struct qpas_fw *fw, phys_addr_t mem_phys,
 			max_addr = ALIGN(phdr->p_paddr + phdr->p_memsz, SZ_4K);
 	}
 
+	log_warning("qcom-adsp-pas: MDT summary relocate=%d min_addr=%08llx max_addr=%08llx mem_phys=%llx mem_setup_size=%llx\n",
+		    relocate,
+		    (unsigned long long)min_addr,
+		    (unsigned long long)max_addr,
+		    (unsigned long long)mem_phys,
+		    (unsigned long long)(max_addr - min_addr));
+
 	ret = qpas_mdt_read_metadata(fw, &metadata, &metadata_len);
 	if (ret)
 		return ret;
@@ -1586,9 +1624,13 @@ static int qpas_mdt_init_image(const struct qpas_fw *fw, phys_addr_t mem_phys,
 	if (ret)
 		return ret;
 
-	if (relocate)
+	if (relocate) {
 		ret = qcom_scm_pas_mem_setup(QCOM_ADSP_PAS_ID, mem_phys,
 					     max_addr - min_addr);
+	} else {
+		log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP skipped relocate=%d\n",
+			    relocate);
+	}
 
 	return ret;
 }
