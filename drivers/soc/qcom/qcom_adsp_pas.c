@@ -1789,17 +1789,76 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (ret)
 		goto out_free_metadata;
 
-	/* Step 6: poll SMP2P for ready/fatal/handover */
-	log_warning("qcom-adsp-pas: starting SMP2P wait for ADSP ready\n");
-	ret = qpas_wait_for_start(node, &clks, &pds);
-	if (ret) {
-		qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		goto out_free_metadata;
+	/*
+	 * Diagnostic survival poll: check SMP2P item 429 and crash
+	 * reason 423 every 50ms for 600ms (under the known ~1000ms
+	 * reset threshold).  Shutdown before the hard reset so we can
+	 * see whether either item appears during the survival window.
+	 */
+	{
+		struct qpas_smp2p_info diag_info = {};
+		struct qpas_smp2p_smem_item *in_item;
+		struct udevice *diag_smem;
+		ulong diag_start;
+		size_t in_sz;
+		bool in_found = false;
+		int rd;
+		int i;
+
+		rd = qpas_find_smp2p(node, &diag_info);
+		if (!rd)
+			rd = uclass_first_device_err(UCLASS_SMEM, &diag_smem);
+		if (!rd) {
+			diag_start = get_timer(0);
+			for (i = 0; get_timer(diag_start) < 600; i++) {
+				in_sz = 0;
+				in_item = smem_get(diag_smem,
+						   diag_info.remote_pid,
+						   diag_info.inbound_item,
+						   &in_sz);
+				if (IS_ERR_OR_NULL(in_item)) {
+					in_sz = 0;
+					in_item = smem_get(diag_smem,
+							   SMEM_HOST_APPS,
+							   diag_info.inbound_item,
+							   &in_sz);
+				}
+
+				if (!IS_ERR_OR_NULL(in_item) && in_sz >= 24) {
+					u32 val;
+					if (!qpas_smp2p_read_entry(diag_smem,
+						&diag_info, &val)) {
+						log_warning("qcom-adsp-pas: diag t=%lu smp2p=%08x ready=%d\n",
+							    get_timer(diag_start),
+							    val,
+							    !!(val & BIT(diag_info.ready_bit)));
+						in_found = true;
+					}
+				}
+
+				if (i % 5 == 0) {
+					size_t cr_sz = 0;
+					char *cr = smem_get(diag_smem,
+						SMEM_HOST_APPS,
+						QCOM_ADSP_CRASH_REASON_SMEM,
+						&cr_sz);
+					log_warning("qcom-adsp-pas: diag t=%lu in=%s cr=%s\n",
+						    get_timer(diag_start),
+						    in_found ? "found" : "missing",
+						    (!IS_ERR_OR_NULL(cr) && cr_sz) ? cr : "empty");
+				}
+
+				mdelay(50);
+			}
+		}
+
+		log_warning("qcom-adsp-pas: diag 600ms elapsed, shutdown begin\n");
+		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		log_warning("qcom-adsp-pas: diag shutdown ret=%d\n", ret);
+		return -ENODEV;
 	}
 
-	qpas_booted = true;
-	log_warning("qcom-adsp-pas: booted ADSP reloc_base=%llx\n",
-		    (unsigned long long)reloc_base);
+	/* Step 6: poll SMP2P for ready/fatal/handover */
 
 out_free_metadata:
 	free(metadata_ctx);
