@@ -174,6 +174,7 @@ struct qpas_smp2p_smem_item {
 } __packed;
 
 static bool qpas_booted;
+static bool qpas_adsp_failed;
 
 static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
 {
@@ -1799,6 +1800,11 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	if (qpas_booted)
 		return 0;
 
+	if (qpas_adsp_failed) {
+		log_warning("qcom-adsp-pas: previous ADSP boot failed, refusing retry\n");
+		return -EIO;
+	}
+
 	/* Dump U-Boot memory layout to check for ADSP region overlap */
 	log_warning("qcom-adsp-pas: U-Boot mem: ram_base=%llx ram_size=%llx ram_top=%llx\n",
 		    (unsigned long long)gd->ram_base,
@@ -2107,6 +2113,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
 		log_warning("qcom-adsp-pas: pas_shutdown ret=%d\n", ret);
 
+		qpas_adsp_failed = true;
 		ret = -EIO;
 		goto out_free_metadata;
 	}
@@ -2157,6 +2164,11 @@ int qcom_adsp_pas_boot(void)
 
 	if (qpas_booted)
 		return 0;
+
+	if (qpas_adsp_failed) {
+		log_warning("qcom-adsp-pas: previous ADSP boot failed, refusing retry\n");
+		return -EIO;
+	}
 
 	node = ofnode_by_compatible(ofnode_null(), QCOM_ADSP_COMPAT);
 	if (!ofnode_valid(node)) {
