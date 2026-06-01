@@ -1136,7 +1136,7 @@ static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 
 	desc.args[1] = qpas_metadata.phys;
 
-	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE svc=%x cmd=%x arginfo=%llx pas_id=%u metadata_phys=%llx metadata_size=%zu below4g=%d noncache=1 lmb=1\n",
+	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE svc=%x cmd=%x arginfo=%x pas_id=%u metadata_phys=%llx metadata_size=%zu below4g=%d noncache=1 lmb=1\n",
 		    QCOM_SCM_SVC_PIL,
 		    QCOM_SCM_PIL_PAS_INIT_IMAGE,
 		    desc.arginfo,
@@ -1173,7 +1173,7 @@ static int qcom_scm_pas_mem_setup(u32 pas_id, phys_addr_t addr, size_t size)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP svc=%x cmd=%x arginfo=%llx pas_id=%u addr=%llx size=%llx\n",
+	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP svc=%x cmd=%x arginfo=%x pas_id=%u addr=%llx size=%llx\n",
 		    QCOM_SCM_SVC_PIL,
 		    QCOM_SCM_PIL_PAS_MEM_SETUP,
 		    desc.arginfo,
@@ -1200,7 +1200,7 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET svc=%x cmd=%x arginfo=%llx pas_id=%u\n",
+	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET svc=%x cmd=%x arginfo=%x pas_id=%u\n",
 		    QCOM_SCM_SVC_PIL,
 		    QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
 		    desc.arginfo,
