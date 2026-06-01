@@ -90,6 +90,11 @@ DECLARE_GLOBAL_DATA_PTR;
  */
 #define QCOM_ADSP_SKIP_BOOT			0
 
+#define QPAS_PIL_RELOC_COMPAT			"qcom,pil-reloc-info"
+#define QPAS_PIL_RELOC_NAME_LEN		8
+#define QPAS_PIL_RELOC_ENTRY_SIZE		(QPAS_PIL_RELOC_NAME_LEN + sizeof(u64) + sizeof(u32))
+#define QPAS_PIL_IMAGE_NAME			"adsp"
+
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -1623,6 +1628,150 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 	return 0;
 }
 
+/*
+ * PIL relocation info helpers
+ *
+ * Linux-parity: store the ADSP firmware base/size into the IMEM
+ * pil-reloc-info region so post-mortem debugging tools can locate
+ * remoteproc images.  Entry layout:
+ *   - 8-byte textual image name (QPAS_PIL_RELOC_NAME_LEN)
+ *   - u64 little-endian base address
+ *   - u32 little-endian size
+ */
+
+static ofnode qpas_find_compatible_recursive(ofnode parent,
+					     const char *compat)
+{
+	ofnode child;
+
+	if (ofnode_device_is_compatible(parent, compat))
+		return parent;
+
+	ofnode_for_each_subnode(child, parent) {
+		ofnode found;
+
+		found = qpas_find_compatible_recursive(child, compat);
+		if (ofnode_valid(found))
+			return found;
+	}
+
+	return ofnode_null();
+}
+
+static ofnode qpas_find_pil_reloc_node(void)
+{
+	return qpas_find_compatible_recursive(ofnode_root(),
+					      QPAS_PIL_RELOC_COMPAT);
+}
+
+static int qpas_pil_info_store(const char *image, phys_addr_t base,
+			       size_t size)
+{
+	ofnode node;
+	struct resource res;
+	void __iomem *vaddr;
+	u8 name[QPAS_PIL_RELOC_NAME_LEN];
+	size_t region_size;
+	size_t num_entries;
+	int slot = -1;
+	int ret;
+	int i;
+
+	node = qpas_find_pil_reloc_node();
+	if (!ofnode_valid(node)) {
+		log_warning("qcom-adsp-pas: PIL reloc node not found, skipping\n");
+		return 0;
+	}
+
+	ret = ofnode_read_resource(node, 0, &res);
+	if (ret) {
+		log_warning("qcom-adsp-pas: PIL reloc resource ret=%d\n", ret);
+		return ret;
+	}
+
+	region_size = resource_size(&res);
+	if (region_size < QPAS_PIL_RELOC_ENTRY_SIZE) {
+		log_warning("qcom-adsp-pas: PIL reloc region too small size=%zu\n",
+			    region_size);
+		return -ENOSPC;
+	}
+
+	vaddr = map_sysmem(res.start, region_size);
+	if (!vaddr) {
+		log_warning("qcom-adsp-pas: PIL reloc map failed phys=%llx\n",
+			    (unsigned long long)res.start);
+		return -ENOMEM;
+	}
+
+	memset(name, 0, sizeof(name));
+	strncpy((char *)name, image, QPAS_PIL_RELOC_NAME_LEN);
+
+	num_entries = region_size / QPAS_PIL_RELOC_ENTRY_SIZE;
+
+	for (i = 0; i < (int)num_entries; i++) {
+		u8 *entry = (u8 *)vaddr + (i * QPAS_PIL_RELOC_ENTRY_SIZE);
+
+		if (memcmp(entry, name, QPAS_PIL_RELOC_NAME_LEN) == 0) {
+			slot = i;
+			break;
+		}
+
+		/* Check for empty slot (all zeros) */
+		{
+			bool empty = true;
+			int j;
+
+			for (j = 0; j < (int)QPAS_PIL_RELOC_ENTRY_SIZE; j++) {
+				if (entry[j] != 0) {
+					empty = false;
+					break;
+				}
+			}
+
+			if (empty && slot < 0) {
+				slot = i;
+				/* Keep scanning for matching name */
+			}
+		}
+	}
+
+	if (slot < 0) {
+		log_warning("qcom-adsp-pas: PIL reloc no free slot\n");
+		unmap_sysmem(vaddr);
+		return -ENOSPC;
+	}
+
+	{
+		u8 *entry = (u8 *)vaddr + (slot * QPAS_PIL_RELOC_ENTRY_SIZE);
+		u64 base_le;
+
+		/* Write name */
+		memcpy(entry, name, QPAS_PIL_RELOC_NAME_LEN);
+
+		/* Write base (little-endian u64 via two 32-bit writes) */
+		base_le = cpu_to_le64(base);
+		writel((u32)(base_le & 0xffffffff),
+		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN));
+		writel((u32)(base_le >> 32),
+		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 4));
+
+		/* Write size (little-endian u32) */
+		writel((u32)size,
+		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 8));
+	}
+
+	flush_cache((unsigned long)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
+		    QPAS_PIL_RELOC_ENTRY_SIZE);
+
+	unmap_sysmem(vaddr);
+
+	log_warning("qcom-adsp-pas: PIL info image=%s base=%llx size=%zu slot=%d region=%llx+%zx\n",
+		    image, (unsigned long long)base, size, slot,
+		    (unsigned long long)res.start, region_size);
+
+	return 0;
+}
+
 static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 {
 	struct qpas_power_domains pds = {};
@@ -1748,6 +1897,19 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: load complete, segments=%zu reloc_base=%llx\n",
 		    (size_t)((const Elf32_Ehdr *)fw.data)->e_phnum,
 		    (unsigned long long)reloc_base);
+
+	/*
+	 * PIL relocation info store (Linux parity: qcom_pil_info_store)
+	 *
+	 * Stores ADSP firmware base/size into IMEM pil-reloc-info region
+	 * so post-mortem debugging tools can locate remoteproc images.
+	 * Linux calls this between qcom_mdt_pas_load() and
+	 * qcom_scm_pas_auth_and_reset().  Not fatal on failure.
+	 */
+	ret = qpas_pil_info_store(QPAS_PIL_IMAGE_NAME, mem_phys, mem_size);
+	log_warning("qcom-adsp-pas: PIL info store ret=%d\n", ret);
+	if (ret)
+		log_warning("qcom-adsp-pas: continuing despite PIL info failure\n");
 
 	if (QCOM_ADSP_SKIP_BOOT) {
 		log_warning("qcom-adsp-pas: SKIP_BOOT: bypassing auth_and_reset + SMP2P wait\n");
