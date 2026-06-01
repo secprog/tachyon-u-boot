@@ -442,6 +442,9 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 	if (!ofnode_valid(info->node))
 		return -ENODEV;
 
+	/* Linux qcom_smp2p_kick() begins with wmb() */
+	dmb();
+
 	/* Try SMP2P node's own mboxes */
 	ret = ofnode_parse_phandle_with_args(info->node, "mboxes",
 					     "#mbox-cells", 0, 0, &mbox_args);
@@ -457,9 +460,9 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 				ret = ops->of_xlate(&mbox, &mbox_args);
 			else
 				mbox.id = mbox_args.args[0];
+			if (!ret && ops->request)
+				ret = ops->request(&mbox);
 			if (!ret) {
-				if (ops->request)
-					ops->request(&mbox);
 				ret = mbox_send(&mbox, NULL);
 				log_warning("qcom-adsp-pas: SMP2P kick ret=%d\n",
 					    ret);
@@ -468,9 +471,9 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 		}
 	}
 
-	/* Fallback: qcom,ipc from SMP2P node (Linux smp2p_parse_ipc).
+	/* Fallback: qcom,ipc (Linux smp2p_parse_ipc).
 	 * ipc_data[0]=syscon_phandle, ipc_data[1]=offset, ipc_data[2]=bit.
-	 * Does readl / set bit / writel to the syscon.
+	 * Linux writes exactly BIT(bit), not read-modify-write.
 	 */
 	{
 		struct ofnode_phandle_args ipc_args;
@@ -483,16 +486,16 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 						    ipc_data, 3);
 			if (!ret) {
 				struct resource res;
-				void __iomem *base;
-				u32 val;
 
 				ret = ofnode_read_resource(ipc_args.node, 0,
 							   &res);
 				if (!ret) {
-					base = (void __iomem *)res.start;
-					val = readl(base + ipc_data[1]);
-					val |= BIT(ipc_data[2]);
-					writel(val, base + ipc_data[1]);
+					void __iomem *base = map_sysmem(
+						res.start,
+						resource_size(&res));
+
+					writel(BIT(ipc_data[2]),
+					       base + ipc_data[1]);
 					log_warning("qcom-adsp-pas: SMP2P kick via qcom,ipc off=%x bit=%u\n",
 						    ipc_data[1],
 						    ipc_data[2]);
@@ -558,9 +561,10 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	}
 
 	/*
-	 * Write header with correct endianness.  Linux:
-	 *   memset(out, 0, sizeof(*out));
-	/* Phase 1: header → dmb → version → kick (Linux order) */
+	 * Phase 1: header → dmb → version → kick (Linux order).
+	 * Linux: memset(out, 0, sizeof(*out)); magic=...; features=...;
+	 * wmb(); version=...; qcom_smp2p_kick().
+	 */
 	memset(out, 0, sizeof(*out));
 	out->magic = cpu_to_le32(QPAS_SMP2P_MAGIC);
 	out->local_pid = cpu_to_le16(SMEM_HOST_APPS);
@@ -579,7 +583,12 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 		    le16_to_cpu(out->local_pid), le16_to_cpu(out->remote_pid),
 		    out->features[0]);
 
-	qpas_smp2p_kick(info);
+	ret = qpas_smp2p_kick(info);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P phase-1 kick failed ret=%d\n",
+			    ret);
+		return ret;
+	}
 
 	/* Phase 2: entry → valid_entries → kick */
 	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
@@ -608,7 +617,12 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	out->valid_entries = cpu_to_le16(1);
 	log_warning("qcom-adsp-pas: SMP2P out entry='%s'\n", entry_name);
 
-	qpas_smp2p_kick(info);
+	ret = qpas_smp2p_kick(info);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P phase-2 kick failed ret=%d\n",
+			    ret);
+		return ret;
+	}
 
 	return 0;
 }
