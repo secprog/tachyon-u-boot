@@ -34,6 +34,7 @@
 #include <asm/cache.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/qcom_aoss_qmp.h>
+#include <u-boot/crc.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
@@ -1921,6 +1922,16 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		    (unsigned long long)reloc_base);
 
 	/*
+	 * CRC the loaded segments to verify memory integrity with
+	 * DCACHE_OFF mapping.  CRC only the used portion of the
+	 * region (Linux: devm_ioremap_resource_wc produces WC, not
+	 * cacheable).  If the CRC is stable and ADSP still fails,
+	 * caching is ruled out.
+	 */
+	log_warning("qcom-adsp-pas: adsp crc_after_load=%08x\n",
+		    crc32(0, mem_region, mem_size));
+
+	/*
 	 * PIL relocation info store (Linux parity: qcom_pil_info_store)
 	 *
 	 * Stores ADSP firmware base/size into IMEM pil-reloc-info region
@@ -1965,6 +1976,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		if (ret)
 			goto out_free_metadata;
 	}
+
+	/*
+	 * CRC the region again right before auth_and_reset, after
+	 * PIL info store and SMP2P init.  If crc_before_auth !=
+	 * crc_after_load, something wrote to the ADSP region.
+	 */
+	log_warning("qcom-adsp-pas: adsp crc_before_auth=%08x\n",
+		    crc32(0, mem_region, mem_size));
 
 	/* Step 5: SCM auth_and_reset */
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
