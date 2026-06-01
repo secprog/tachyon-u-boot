@@ -2026,7 +2026,9 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		log_warning("qcom-adsp-pas: diag 600ms elapsed, shutdown begin\n");
 		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
 		log_warning("qcom-adsp-pas: diag shutdown ret=%d\n", ret);
-		return -ENODEV;
+
+		ret = -ENODEV;
+		goto out_free_metadata;
 	}
 
 	/* Step 6: poll SMP2P for ready/fatal/handover */
