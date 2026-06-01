@@ -1963,16 +1963,30 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	/*
 	 * Diagnostic survival poll: check SMP2P item 429 and crash
 	 * reason 423 every 50ms for 600ms (under the known ~1000ms
-	 * reset threshold).  Shutdown before the hard reset so we can
-	 * see whether either item appears during the survival window.
+	 * reset threshold).  On crash, follow Linux stop order:
+	 *   smp2p stop-bit → wait stop-ack → SCM shutdown → cleanup.
+	 *
+	 * When CONFIG_QCOM_ADSP_PAS_STANDALONE is set, skip the
+	 * diagnostic entirely and wait for ADSP ready via the full
+	 * SMP2P state machine (Linux qcom_q6v5_wait_for_start equivalent).
 	 */
+	if (IS_ENABLED(CONFIG_QCOM_ADSP_PAS_STANDALONE)) {
+		ret = qpas_wait_for_start(node, &clks, &pds);
+		if (!ret) {
+			qpas_booted = true;
+			goto out_free_metadata;
+		}
+		/* qpas_wait_for_start already shuts down on fatal */
+		goto out_free_metadata;
+	}
+
 	{
 		struct qpas_smp2p_info diag_info = {};
 		struct qpas_smp2p_smem_item *in_item;
 		struct udevice *diag_smem;
 		ulong diag_start;
 		size_t in_sz;
-		bool in_found = false;
+		bool crashed = false;
 		int rd;
 		int i;
 
@@ -2003,7 +2017,6 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 							    get_timer(diag_start),
 							    val,
 							    !!(val & BIT(diag_info.ready_bit)));
-						in_found = true;
 					}
 				}
 
@@ -2013,21 +2026,65 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 						SMEM_HOST_APPS,
 						QCOM_ADSP_CRASH_REASON_SMEM,
 						&cr_sz);
-					log_warning("qcom-adsp-pas: diag t=%lu in=%s cr=%s\n",
+
+					log_warning("qcom-adsp-pas: diag t=%lu cr=%s\n",
 						    get_timer(diag_start),
-						    in_found ? "found" : "missing",
 						    (!IS_ERR_OR_NULL(cr) && cr_sz) ? cr : "empty");
+
+					if (!IS_ERR_OR_NULL(cr) && cr_sz &&
+					    strcmp(cr, "empty")) {
+						log_warning("qcom-adsp-pas: crash reason at %lu ms, Linux stop order\n",
+							    get_timer(diag_start));
+						crashed = true;
+						break;
+					}
 				}
 
 				mdelay(50);
 			}
 		}
 
-		log_warning("qcom-adsp-pas: diag 600ms elapsed, shutdown begin\n");
-		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		log_warning("qcom-adsp-pas: diag shutdown ret=%d\n", ret);
+		/*
+		 * Linux stop order (qcom_q6v5_pas_remove / qcom_pas_stop):
+		 *   1. Assert smp2p stop bit (outbound)
+		 *   2. Wait for stop-ack (inbound)
+		 *   3. SCM PAS shutdown
+		 *   4. Unwind resources (goto cleanup labels)
+		 */
+		if (crashed) {
+			ret = qpas_smp2p_write_stop(diag_smem, &diag_info,
+						    true);
+			log_warning("qcom-adsp-pas: stop-bit write ret=%d\n",
+				    ret);
 
-		ret = -ENODEV;
+			/* Brief poll for stop-ack (Linux waits 4ms) */
+			{
+				u32 val;
+				int ack_ret;
+				int ack_waits;
+
+				for (ack_waits = 0; ack_waits < 20;
+				     ack_waits++) {
+					mdelay(1);
+					ack_ret = qpas_smp2p_read_entry(
+						diag_smem, &diag_info, &val);
+					if (ack_ret)
+						continue;
+					if (diag_info.stop_ack_bit != U32_MAX &&
+					    (val & BIT(diag_info.stop_ack_bit))) {
+						log_warning("qcom-adsp-pas: stop-ack at %d ms\n",
+							    ack_waits + 1);
+						break;
+					}
+				}
+			}
+		}
+
+		log_warning("qcom-adsp-pas: SCM shutdown\n");
+		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		log_warning("qcom-adsp-pas: SCM shutdown ret=%d\n", ret);
+
+		ret = -EIO;
 		goto out_free_metadata;
 	}
 
