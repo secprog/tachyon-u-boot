@@ -2046,9 +2046,11 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 		/*
 		 * Linux stop order (qcom_q6v5_pas_remove / qcom_pas_stop):
-		 *   1. Assert smp2p stop bit (outbound)
-		 *   2. Wait for stop-ack (inbound)
-		 *   3. SCM PAS shutdown
+		 *   1. Best-effort smp2p stop bit (may time out, item 429
+		 *      may not exist — Linux ignores -ETIMEDOUT here)
+		 *   2. Bounded stop-ack wait (100 ms max)
+		 *   3. SCM PAS shutdown — ALWAYS called, even if stop-ack
+		 *      never appears
 		 *   4. Unwind resources (goto cleanup labels)
 		 */
 		if (crashed) {
@@ -2057,32 +2059,53 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 			log_warning("qcom-adsp-pas: stop-bit write ret=%d\n",
 				    ret);
 
-			/* Brief poll for stop-ack (Linux waits 4ms) */
+			/*
+			 * Bounded stop-ack poll.  ADSP may never create
+			 * inbound SMP2P item 429, so do not loop forever.
+			 * Linux uses a 1-second timeout; 100 ms is enough
+			 * to observe a stop-ack if ADSP is alive enough
+			 * to produce one.
+			 */
 			{
 				u32 val;
-				int ack_ret;
-				int ack_waits;
+				ulong ack_start = get_timer(0);
 
-				for (ack_waits = 0; ack_waits < 20;
-				     ack_waits++) {
-					mdelay(1);
+				while (get_timer(ack_start) < 100) {
+					int ack_ret;
+
 					ack_ret = qpas_smp2p_read_entry(
 						diag_smem, &diag_info, &val);
-					if (ack_ret)
+					if (ack_ret == -EAGAIN) {
+						/*
+						 * Item 429 may not be allocated
+						 * by ADSP.  Wait briefly, then
+						 * proceed to SCM shutdown.
+						 */
+						mdelay(10);
 						continue;
-					if (diag_info.stop_ack_bit != U32_MAX &&
+					}
+					if (!ack_ret &&
+					    diag_info.stop_ack_bit != U32_MAX &&
 					    (val & BIT(diag_info.stop_ack_bit))) {
-						log_warning("qcom-adsp-pas: stop-ack at %d ms\n",
-							    ack_waits + 1);
+						log_warning("qcom-adsp-pas: stop-ack at %lu ms\n",
+							    get_timer(ack_start));
 						break;
 					}
+					mdelay(5);
 				}
+				log_warning("qcom-adsp-pas: stop-ack wait done t=%lu ms\n",
+					    get_timer(ack_start));
 			}
 		}
 
-		log_warning("qcom-adsp-pas: SCM shutdown\n");
+		/*
+		 * Always call SCM PAS shutdown — Linux calls this
+		 * unconditionally after the bounded stop-ack wait,
+		 * even if stop-ack timed out.
+		 */
+		log_warning("qcom-adsp-pas: pas_shutdown begin\n");
 		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
-		log_warning("qcom-adsp-pas: SCM shutdown ret=%d\n", ret);
+		log_warning("qcom-adsp-pas: pas_shutdown ret=%d\n", ret);
 
 		ret = -EIO;
 		goto out_free_metadata;
