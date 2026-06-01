@@ -1029,6 +1029,8 @@ static int qcom_scm_call(const struct qcom_scm_desc *desc,
 	return res.a0 ? qcom_scm_remap_error(res.a0) : 0;
 }
 
+static size_t qpas_metadata_aligned;
+
 static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 				   size_t size, void **ctxp)
 {
@@ -1045,25 +1047,44 @@ static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 	int ret;
 
 	aligned = ALIGN(size, SZ_4K);
+	qpas_metadata_aligned = aligned;
 	mdata = memalign(SZ_4K, aligned);
 	if (!mdata)
 		return -ENOMEM;
 
+	phys = map_to_sysmem(mdata);
+
+	/*
+	 * Linux uses dma_alloc_coherent() for PAS metadata: the buffer
+	 * must be non-cacheable to avoid XPU violations during the SCM
+	 * call.  Make the page range device memory before copying.
+	 */
+	mmu_set_region_dcache_behaviour(phys, aligned, DCACHE_OFF);
+
+	memset(mdata, 0, aligned);
 	memcpy(mdata, metadata, size);
+
+	/*
+	 * Flush is harmless on device memory but keeps the pattern
+	 * consistent with the ADSP carveout and segment loader.
+	 */
 	flush_cache(rounddown((ulong)mdata, ARCH_DMA_MINALIGN),
 		    roundup((ulong)mdata + aligned, ARCH_DMA_MINALIGN) -
 		    rounddown((ulong)mdata, ARCH_DMA_MINALIGN));
 
-	phys = map_to_sysmem(mdata);
 	desc.args[1] = phys;
 
-	log_warning("qcom-adsp-pas: init_image pas_id=%u metadata=%p phys=%llx size=%zu\n",
-		    pas_id, mdata, (unsigned long long)phys, size);
+	log_warning("qcom-adsp-pas: init_image pas_id=%u metadata=%p phys=%llx size=%zu below4g=%d noncache=1\n",
+		    pas_id, mdata, (unsigned long long)phys, size,
+		    phys <= 0xffffffffULL);
 
 	ret = qcom_scm_call(&desc, &res);
 	if (ret || res.result[0]) {
 		log_warning("qcom-adsp-pas: init_image ret=%d scm_result=%llu\n",
 			    ret, res.result[0]);
+		/* Restore mapping before free or heap becomes device memory */
+		mmu_set_region_dcache_behaviour(phys, aligned,
+						DCACHE_DEFAULT_OPTION);
 		free(mdata);
 		return ret ? ret : (int)res.result[0];
 	}
@@ -2147,6 +2168,19 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	/* Step 6: poll SMP2P for ready/fatal/handover */
 
 out_free_metadata:
+	/*
+	 * Restore cacheable mapping on the PAS metadata buffer before
+	 * freeing: qcom_scm_pas_init_image marks it DCACHE_OFF, and
+	 * leaving it as device memory would corrupt future malloc
+	 * allocations from the same page.
+	 */
+	if (metadata_ctx) {
+		phys_addr_t meta_phys = map_to_sysmem(metadata_ctx);
+
+		mmu_set_region_dcache_behaviour(meta_phys,
+						qpas_metadata_aligned,
+						DCACHE_DEFAULT_OPTION);
+	}
 	free(metadata_ctx);
 out_free_fw:
 	free(fw.data);
