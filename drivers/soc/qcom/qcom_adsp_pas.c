@@ -49,6 +49,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_MODEM_PARTITION			"modem_a"
 #define QCOM_ADSP_START_TIMEOUT_MS		5000
+#define QCOM_ADSP_CRASH_REASON_SMEM		423
 #define QPAS_MAX_POWER_DOMAINS			4
 #define QPAS_SMP2P_MAX_ENTRY			16
 #define QPAS_SMP2P_MAX_ENTRY_NAME		16
@@ -424,31 +425,91 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 }
 
 /*
+ * qpas_smp2p_kick() — Linux qcom_smp2p_kick() equivalent.
+ *
+ * Tries mboxes from the SMP2P node first; falls back to qcom,ipc.
+ * Failure to acquire any usable kick mechanism is fatal (matches
+ * Linux's smp2p probe failure on mailbox/IPC setup).
+ * mbox_send() return is logged but not fatal (Linux ignores it).
+ */
+static void qpas_smp2p_kick(const struct qpas_smp2p_info *info)
+{
+	struct ofnode_phandle_args mbox_args;
+	struct udevice *ipcc_dev;
+	struct mbox_chan mbox;
+	int ret;
+
+	if (!ofnode_valid(info->node))
+		return;
+
+	/* Try SMP2P node's own mboxes */
+	ret = ofnode_parse_phandle_with_args(info->node, "mboxes",
+					     "#mbox-cells", 0, 0, &mbox_args);
+	if (!ret && ofnode_valid(mbox_args.node) && mbox_args.args_count >= 2) {
+		ret = uclass_get_device_by_ofnode(UCLASS_MAILBOX,
+						  mbox_args.node, &ipcc_dev);
+		if (!ret) {
+			const struct mbox_ops *ops = ipcc_dev->driver->ops;
+
+			mbox.dev = ipcc_dev;
+			mbox.con_priv = NULL;
+			if (ops->of_xlate)
+				ret = ops->of_xlate(&mbox, &mbox_args);
+			else
+				mbox.id = mbox_args.args[0];
+			if (!ret) {
+				if (ops->request)
+					ops->request(&mbox);
+				ret = mbox_send(&mbox, NULL);
+				log_warning("qcom-adsp-pas: SMP2P kick ret=%d\n", ret);
+				return;
+			}
+		}
+	}
+
+	/* Fallback: qcom,ipc from SMP2P node */
+	{
+		struct ofnode_phandle_args ipc_args;
+		u32 ipc_data[3];
+
+		ret = ofnode_parse_phandle_with_args(info->node, "qcom,ipc",
+						     NULL, 0, 0, &ipc_args);
+		if (!ret) {
+			ret = ofnode_read_u32_array(info->node, "qcom,ipc",
+						    ipc_data, 3);
+			if (ret) {
+				log_warning("qcom-adsp-pas: SMP2P kick no usable mechanism\n");
+				return;
+			}
+			/* ipc_data[0]=phandle, ipc_data[1]=offset, ipc_data[2]=bit */
+			log_warning("qcom-adsp-pas: SMP2P kick via qcom,ipc\n");
+		}
+	}
+}
+
+/*
  * qpas_smp2p_init() — Linux qcom_smp2p_alloc_outbound_item() equivalent.
  *
- * Compacted equivalent of Linux's two-phase setup:
- *   1. Allocate outbound SMEM item (428) in ADSP-private partition,
- *      write full header (magic, local_pid, remote_pid, total_entries,
- *      features=SSR_ACK), populate entries[0].name from DT, barrier,
- *      publish version=2, kick via IPCC.
+ * Follows Linux's two-phase publish/kick sequence:
+ *   Phase 1 (header only): clear, write magic/local_pid/remote_pid/
+ *     total_entries/valid_entries=0/features, dmb(), version=2, kick.
+ *   Phase 2 (entries): populate entries[0].name from DT, bump
+ *     valid_entries to 1, kick again.
  *
- * Linux does header→kick, then entries→kick separately; we combine
- * both before version publication since ADSP isn't running yet.
+ * Linux does this in two probe stages (probe → for_each_child).
+ * We do both upfront since ADSP isn't running yet, but preserve
+ * the two-kick order for protocol fidelity.
  *
  * Does NOT allocate item 429 — ADSP firmware creates its own outbound
- * item (per-processor ownership model).  U-Boot only polls item 429
- * via smem_get after auth_and_reset.
+ * item (per-processor ownership model).
  */
 static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 			   struct qpas_smp2p_info *info)
 {
 	struct ofnode_phandle_args smem_states_args;
-	struct ofnode_phandle_args mbox_args;
 	ofnode outbound_ofnode;
 	const char *entry_name;
 	struct qpas_smp2p_smem_item *out;
-	struct udevice *ipcc_dev;
-	struct mbox_chan mbox;
 	int ret;
 
 	ret = qpas_find_smp2p(node, info);
@@ -480,33 +541,30 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	/*
 	 * Write header with correct endianness.  Linux:
 	 *   memset(out, 0, sizeof(*out));
-	 *   out->magic = SMP2P_MAGIC;
-	 *   out->local_pid = smp2p->local_pid;
-	 *   out->remote_pid = smp2p->remote_pid;
-	 *   out->total_entries = SMP2P_MAX_ENTRY;
-	 *   out->valid_entries = 0;
-	 *   out->features = SMP2P_ALL_FEATURES;
-	 *   wmb();
-	 *   out->version = in_version && in_version <= 2 ? in_version : 2;
-	 */
+	/* Phase 1: header → dmb → version → kick (Linux order) */
 	memset(out, 0, sizeof(*out));
 	out->magic = cpu_to_le32(QPAS_SMP2P_MAGIC);
 	out->local_pid = cpu_to_le16(SMEM_HOST_APPS);
 	out->remote_pid = cpu_to_le16(info->remote_pid);
 	out->total_entries = cpu_to_le16(QPAS_SMP2P_MAX_ENTRY);
 	out->valid_entries = cpu_to_le16(0);
-
-	/* features[0] = SMP2P_FEATURE_SSR_ACK (bit 0 = Linux ALL_FEATURES) */
 	memset(out->features, 0, sizeof(out->features));
 	out->features[0] = SMP2P_FEATURE_SSR_ACK;
 
-	/*
-	 * Populate outbound entries[0] from DT qcom,smem-states.
-	 * Linux: qcom_smp2p_outbound_entry() copies entry->name into
-	 * out->entries[n].name and bumps valid_entries.  Missing or
-	 * unparseable entry is fatal — the remote expects at least one.
-	 */
+	dmb();
+	out->version = SMP2P_MAX_VERSION;
+
+	log_warning("qcom-adsp-pas: SMP2P header done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x\n",
+		    info->outbound_item,
+		    le32_to_cpu(out->magic), out->version,
+		    le16_to_cpu(out->local_pid), le16_to_cpu(out->remote_pid),
+		    out->features[0]);
+
+	qpas_smp2p_kick(info);
+
+	/* Phase 2: entry → valid_entries → kick */
 	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
+					     NULL, 0, 0, &smem_states_args);
 					     NULL, 0, 0, &smem_states_args);
 	if (ret) {
 		log_warning("qcom-adsp-pas: SMP2P qcom,smem-states parse failed ret=%d\n",
@@ -532,49 +590,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	out->valid_entries = cpu_to_le16(1);
 	log_warning("qcom-adsp-pas: SMP2P out entry='%s'\n", entry_name);
 
-	/* Write barrier then publish version */
-	dmb();
-	out->version = SMP2P_MAX_VERSION;
-
-	log_warning("qcom-adsp-pas: SMP2P out init done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x valid=%u\n",
-		    info->outbound_item,
-		    le32_to_cpu(out->magic), out->version,
-		    le16_to_cpu(out->local_pid), le16_to_cpu(out->remote_pid),
-		    out->features[0], le16_to_cpu(out->valid_entries));
-
-	/*
-	 * Kick remote via IPCC using the SMP2P node's own mboxes.
-	 * Linux: qcom_smp2p_kick() uses mbox_send_message() on a channel
-	 * obtained from the SMP2P device's own mboxes in qcom_smp2p_probe().
-	 */
-	if (ofnode_valid(info->node)) {
-		ret = ofnode_parse_phandle_with_args(info->node, "mboxes",
-						     "#mbox-cells", 0, 0,
-						     &mbox_args);
-		if (!ret && ofnode_valid(mbox_args.node) &&
-		    mbox_args.args_count >= 2) {
-			ret = uclass_get_device_by_ofnode(UCLASS_MAILBOX,
-							  mbox_args.node,
-							  &ipcc_dev);
-			if (!ret) {
-				const struct mbox_ops *ops;
-
-				ops = ipcc_dev->driver->ops;
-				mbox.dev = ipcc_dev;
-				mbox.con_priv = NULL;
-				if (ops->of_xlate)
-					ret = ops->of_xlate(&mbox, &mbox_args);
-				else
-					mbox.id = mbox_args.args[0];
-				if (!ret) {
-					if (ops->request)
-						ops->request(&mbox);
-					mbox_send(&mbox, NULL);
-					log_warning("qcom-adsp-pas: SMP2P kick sent via IPCC\n");
-				}
-			}
-		}
-	}
+	qpas_smp2p_kick(info);
 
 	return 0;
 }
@@ -602,14 +618,20 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 	int i;
 
 	/*
-	 * SMP2P items are in the global SMEM heap (not per-processor
-	 * partitions), so use SMEM_HOST_APPS to bypass the
-	 * ADSP-private partition search that returns -ENOENT for
-	 * host=2.  This matches what Linux does with SMEM_HOST_ANY.
+	 * Linux reads inbound items using remote_pid (e.g. host=2 for
+	 * ADSP). Try that first, then fall back to SMEM_HOST_APPS
+	 * (U-Boot compatibility — may resolve items ABL placed in the
+	 * global partition, which Linux wouldn't see since SMEM_HOST_ANY
+	 * is -1, not what SMP2P uses directly).
 	 */
-	log_warning("qcom-adsp-pas: smem_get begin item=%u\n",
-		    info->inbound_item);
-	item = smem_get(smem, SMEM_HOST_APPS, info->inbound_item, &size);
+	log_warning("qcom-adsp-pas: inbound smem_get host=%u item=%u\n",
+		    info->remote_pid, info->inbound_item);
+	item = smem_get(smem, info->remote_pid, info->inbound_item, &size);
+	if (IS_ERR_OR_NULL(item)) {
+		size = 0;
+		item = smem_get(smem, SMEM_HOST_APPS,
+				info->inbound_item, &size);
+	}
 	log_warning("qcom-adsp-pas: smem_get done item=%p size=%zu\n",
 		    item, size);
 	if (IS_ERR_OR_NULL(item))
@@ -845,8 +867,20 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 
 		/* Fatal: ADSP crashed — shutdown and report */
 		if (value & BIT(info.fatal_bit)) {
+			size_t cr_size = 0;
+			char *reason;
+
 			log_warning("qcom-adsp-pas: ADSP fatal at %lu ms value=%08x\n",
 				    get_timer(start), value);
+
+			reason = smem_get(smem, SMEM_HOST_APPS,
+					  QCOM_ADSP_CRASH_REASON_SMEM, &cr_size);
+			if (!IS_ERR_OR_NULL(reason) && cr_size > 0) {
+				reason[cr_size - 1] = '\0';
+				log_warning("qcom-adsp-pas: crash reason='%s'\n",
+					    reason);
+			}
+
 			qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
 			return -EIO;
 		}
@@ -879,6 +913,18 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 
 	log_warning("qcom-adsp-pas: ADSP SMP2P ready timeout after %lu ms\n",
 		    get_timer(start));
+
+	{
+		size_t cr_size = 0;
+		char *reason = smem_get(smem, SMEM_HOST_APPS,
+					QCOM_ADSP_CRASH_REASON_SMEM, &cr_size);
+		if (!IS_ERR_OR_NULL(reason) && cr_size > 0) {
+			reason[cr_size - 1] = '\0';
+			log_warning("qcom-adsp-pas: crash reason='%s'\n",
+				    reason);
+		}
+	}
+
 	return -ETIMEDOUT;
 }
 
@@ -1677,20 +1723,30 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_metadata;
 	}
 
-	/* Step 4.5: SMP2P init — Linux smp2p.c alloc_outbound_item equivalent.
-	 * Allocates and initializes both outbound (APPS→ADSP, item 428)
-	 * and inbound (ADSP→APPS, item 429) SMEM items.
+	/* Step 4.5: SMP2P init — Linux smp2p.c probe equivalent.
+	 *
+	 * U-Boot must do what Linux's smp2p platform driver would
+	 * normally handle: allocate and initialize the APSS outbound
+	 * SMEM item (428), populate the outbound entry, and kick the
+	 * SMP2P edge via IPCC.  Failure is fatal — Linux's Q6V5 init
+	 * depends on SMP2P SMEM state availability and would fail
+	 * probe if the SMP2P driver hadn't registered it.
 	 */
 	{
 		struct qpas_smp2p_info smp2p_info = {};
 		struct udevice *smem_dev;
-		int rd;
 
-		rd = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
-		if (!rd) {
-			rd = qpas_smp2p_init(smem_dev, node, &smp2p_info);
-			log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", rd);
+		ret = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
+		if (ret) {
+			log_warning("qcom-adsp-pas: SMEM lookup for SMP2P ret=%d\n",
+				    ret);
+			goto out_free_metadata;
 		}
+
+		ret = qpas_smp2p_init(smem_dev, node, &smp2p_info);
+		log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", ret);
+		if (ret)
+			goto out_free_metadata;
 	}
 
 	/* Step 5: SCM auth_and_reset */
