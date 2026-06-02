@@ -101,6 +101,44 @@
 	};
 };
 
+/* Linux QCM6490 addon SMP2P entries needed before ADSP/CDSP release. */
+&{/smp2p-adsp} {
+	smp2p_rdbg2_out: smp2p-rdbg2-out {
+		qcom,entry-name = "rdbg";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	smp2p_rdbg2_in: smp2p-rdbg2-in {
+		qcom,entry-name = "rdbg";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+
+	sleepstate_smp2p_in: qcom,sleepstate-in {
+		qcom,entry-name = "sleepstate_see";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+
+	sleepstate_smp2p_out: sleepstate-out {
+		qcom,entry-name = "sleepstate";
+		#qcom,smem-state-cells = <1>;
+	};
+};
+
+&{/smp2p-cdsp} {
+	smp2p_rdbg5_out: smp2p-rdbg5-out {
+		qcom,entry-name = "rdbg";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	smp2p_rdbg5_in: smp2p-rdbg5-in {
+		qcom,entry-name = "rdbg";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+};
+
 &usb_1_qmpphy {
 	bootph-all;
 };
