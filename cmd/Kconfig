@@ -2727,14 +2727,13 @@ endmenu
 
 menu "Qualcomm commands"
 config CMD_ADSP
-	bool "adsp - boot ADSP PAS standalone"
+	bool "adsp/cdsp - boot Qualcomm PAS processors standalone"
 	depends on QCOM_ADSP_PAS
 	help
-	  Provide an 'adsp' shell command that boots the ADSP/LPASS
-	  remote processor through Peripheral Authentication Service.
+	  Provide 'adsp' and 'cdsp' shell commands that boot Qualcomm
+	  remote processors through Peripheral Authentication Service.
 	  This is intended for bring-up testing without the DP/USB-C /
-	  PMIC-GLINK consumer path.  After boot, the diagnostic poll
-	  runs and shuts ADSP down on crash or timeout.
+	  PMIC-GLINK consumer path.
 
 endmenu
 

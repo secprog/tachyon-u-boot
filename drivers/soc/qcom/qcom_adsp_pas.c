@@ -46,12 +46,16 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
-#define QCOM_ADSP_PAS_ID			1
 #define QCOM_ADSP_COMPAT			"qcom,sc7280-adsp-pas"
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
+#define QCOM_ADSP_PAS_ID			1
+#define QCOM_ADSP_CRASH_REASON_SMEM		423
+#define QCOM_CDSP_COMPAT			"qcom,sc7280-cdsp-pas"
+#define QCOM_CDSP_DEFAULT_FW			"cdsp.mdt"
+#define QCOM_CDSP_PAS_ID			18
+#define QCOM_CDSP_CRASH_REASON_SMEM		601
 #define QCOM_MODEM_PARTITION			"modem_a"
 #define QCOM_ADSP_START_TIMEOUT_MS		5000
-#define QCOM_ADSP_CRASH_REASON_SMEM		423
 #define QPAS_MAX_POWER_DOMAINS			4
 #define QPAS_SMP2P_MAX_ENTRY			16
 #define QPAS_SMP2P_MAX_ENTRY_NAME		16
@@ -95,8 +99,6 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QPAS_PIL_RELOC_COMPAT			"qcom,pil-reloc-info"
 #define QPAS_PIL_RELOC_NAME_LEN		8
 #define QPAS_PIL_RELOC_ENTRY_SIZE		(QPAS_PIL_RELOC_NAME_LEN + sizeof(u64) + sizeof(u32))
-#define QPAS_PIL_IMAGE_NAME			"adsp"
-
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -129,6 +131,18 @@ struct qpas_fw {
 	struct blk_desc *desc;
 	int part;
 	char path[128];
+};
+
+struct qpas_proc {
+	const char *name;
+	const char *compat;
+	const char *default_fw;
+	const char *load_state;
+	const char *pil_image;
+	u32 pas_id;
+	u32 crash_reason_smem;
+	bool booted;
+	bool failed;
 };
 
 struct qpas_power_domains {
@@ -175,8 +189,25 @@ struct qpas_smp2p_smem_item {
 	} entries[QPAS_SMP2P_MAX_ENTRY];
 } __packed;
 
-static bool qpas_booted;
-static bool qpas_adsp_failed;
+static struct qpas_proc qpas_adsp_proc = {
+	.name = "ADSP",
+	.compat = QCOM_ADSP_COMPAT,
+	.default_fw = QCOM_ADSP_DEFAULT_FW,
+	.load_state = "adsp",
+	.pil_image = "adsp",
+	.pas_id = QCOM_ADSP_PAS_ID,
+	.crash_reason_smem = QCOM_ADSP_CRASH_REASON_SMEM,
+};
+
+static struct qpas_proc qpas_cdsp_proc = {
+	.name = "CDSP",
+	.compat = QCOM_CDSP_COMPAT,
+	.default_fw = QCOM_CDSP_DEFAULT_FW,
+	.load_state = "cdsp",
+	.pil_image = "cdsp",
+	.pas_id = QCOM_CDSP_PAS_ID,
+	.crash_reason_smem = QCOM_CDSP_CRASH_REASON_SMEM,
+};
 
 static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
 {
@@ -902,7 +933,7 @@ static void qpas_log_q6v5_irq_resources(ofnode node)
 
 static int qcom_scm_pas_shutdown(u32 pas_id);
 
-static void qpas_log_pre_release_state(ofnode node)
+static void qpas_log_pre_release_state(struct qpas_proc *proc, ofnode node)
 {
 	struct qpas_smp2p_info info = {};
 	struct udevice *smem;
@@ -929,8 +960,7 @@ static void qpas_log_pre_release_state(ofnode node)
 	log_warning("qcom-adsp-pas: pre-release SMP2P read ret=%d value=%08x\n",
 		    ret, value);
 
-	cr = smem_get(smem, SMEM_HOST_APPS, QCOM_ADSP_CRASH_REASON_SMEM,
-		      &cr_sz);
+	cr = smem_get(smem, SMEM_HOST_APPS, proc->crash_reason_smem, &cr_sz);
 	if (IS_ERR_OR_NULL(cr) || !cr_sz) {
 		log_warning("qcom-adsp-pas: pre-release crash reason empty\n");
 		return;
@@ -953,7 +983,8 @@ static void qpas_log_pre_release_state(ofnode node)
  * @pds:      proxy power domains to release on handover (may be NULL)
  * @return:   0 on ready, -EIO on fatal, -ETIMEDOUT on timeout
  */
-static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
+static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
+			       struct qpas_clocks *clks,
 			       struct qpas_power_domains *pds)
 {
 	struct qpas_smp2p_info info = {};
@@ -977,8 +1008,8 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 		return ret;
 	}
 
-	log_warning("qcom-adsp-pas: waiting ADSP SMP2P ready (remote_pid=%u) timeout=%d ms\n",
-		    info.remote_pid, QCOM_ADSP_START_TIMEOUT_MS);
+	log_warning("qcom-adsp-pas: waiting %s SMP2P ready (remote_pid=%u) timeout=%d ms\n",
+		    proc->name, info.remote_pid, QCOM_ADSP_START_TIMEOUT_MS);
 
 	start = get_timer(0);
 	do {
@@ -1017,18 +1048,18 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 			size_t cr_size = 0;
 			char *reason;
 
-			log_warning("qcom-adsp-pas: ADSP fatal at %lu ms value=%08x\n",
-				    get_timer(start), value);
+			log_warning("qcom-adsp-pas: %s fatal at %lu ms value=%08x\n",
+				    proc->name, get_timer(start), value);
 
 			reason = smem_get(smem, SMEM_HOST_APPS,
-					  QCOM_ADSP_CRASH_REASON_SMEM, &cr_size);
+					  proc->crash_reason_smem, &cr_size);
 			if (!IS_ERR_OR_NULL(reason) && cr_size > 0) {
 				reason[cr_size - 1] = '\0';
 				log_warning("qcom-adsp-pas: crash reason='%s'\n",
 					    reason);
 			}
 
-			qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+			qcom_scm_pas_shutdown(proc->pas_id);
 			return -EIO;
 		}
 
@@ -1039,8 +1070,8 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 		 */
 		if (!handover_seen && info.handover_bit != U32_MAX &&
 		    (value & BIT(info.handover_bit))) {
-			log_warning("qcom-adsp-pas: ADSP handover at %lu ms, releasing proxy resources\n",
-				    get_timer(start));
+			log_warning("qcom-adsp-pas: %s handover at %lu ms, releasing proxy resources\n",
+				    proc->name, get_timer(start));
 			handover_seen = true;
 			if (clks)
 				qpas_disable_clocks(clks);
@@ -1050,21 +1081,21 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 
 		/* Ready: ADSP booted successfully */
 		if (value & BIT(info.ready_bit)) {
-			log_warning("qcom-adsp-pas: ADSP ready at %lu ms value=%08x\n",
-				    get_timer(start), value);
+			log_warning("qcom-adsp-pas: %s ready at %lu ms value=%08x\n",
+				    proc->name, get_timer(start), value);
 			return 0;
 		}
 
 		mdelay(20);
 	} while (get_timer(start) < QCOM_ADSP_START_TIMEOUT_MS);
 
-	log_warning("qcom-adsp-pas: ADSP SMP2P ready timeout after %lu ms\n",
-		    get_timer(start));
+	log_warning("qcom-adsp-pas: %s SMP2P ready timeout after %lu ms\n",
+		    proc->name, get_timer(start));
 
 	{
 		size_t cr_size = 0;
 		char *reason = smem_get(smem, SMEM_HOST_APPS,
-					QCOM_ADSP_CRASH_REASON_SMEM, &cr_size);
+					proc->crash_reason_smem, &cr_size);
 		if (!IS_ERR_OR_NULL(reason) && cr_size > 0) {
 			reason[cr_size - 1] = '\0';
 			log_warning("qcom-adsp-pas: crash reason='%s'\n",
@@ -1669,8 +1700,8 @@ static int qpas_mdt_read_metadata(const struct qpas_fw *fw,
 	return 0;
 }
 
-static int qpas_mdt_init_image(const struct qpas_fw *fw, phys_addr_t mem_phys,
-			       void **metadata_ctxp)
+static int qpas_mdt_init_image(struct qpas_proc *proc, const struct qpas_fw *fw,
+			       phys_addr_t mem_phys, void **metadata_ctxp)
 {
 	const Elf32_Ehdr *ehdr = fw->data;
 	const u8 *data = fw->data;
@@ -1724,14 +1755,14 @@ static int qpas_mdt_init_image(const struct qpas_fw *fw, phys_addr_t mem_phys,
 	if (ret)
 		return ret;
 
-	ret = qcom_scm_pas_init_image(QCOM_ADSP_PAS_ID, metadata,
+	ret = qcom_scm_pas_init_image(proc->pas_id, metadata,
 				      metadata_len, metadata_ctxp);
 	free(metadata);
 	if (ret)
 		return ret;
 
 	if (relocate) {
-		ret = qcom_scm_pas_mem_setup(QCOM_ADSP_PAS_ID, mem_phys,
+		ret = qcom_scm_pas_mem_setup(proc->pas_id, mem_phys,
 					     max_addr - min_addr);
 	} else {
 		log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP skipped relocate=%d\n",
@@ -2012,7 +2043,8 @@ static int qpas_pil_info_store(const char *image, phys_addr_t base,
 	return 0;
 }
 
-static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
+static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
+				   ofnode node)
 {
 	struct qpas_power_domains pds = {};
 	struct qpas_clocks clks = {};
@@ -2027,11 +2059,12 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	size_t mem_size;
 	int ret;
 
-	if (qpas_booted)
+	if (proc->booted)
 		return 0;
 
-	if (qpas_adsp_failed) {
-		log_warning("qcom-adsp-pas: previous ADSP boot failed, refusing retry\n");
+	if (proc->failed) {
+		log_warning("qcom-adsp-pas: previous %s boot failed, refusing retry\n",
+			    proc->name);
 		return -EIO;
 	}
 
@@ -2102,8 +2135,9 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		return ret;
 	}
 
-	ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", true);
-	log_warning("qcom-adsp-pas: QMP load_state adsp on ret=%d\n", ret);
+	ret = qcom_aoss_qmp_load_state(qmp_dev, proc->load_state, true);
+	log_warning("qcom-adsp-pas: QMP load_state %s on ret=%d\n",
+		    proc->load_state, ret);
 	if (ret) {
 		return ret;
 	}
@@ -2137,7 +2171,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 
 	fw_name = ofnode_read_string(node, "firmware-name");
 	if (!fw_name)
-		fw_name = QCOM_ADSP_DEFAULT_FW;
+		fw_name = proc->default_fw;
 
 	log_warning("qcom-adsp-pas: boot start firmware=%s mem=%llx size=%zu\n",
 		    fw_name, (unsigned long long)mem_phys, mem_size);
@@ -2157,7 +2191,8 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * writes and ADSP reads, no risk of a dirty cache line surviving
 	 * flush and corrupting the firmware image the ADSP executes.
 	 */
-	log_warning("qcom-adsp-pas: mapping ADSP region as non-cacheable\n");
+	log_warning("qcom-adsp-pas: mapping %s region as non-cacheable\n",
+		    proc->name);
 	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_OFF);
 
 	ret = qpas_read_firmware(&fw, fw_name);
@@ -2170,7 +2205,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_fw;
 	}
 
-	ret = qpas_mdt_init_image(&fw, mem_phys, &metadata_ctx);
+	ret = qpas_mdt_init_image(proc, &fw, mem_phys, &metadata_ctx);
 	if (ret)
 		goto out_free_fw;
 
@@ -2190,8 +2225,8 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * cacheable).  If the CRC is stable and ADSP still fails,
 	 * caching is ruled out.
 	 */
-	log_warning("qcom-adsp-pas: adsp crc_after_load=%08x\n",
-		    crc32(0, mem_region, mem_size));
+	log_warning("qcom-adsp-pas: %s crc_after_load=%08x\n",
+		    proc->load_state, crc32(0, mem_region, mem_size));
 
 	/*
 	 * PIL relocation info store (Linux parity: qcom_pil_info_store)
@@ -2201,14 +2236,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * Linux calls this between qcom_mdt_pas_load() and
 	 * qcom_scm_pas_auth_and_reset().  Not fatal on failure.
 	 */
-	ret = qpas_pil_info_store(QPAS_PIL_IMAGE_NAME, mem_phys, mem_size);
+	ret = qpas_pil_info_store(proc->pil_image, mem_phys, mem_size);
 	log_warning("qcom-adsp-pas: PIL info store ret=%d\n", ret);
 	if (ret)
 		log_warning("qcom-adsp-pas: continuing despite PIL info failure\n");
 
 	if (QCOM_ADSP_SKIP_BOOT) {
 		log_warning("qcom-adsp-pas: SKIP_BOOT: bypassing auth_and_reset + SMP2P wait\n");
-		qpas_booted = true;
+		proc->booted = true;
 		ret = 0;
 		goto out_free_metadata;
 	}
@@ -2218,32 +2253,33 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * store. If crc_before_auth != crc_after_load, something wrote to the
 	 * ADSP region.
 	 */
-	log_warning("qcom-adsp-pas: adsp crc_before_auth=%08x\n",
-		    crc32(0, mem_region, mem_size));
+	log_warning("qcom-adsp-pas: %s crc_before_auth=%08x\n",
+		    proc->load_state, crc32(0, mem_region, mem_size));
 
-	qpas_log_pre_release_state(node);
+	qpas_log_pre_release_state(proc, node);
 
 	/* Step 5: SCM auth_and_reset */
-	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
-	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
+	log_warning("qcom-adsp-pas: preparing to boot %s\n", proc->name);
+	ret = qcom_scm_pas_auth_and_reset(proc->pas_id);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
 		goto out_free_metadata;
 
 	/*
-	 * Diagnostic survival poll: check SMP2P item 429 and crash
-	 * reason 423 every 50ms for 600ms (under the known ~1000ms
-	 * reset threshold).  On crash, follow Linux stop order:
+	 * ADSP diagnostic survival poll: check SMP2P and crash reason every
+	 * 50ms for 600ms (under the known ~1000ms reset threshold).  On crash,
+	 * follow Linux stop order:
 	 *   smp2p stop-bit -> wait stop-ack -> SCM shutdown -> cleanup.
 	 *
-	 * When CONFIG_QCOM_ADSP_PAS_STANDALONE is set, skip the
-	 * diagnostic entirely and wait for ADSP ready via the full
-	 * SMP2P state machine (Linux qcom_q6v5_wait_for_start equivalent).
+	 * CDSP must remain running for the Linux-parity precondition test, so
+	 * it always uses the full SMP2P state machine instead of this ADSP-only
+	 * crash diagnostic.
 	 */
-	if (IS_ENABLED(CONFIG_QCOM_ADSP_PAS_STANDALONE)) {
-		ret = qpas_wait_for_start(node, &clks, &pds);
+	if (IS_ENABLED(CONFIG_QCOM_ADSP_PAS_STANDALONE) ||
+	    proc != &qpas_adsp_proc) {
+		ret = qpas_wait_for_start(proc, node, &clks, &pds);
 		if (!ret) {
-			qpas_booted = true;
+			proc->booted = true;
 			goto out_free_metadata;
 		}
 		/* qpas_wait_for_start already shuts down on fatal */
@@ -2294,7 +2330,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 					size_t cr_sz = 0;
 					char *cr = smem_get(diag_smem,
 						SMEM_HOST_APPS,
-						QCOM_ADSP_CRASH_REASON_SMEM,
+						proc->crash_reason_smem,
 						&cr_sz);
 
 					log_warning("qcom-adsp-pas: diag t=%lu cr=%s\n",
@@ -2374,10 +2410,10 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		 * even if stop-ack timed out.
 		 */
 		log_warning("qcom-adsp-pas: pas_shutdown begin\n");
-		ret = qcom_scm_pas_shutdown(QCOM_ADSP_PAS_ID);
+		ret = qcom_scm_pas_shutdown(proc->pas_id);
 		log_warning("qcom-adsp-pas: pas_shutdown ret=%d\n", ret);
 
-		qpas_adsp_failed = true;
+		proc->failed = true;
 		ret = -EIO;
 		goto out_free_metadata;
 	}
@@ -2406,20 +2442,24 @@ out_qmp_off:
 	if (ret && qmp_on) {
 		int qmp_off_ret;
 
-		qmp_off_ret = qcom_aoss_qmp_load_state(qmp_dev, "adsp", false);
-		log_warning("qcom-adsp-pas: QMP load_state adsp off ret=%d\n",
-			    qmp_off_ret);
+		qmp_off_ret = qcom_aoss_qmp_load_state(qmp_dev,
+						       proc->load_state, false);
+		log_warning("qcom-adsp-pas: QMP load_state %s off ret=%d\n",
+			    proc->load_state, qmp_off_ret);
 	}
 	return ret;
 }
 
 static int qcom_adsp_pas_probe(struct udevice *dev)
 {
-	return qcom_adsp_pas_boot_node(dev, dev_ofnode(dev));
+	struct qpas_proc *proc = (struct qpas_proc *)dev_get_driver_data(dev);
+
+	return qcom_q6v5_pas_boot_node(proc, dev, dev_ofnode(dev));
 }
 
 static const struct udevice_id qcom_adsp_pas_ids[] = {
-	{ .compatible = QCOM_ADSP_COMPAT },
+	{ .compatible = QCOM_ADSP_COMPAT, .data = (ulong)&qpas_adsp_proc },
+	{ .compatible = QCOM_CDSP_COMPAT, .data = (ulong)&qpas_cdsp_proc },
 	{ }
 };
 
@@ -2431,34 +2471,45 @@ U_BOOT_DRIVER(qcom_adsp_pas) = {
 	.flags = DM_FLAG_DEFAULT_PD_CTRL_OFF,
 };
 
-int qcom_adsp_pas_boot(void)
+static int qcom_q6v5_pas_boot(struct qpas_proc *proc)
 {
 	struct udevice *dev;
 	ofnode node;
 	int ret;
 
-	if (qpas_booted)
+	if (proc->booted)
 		return 0;
 
-	if (qpas_adsp_failed) {
-		log_warning("qcom-adsp-pas: previous ADSP boot failed, refusing retry\n");
+	if (proc->failed) {
+		log_warning("qcom-adsp-pas: previous %s boot failed, refusing retry\n",
+			    proc->name);
 		return -EIO;
 	}
 
-	node = ofnode_by_compatible(ofnode_null(), QCOM_ADSP_COMPAT);
+	node = ofnode_by_compatible(ofnode_null(), proc->compat);
 	if (!ofnode_valid(node)) {
 		log_warning("qcom-adsp-pas: missing %s DT node\n",
-			    QCOM_ADSP_COMPAT);
+			    proc->compat);
 		return -ENOENT;
 	}
 
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &dev);
-	if (!ret || qpas_booted)
+	if (!ret || proc->booted)
 		return 0;
 
-	if (qpas_adsp_failed && ret == -EIO)
+	if (proc->failed && ret == -EIO)
 		return ret;
 
 	log_warning("qcom-adsp-pas: DM device lookup/probe failed ret=%d\n", ret);
 	return ret;
+}
+
+int qcom_adsp_pas_boot(void)
+{
+	return qcom_q6v5_pas_boot(&qpas_adsp_proc);
+}
+
+int qcom_cdsp_pas_boot(void)
+{
+	return qcom_q6v5_pas_boot(&qpas_cdsp_proc);
 }

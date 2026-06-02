@@ -5,8 +5,14 @@
 
 #if CONFIG_IS_ENABLED(QCOM_ADSP_PAS)
 int qcom_adsp_pas_boot(void);
+int qcom_cdsp_pas_boot(void);
 #else
 static inline int qcom_adsp_pas_boot(void)
+{
+	return 0;
+}
+
+static inline int qcom_cdsp_pas_boot(void)
 {
 	return 0;
 }

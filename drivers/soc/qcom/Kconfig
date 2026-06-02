@@ -25,7 +25,7 @@ config QCOM_RPMH
 	  if you need to control regulators on Qualcomm platforms, say y here.
 
 config QCOM_ADSP_PAS
-	bool "Qualcomm ADSP PAS bootstrap"
+	bool "Qualcomm ADSP/CDSP PAS bootstrap"
 	depends on ARM64 && OF_CONTROL && BLK && ARCH_SNAPDRAGON
 	select ARM_SMCCC
 	select CLK
@@ -35,9 +35,9 @@ config QCOM_ADSP_PAS
 	select POWER_DOMAIN
 	select QCOM_RPMH_POWER_DOMAIN
 	help
-	  Start the Qualcomm ADSP/LPASS remote processor through the
-	  Peripheral Authentication Service using firmware stored in the
-	  modem_a FAT partition.
+	  Start Qualcomm ADSP/LPASS and CDSP remote processors through
+	  the Peripheral Authentication Service using firmware stored in
+	  the modem_a FAT partition.
 
 if QCOM_ADSP_PAS
 

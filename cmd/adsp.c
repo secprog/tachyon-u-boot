@@ -25,8 +25,26 @@ static int do_adsp_boot(struct cmd_tbl *cmdtp, int flag, int argc,
 	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
+static int do_cdsp_boot(struct cmd_tbl *cmdtp, int flag, int argc,
+			char *const argv[])
+{
+	int ret;
+
+	log_warning("cdsp: PAS boot start (Linux-parity CDSP precondition test)\n");
+	ret = qcom_cdsp_pas_boot();
+	log_warning("cdsp: PAS boot ret=%d\n", ret);
+
+	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
 U_BOOT_CMD(
 	adsp, 1, 0, do_adsp_boot,
 	"Boot ADSP PAS standalone (isolated from DP/PMIC-GLINK)",
+	""
+);
+
+U_BOOT_CMD(
+	cdsp, 1, 0, do_cdsp_boot,
+	"Boot CDSP PAS standalone before ADSP",
 	""
 );
