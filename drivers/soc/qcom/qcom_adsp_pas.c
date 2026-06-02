@@ -169,7 +169,11 @@ struct qpas_bcm_aux {
 struct qpas_bcm_vote {
 	const char *name;
 	u32 addr;
+	u32 unit;
+	u16 width;
 	u8 vcd;
+	u32 vote_x;
+	u32 vote_y;
 };
 
 struct qpas_smp2p_info {
@@ -287,26 +291,44 @@ static int qpas_bcm_get(const char *name, struct qpas_bcm_vote *vote)
 	}
 
 	vote->vcd = aux->vcd;
+	vote->unit = le32_to_cpu(aux->unit);
+	vote->width = le16_to_cpu(aux->width);
 	log_warning("qcom-adsp-pas: BCM %s addr=%#x unit=%u width=%u vcd=%u\n",
-		    name, vote->addr, le32_to_cpu(aux->unit),
-		    le16_to_cpu(aux->width), vote->vcd);
+		    name, vote->addr, vote->unit, vote->width, vote->vcd);
 
 	return 0;
 }
 
+static u64 qpas_div_round_up_u64(u64 dividend, u64 divisor)
+{
+	return (dividend + divisor - 1) / divisor;
+}
+
+static u32 qpas_bcm_vote_field(u64 bw, u32 unit)
+{
+	u64 val;
+
+	if (!bw || !unit)
+		return 0;
+
+	val = qpas_div_round_up_u64(bw, unit);
+	if (val > BCM_TCS_CMD_VOTE_MASK)
+		return BCM_TCS_CMD_VOTE_MASK;
+
+	return val;
+}
+
+static u64 qpas_icb_scale_bw(u64 bw, u64 dividend, u64 divisor)
+{
+	if (!bw || !dividend || !divisor)
+		return 0;
+
+	return qpas_div_round_up_u64(bw * dividend, divisor);
+}
+
 static int qpas_cdsp_proxy_vote(struct udevice *rpmh_dev, bool enable)
 {
-	const char * const names[] = {
-		/*
-		 * Linux qcom_q6v5_prepare() CDSP DT path:
-		 *   MASTER_CDSP_PROC -> SLAVE_EBI1: CO3, CO0
-		 *
-		 * Qualcomm Cedros PILProxyVoteLib CDSP boot proxy paths:
-		 *   MASTER_CDSP_PROC -> SLAVE_CLK_CTL: CO3, CN1
-		 *   MASTER_MDP0      -> SLAVE_EBI1:   MM1, MC0, ACV
-		 */
-		"CO0", "CO3", "CN1", "MM1", "MC0", "ACV",
-	};
+	const char * const names[] = { "CO3", "CN1" };
 	struct qpas_bcm_vote votes[ARRAY_SIZE(names)];
 	struct tcs_cmd cmds[ARRAY_SIZE(names)];
 	int ret;
@@ -320,6 +342,42 @@ static int qpas_cdsp_proxy_vote(struct udevice *rpmh_dev, bool enable)
 		ret = qpas_bcm_get(names[i], &votes[i]);
 		if (ret)
 			return ret;
+	}
+
+	/*
+	 * Tachyon's XBL reports SocKodiakLAA.  Kodiak PilProxyVoteLib votes
+	 * only MASTER_CDSP_PROC -> SLAVE_CLK_CTL with ICB TYPE_3
+	 * ib=100 MB/s, ab=100 MB/s.
+	 *
+	 * Kodiak ICB route:
+	 *   master qxm_nsp       -> BCM CO3, width 32, agg ports 2
+	 *   slave  qhs_clk_ctl   -> BCM CN1, width 4,  agg ports 1
+	 *
+	 * Qualcomm's ICB aggregation scales by bcm_width/node_width, then
+	 * encodes ceil(ib_or_ab / bcm_unit) into the BCM vote fields.
+	 */
+	for (i = 0; i < ARRAY_SIZE(votes); i++) {
+		if (!strcmp(votes[i].name, "CO3")) {
+			u64 ib = qpas_icb_scale_bw(100000000ULL,
+						   votes[i].width, 32);
+			u64 ab = qpas_icb_scale_bw(100000000ULL,
+						   votes[i].width, 32 * 2);
+
+			votes[i].vote_y = qpas_bcm_vote_field(ib,
+							      votes[i].unit);
+			votes[i].vote_x = qpas_bcm_vote_field(ab,
+							      votes[i].unit);
+		} else if (!strcmp(votes[i].name, "CN1")) {
+			u64 ib = qpas_icb_scale_bw(100000000ULL,
+						   votes[i].width, 4);
+			u64 ab = qpas_icb_scale_bw(100000000ULL,
+						   votes[i].width, 4);
+
+			votes[i].vote_y = qpas_bcm_vote_field(ib,
+							      votes[i].unit);
+			votes[i].vote_x = qpas_bcm_vote_field(ab,
+							      votes[i].unit);
+		}
 	}
 
 	for (i = 0; i < ARRAY_SIZE(votes) - 1; i++) {
@@ -336,15 +394,17 @@ static int qpas_cdsp_proxy_vote(struct udevice *rpmh_dev, bool enable)
 	for (i = 0; i < ARRAY_SIZE(votes); i++) {
 		bool commit = i == ARRAY_SIZE(votes) - 1 ||
 			      votes[i].vcd != votes[i + 1].vcd;
-		u32 vote_y = enable ? BCM_TCS_CMD_VOTE_MASK : 0;
+		u32 vote_x = enable ? votes[i].vote_x : 0;
+		u32 vote_y = enable ? votes[i].vote_y : 0;
+		bool valid = enable && (vote_x || vote_y);
 
 		cmds[i].addr = votes[i].addr;
-		cmds[i].data = BCM_TCS_CMD(commit, enable, 0, vote_y);
+		cmds[i].data = BCM_TCS_CMD(commit, valid, vote_x, vote_y);
 		cmds[i].wait = commit;
 
-		log_warning("qcom-adsp-pas: CDSP proxy %s BCM %s vcd=%u commit=%d data=%#x\n",
+		log_warning("qcom-adsp-pas: CDSP proxy %s BCM %s vcd=%u commit=%d x=%#x y=%#x data=%#x\n",
 			    enable ? "vote" : "unvote", votes[i].name,
-			    votes[i].vcd, commit, cmds[i].data);
+			    votes[i].vcd, commit, vote_x, vote_y, cmds[i].data);
 	}
 
 	ret = rpmh_write(rpmh_dev, RPMH_ACTIVE_ONLY_STATE, cmds,
@@ -2265,7 +2325,7 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
 	}
 
-	/* Step 2b: CDSP Linux interconnect + Qualcomm PIL proxy votes */
+	/* Step 2b: CDSP Kodiak PIL proxy vote */
 	if (proc == &qpas_cdsp_proc && ofnode_read_bool(node, "interconnects")) {
 		struct udevice *rpmh_dev = pds.count ? pds.pd[0].dev : NULL;
 
