@@ -65,28 +65,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QPAS_SMP2P_VERSION			1
 #define SMEM_HOST_APPS				0
 
-#define QPAS_AOP_MSG_RAM_PHYS			0x0c300000
-#define QPAS_AOP_QMP_CDSP_DESC_OFFSET		0x30000
-#define QPAS_AOP_QMP_ADSP_DESC_OFFSET		0x40000
-
-#define QPAS_QMP_DESC_MAGIC			0x00
-#define QPAS_QMP_DESC_VERSION			0x04
-#define QPAS_QMP_DESC_FEATURES			0x08
-#define QPAS_QMP_DESC_UCORE_LINK_STATE		0x0c
-#define QPAS_QMP_DESC_UCORE_LINK_STATE_ACK	0x10
-#define QPAS_QMP_DESC_UCORE_CH_STATE		0x14
-#define QPAS_QMP_DESC_UCORE_CH_STATE_ACK	0x18
-#define QPAS_QMP_DESC_UCORE_MBOX_SIZE		0x1c
-#define QPAS_QMP_DESC_UCORE_MBOX_OFFSET		0x20
-#define QPAS_QMP_DESC_MCORE_LINK_STATE		0x24
-#define QPAS_QMP_DESC_MCORE_LINK_STATE_ACK	0x28
-#define QPAS_QMP_DESC_MCORE_CH_STATE		0x2c
-#define QPAS_QMP_DESC_MCORE_CH_STATE_ACK	0x30
-#define QPAS_QMP_DESC_MCORE_MBOX_SIZE		0x34
-#define QPAS_QMP_DESC_MCORE_MBOX_OFFSET		0x38
-#define QPAS_QMP_DESC_SIZE			0x40
-#define QPAS_QMP_MAGIC				0x4d41494c
-#define QPAS_QMP_VERSION			1
+#define QPAS_AOP_LOAD_STATE_SETTLE_MS		500
 
 #define SMP2P_FEATURE_SSR_ACK			0x01
 #define SMP2P_MAX_VERSION			2
@@ -996,98 +975,6 @@ static void qpas_log_q6v5_irq_resources(ofnode node)
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id);
-
-static phys_addr_t qpas_aop_qmp_desc_phys(struct qpas_proc *proc)
-{
-	if (proc == &qpas_adsp_proc)
-		return QPAS_AOP_MSG_RAM_PHYS + QPAS_AOP_QMP_ADSP_DESC_OFFSET;
-	if (proc == &qpas_cdsp_proc)
-		return QPAS_AOP_MSG_RAM_PHYS + QPAS_AOP_QMP_CDSP_DESC_OFFSET;
-
-	return 0;
-}
-
-static bool qpas_aop_qmp_desc_snapshot(struct qpas_proc *proc,
-				       const char *stage, bool verbose)
-{
-	void __iomem *desc;
-	phys_addr_t phys = qpas_aop_qmp_desc_phys(proc);
-	u32 magic;
-	u32 version;
-	u32 ucore_mbox_size;
-	u32 mcore_mbox_size;
-	bool ready;
-
-	if (!phys)
-		return false;
-
-	desc = map_physmem(phys, QPAS_QMP_DESC_SIZE, MAP_NOCACHE);
-	if (!desc) {
-		log_warning("qcom-adsp-pas: %s AOP QMP %s map failed phys=%llx\n",
-			    proc->name, stage, (unsigned long long)phys);
-		return false;
-	}
-
-	magic = readl(desc + QPAS_QMP_DESC_MAGIC);
-	version = readl(desc + QPAS_QMP_DESC_VERSION);
-	ucore_mbox_size = readl(desc + QPAS_QMP_DESC_UCORE_MBOX_SIZE);
-	mcore_mbox_size = readl(desc + QPAS_QMP_DESC_MCORE_MBOX_SIZE);
-	ready = magic == QPAS_QMP_MAGIC && version == QPAS_QMP_VERSION &&
-		(ucore_mbox_size || mcore_mbox_size);
-
-	if (verbose)
-		log_warning("qcom-adsp-pas: %s AOP QMP %s phys=%llx magic=%08x ver=%u feat=%08x u_link=%08x u_link_ack=%08x u_ch=%08x u_ch_ack=%08x u_mbox=%u@%08x m_link=%08x m_link_ack=%08x m_ch=%08x m_ch_ack=%08x m_mbox=%u@%08x ready=%d\n",
-			    proc->name, stage, (unsigned long long)phys,
-			    magic, version,
-			    readl(desc + QPAS_QMP_DESC_FEATURES),
-			    readl(desc + QPAS_QMP_DESC_UCORE_LINK_STATE),
-			    readl(desc + QPAS_QMP_DESC_UCORE_LINK_STATE_ACK),
-			    readl(desc + QPAS_QMP_DESC_UCORE_CH_STATE),
-			    readl(desc + QPAS_QMP_DESC_UCORE_CH_STATE_ACK),
-			    ucore_mbox_size,
-			    readl(desc + QPAS_QMP_DESC_UCORE_MBOX_OFFSET),
-			    readl(desc + QPAS_QMP_DESC_MCORE_LINK_STATE),
-			    readl(desc + QPAS_QMP_DESC_MCORE_LINK_STATE_ACK),
-			    readl(desc + QPAS_QMP_DESC_MCORE_CH_STATE),
-			    readl(desc + QPAS_QMP_DESC_MCORE_CH_STATE_ACK),
-			    mcore_mbox_size,
-			    readl(desc + QPAS_QMP_DESC_MCORE_MBOX_OFFSET),
-			    ready);
-
-	unmap_physmem((void *)desc, MAP_NOCACHE);
-
-	return ready;
-}
-
-static void qpas_wait_aop_qmp_desc(struct qpas_proc *proc, const char *stage,
-				   ulong timeout_ms)
-{
-	ulong start = get_timer(0);
-
-	if (qpas_aop_qmp_desc_snapshot(proc, stage, true))
-		return;
-
-	if (!timeout_ms) {
-		log_warning("qcom-adsp-pas: %s AOP QMP %s not ready after %lu ms\n",
-			    proc->name, stage, timeout_ms);
-		return;
-	}
-
-	do {
-		if (get_timer(start) >= timeout_ms)
-			break;
-
-		mdelay(20);
-		if (qpas_aop_qmp_desc_snapshot(proc, stage, false)) {
-			qpas_aop_qmp_desc_snapshot(proc, stage, true);
-			return;
-		}
-	} while (1);
-
-	qpas_aop_qmp_desc_snapshot(proc, stage, true);
-	log_warning("qcom-adsp-pas: %s AOP QMP %s not ready after %lu ms\n",
-		    proc->name, stage, timeout_ms);
-}
 
 static void qpas_log_pre_release_state(struct qpas_proc *proc, ofnode node)
 {
@@ -2313,7 +2200,9 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		return ret;
 	}
 	qmp_on = true;
-	qpas_wait_aop_qmp_desc(proc, "after-load-state", 500);
+	log_warning("qcom-adsp-pas: %s AOP QMP descriptor is firmware-side; settling load_state for %u ms\n",
+		    proc->name, QPAS_AOP_LOAD_STATE_SETTLE_MS);
+	mdelay(QPAS_AOP_LOAD_STATE_SETTLE_MS);
 
 	/* Step 2: proxy power domains on */
 	if (dev) {
@@ -2439,7 +2328,8 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		    proc->load_state, crc32(0, mem_region, mem_size));
 
 	qpas_log_pre_release_state(proc, node);
-	qpas_wait_aop_qmp_desc(proc, "pre-release", 0);
+	log_warning("qcom-adsp-pas: %s pre-release: not reading AOP-private QMP descriptor from APSS\n",
+		    proc->name);
 
 	/* Step 5: SCM auth_and_reset */
 	log_warning("qcom-adsp-pas: preparing to boot %s\n", proc->name);
