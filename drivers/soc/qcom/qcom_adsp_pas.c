@@ -186,7 +186,9 @@ static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
 	if (ret) {
 		log_warning("qcom-adsp-pas: clk_get_bulk ret=%d; XO may be unmanaged in U-Boot\n",
 			    ret);
-		/* Return success — no clocks to manage for this DT */
+		if (dev_read_prop(dev, "clocks", NULL))
+			return ret;
+
 		return 0;
 	}
 
