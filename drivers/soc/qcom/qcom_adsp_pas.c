@@ -294,38 +294,43 @@ static int qpas_bcm_get(const char *name, struct qpas_bcm_vote *vote)
 	return 0;
 }
 
-static int qpas_cdsp_interconnect_vote(struct udevice *rpmh_dev, bool enable)
+static int qpas_cdsp_proxy_vote(struct udevice *rpmh_dev, bool enable)
 {
-	struct qpas_bcm_vote votes[2];
-	struct tcs_cmd cmds[2];
+	const char * const names[] = {
+		/*
+		 * Linux qcom_q6v5_prepare() CDSP DT path:
+		 *   MASTER_CDSP_PROC -> SLAVE_EBI1: CO3, CO0
+		 *
+		 * Qualcomm Cedros PILProxyVoteLib CDSP boot proxy paths:
+		 *   MASTER_CDSP_PROC -> SLAVE_CLK_CTL: CO3, CN1
+		 *   MASTER_MDP0      -> SLAVE_EBI1:   MM1, MC0, ACV
+		 */
+		"CO0", "CO3", "CN1", "MM1", "MC0", "ACV",
+	};
+	struct qpas_bcm_vote votes[ARRAY_SIZE(names)];
+	struct tcs_cmd cmds[ARRAY_SIZE(names)];
 	int ret;
 	int i;
+	int j;
 
 	if (!rpmh_dev)
 		return -ENODEV;
 
-	/*
-	 * Linux SC7280 ICC maps CDSP's path through nsp_noc:
-	 *   MASTER_CDSP_PROC -> qxm_nsp  -> BCM CO3
-	 *   qns_nsp_gemnoc              -> BCM CO0
-	 *
-	 * qcom_q6v5_prepare() votes UINT_MAX peak bandwidth.  That saturates
-	 * the BCM vote field, so use vote_y=0x3fff here.  vote_x stays zero,
-	 * matching avg_bw=0.
-	 */
-	ret = qpas_bcm_get("CO0", &votes[0]);
-	if (ret)
-		return ret;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = qpas_bcm_get(names[i], &votes[i]);
+		if (ret)
+			return ret;
+	}
 
-	ret = qpas_bcm_get("CO3", &votes[1]);
-	if (ret)
-		return ret;
+	for (i = 0; i < ARRAY_SIZE(votes) - 1; i++) {
+		for (j = i + 1; j < ARRAY_SIZE(votes); j++) {
+			if (votes[j].vcd < votes[i].vcd) {
+				struct qpas_bcm_vote tmp = votes[i];
 
-	if (votes[1].vcd < votes[0].vcd) {
-		struct qpas_bcm_vote tmp = votes[0];
-
-		votes[0] = votes[1];
-		votes[1] = tmp;
+				votes[i] = votes[j];
+				votes[j] = tmp;
+			}
+		}
 	}
 
 	for (i = 0; i < ARRAY_SIZE(votes); i++) {
@@ -337,14 +342,14 @@ static int qpas_cdsp_interconnect_vote(struct udevice *rpmh_dev, bool enable)
 		cmds[i].data = BCM_TCS_CMD(commit, enable, 0, vote_y);
 		cmds[i].wait = commit;
 
-		log_warning("qcom-adsp-pas: CDSP ICC %s BCM %s vcd=%u commit=%d data=%#x\n",
+		log_warning("qcom-adsp-pas: CDSP proxy %s BCM %s vcd=%u commit=%d data=%#x\n",
 			    enable ? "vote" : "unvote", votes[i].name,
 			    votes[i].vcd, commit, cmds[i].data);
 	}
 
 	ret = rpmh_write(rpmh_dev, RPMH_ACTIVE_ONLY_STATE, cmds,
 			 ARRAY_SIZE(cmds));
-	log_warning("qcom-adsp-pas: CDSP ICC %s ret=%d\n",
+	log_warning("qcom-adsp-pas: CDSP proxy %s ret=%d\n",
 		    enable ? "vote" : "unvote", ret);
 
 	return ret;
@@ -2158,7 +2163,7 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	struct udevice *qmp_dev;
 	struct qpas_fw fw = {};
 	bool qmp_on = false;
-	bool icc_on = false;
+	bool cdsp_proxy_on = false;
 	const char *fw_name;
 	phys_addr_t mem_phys;
 	phys_addr_t reloc_base;
@@ -2260,14 +2265,14 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
 	}
 
-	/* Step 2b: CDSP interconnect vote (Linux qcom_q6v5_prepare path) */
+	/* Step 2b: CDSP Linux interconnect + Qualcomm PIL proxy votes */
 	if (proc == &qpas_cdsp_proc && ofnode_read_bool(node, "interconnects")) {
 		struct udevice *rpmh_dev = pds.count ? pds.pd[0].dev : NULL;
 
-		ret = qpas_cdsp_interconnect_vote(rpmh_dev, true);
+		ret = qpas_cdsp_proxy_vote(rpmh_dev, true);
 		if (ret)
-			goto out_icc;
-		icc_on = true;
+			goto out_cdsp_proxy;
+		cdsp_proxy_on = true;
 	}
 
 	/* Step 3: clocks on (XO, aggre2) */
@@ -2553,10 +2558,9 @@ out_unmap:
 out_clocks:
 	if (ret)
 		qpas_disable_clocks(&clks);
-out_icc:
-	if (ret && icc_on)
-		qpas_cdsp_interconnect_vote(pds.count ? pds.pd[0].dev : NULL,
-					    false);
+out_cdsp_proxy:
+	if (ret && cdsp_proxy_on)
+		qpas_cdsp_proxy_vote(pds.count ? pds.pd[0].dev : NULL, false);
 out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
