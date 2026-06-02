@@ -2276,16 +2276,26 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	}
 
 	/*
-	 * Snapdragon board code marks all reserved-memory regions (including
-	 * adsp_mem) as PTE_TYPE_FAULT.  Linux maps the ADSP carveout with
-	 * devm_ioremap_resource_wc() (write-combine, non-cacheable).  Use
-	 * DCACHE_OFF here for parity: no cache coherency gap between APPS
-	 * writes and ADSP reads, no risk of a dirty cache line surviving
-	 * flush and corrupting the firmware image the ADSP executes.
+	 * Linux maps the ADSP carveout with devm_ioremap_resource_wc()
+	 * (Normal Non-Cacheable Write-Combine).  Use DCACHE_WRITEBACK
+	 * (Normal cacheable) with explicit flush+DSB to achieve the same
+	 * end result: all writes reach physical memory before the ADSP
+	 * starts executing.  DCACHE_OFF (Device-nGnRnE) is avoided
+	 * because cache maintenance ops on Device memory have undefined
+	 * behaviour on ARMv8, and Device memory write ordering can cause
+	 * unexpected bus-level write decomposition.
 	 */
-	log_warning("qcom-adsp-pas: mapping %s region as non-cacheable\n",
+	log_warning("qcom-adsp-pas: mapping %s region as write-back cacheable\n",
 		    proc->name);
-	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_OFF);
+	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_WRITEBACK);
+
+	/*
+	 * Reserve the ADSP carveout in LMB so U-Boot does not allocate
+	 * this range for the kernel, FDT, initramfs, or other purposes.
+	 * Linux parity: the reserved-memory/adsp@86700000 node has no-map,
+	 * which the kernel respects, but U-Boot's LMB must also know.
+	 */
+	lmb_reserve(mem_phys, mem_size, LMB_NONE);
 
 	ret = qpas_read_firmware(&fw, fw_name);
 	if (ret)
@@ -2345,6 +2355,20 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	 * store. If crc_before_auth != crc_after_load, something wrote to the
 	 * ADSP region.
 	 */
+	log_warning("qcom-adsp-pas: %s crc_before_flush=%08x\n",
+		    proc->load_state, crc32(0, mem_region, mem_size));
+
+	/*
+	 * Push all firmware data from dcaches to physical memory.
+	 * DCACHE_WRITEBACK mapping means the per-segment flush_cache()
+	 * calls clean each segment.  Do one final range flush of the
+	 * entire carveout followed by a DSB to guarantee every write is
+	 * globally observable before auth_and_reset.
+	 */
+	flush_dcache_range((ulong)mem_region,
+			   (ulong)mem_region + mem_size);
+	dsb();
+
 	log_warning("qcom-adsp-pas: %s crc_before_auth=%08x\n",
 		    proc->load_state, crc32(0, mem_region, mem_size));
 
