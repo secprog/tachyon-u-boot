@@ -181,6 +181,7 @@ struct qpas_bcm_vote {
 struct qpas_smp2p_info {
 	ofnode node;
 	ofnode inbound;
+	u32 local_pid;
 	u32 remote_pid;
 	u32 inbound_item;
 	u32 outbound_item;
@@ -582,6 +583,7 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 	ofnode child;
 	ofnode smp2p;
 	u32 smem[2];
+	u32 local_pid;
 	u32 remote_pid;
 	int ret;
 
@@ -597,6 +599,10 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 				      &info->remote_pid);
 		if (ret || info->remote_pid != remote_pid)
 			continue;
+
+		ret = ofnode_read_u32(smp2p, "qcom,local-pid", &local_pid);
+		if (ret)
+			return ret;
 
 		ret = ofnode_read_u32_array(smp2p, "qcom,smem", smem,
 					    ARRAY_SIZE(smem));
@@ -614,6 +620,7 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 
 			info->node = smp2p;
 			info->inbound = child;
+			info->local_pid = local_pid;
 			info->inbound_item = smem[1];
 			info->outbound_item = smem[0];
 			strncpy(info->entry_name, entry_name,
@@ -624,10 +631,11 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 			if (ret)
 				return ret;
 
-			log_warning("qcom-adsp-pas: SMP2P remote_pid=%u item=%u entry='%s' fatal=%u ready=%u handover=%u stop_ack=%u shutdown_ack=%u\n",
-				    info->remote_pid, info->inbound_item,
-				    info->entry_name, info->fatal_bit,
-				    info->ready_bit, info->handover_bit,
+			log_warning("qcom-adsp-pas: SMP2P local_pid=%u remote_pid=%u item=%u entry='%s' fatal=%u ready=%u handover=%u stop_ack=%u shutdown_ack=%u\n",
+				    info->local_pid, info->remote_pid,
+				    info->inbound_item, info->entry_name,
+				    info->fatal_bit, info->ready_bit,
+				    info->handover_bit,
 				    info->stop_ack_bit,
 				    info->shutdown_ack_bit);
 			return 0;
@@ -727,9 +735,9 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
  *
  * Follows Linux's two-phase publish/kick sequence:
  *   Phase 1 (header only): clear, write magic/local_pid/remote_pid/
- *     total_entries/valid_entries=0/features, dmb(), version=2, kick.
- *   Phase 2 (entries): populate entries[0].name from DT, bump
- *     valid_entries to 1, kick again.
+ *     total_entries/valid_entries=0/features, dmb(), version=1, kick.
+ *   Phase 2 (entries): populate every outbound child entry from DT,
+ *     bump valid_entries, kick again.
  *
  * Linux does this in two probe stages (probe -> for_each_child).
  * We do both upfront since ADSP isn't running yet, but preserve
@@ -741,10 +749,10 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 			   struct qpas_smp2p_info *info)
 {
-	struct ofnode_phandle_args smem_states_args;
-	ofnode outbound_ofnode;
 	const char *entry_name;
 	struct qpas_smp2p_smem_item *out;
+	ofnode child;
+	u16 valid = 0;
 	int ret;
 
 	ret = qpas_find_smp2p(node, info);
@@ -780,7 +788,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	 */
 	memset(out, 0, sizeof(*out));
 	out->magic = cpu_to_le32(QPAS_SMP2P_MAGIC);
-	out->local_pid = cpu_to_le16(SMEM_HOST_APPS);
+	out->local_pid = cpu_to_le16(info->local_pid);
 	out->remote_pid = cpu_to_le16(info->remote_pid);
 	out->total_entries = cpu_to_le16(QPAS_SMP2P_MAX_ENTRY);
 	out->valid_entries = cpu_to_le16(0);
@@ -803,32 +811,41 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 		return ret;
 	}
 
-	/* Phase 2: entry -> valid_entries -> kick */
-	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
-					     NULL, 0, 0, &smem_states_args);
-	if (ret) {
-		log_warning("qcom-adsp-pas: SMP2P qcom,smem-states parse failed ret=%d\n",
-			    ret);
-		return ret;
+	/*
+	 * Phase 2: publish every outbound child entry under the SMP2P node.
+	 * Linux's qcom_smp2p_probe() walks all children and treats nodes
+	 * without interrupt-controller as outbound qcom_smem_state entries.
+	 * Tachyon/QCM6490 adds rdbg/sleepstate entries on top of the base
+	 * master-kernel entry, so publishing only qcom,smem-states is not
+	 * Linux parity.
+	 */
+	ofnode_for_each_subnode(child, info->node) {
+		if (ofnode_read_bool(child, "interrupt-controller"))
+			continue;
+
+		entry_name = ofnode_read_string(child, "qcom,entry-name");
+		if (!entry_name)
+			continue;
+
+		if (valid >= QPAS_SMP2P_MAX_ENTRY) {
+			log_warning("qcom-adsp-pas: SMP2P too many outbound entries, dropping '%s'\n",
+				    entry_name);
+			break;
+		}
+
+		strlcpy((char *)out->entries[valid].name, entry_name,
+			QPAS_SMP2P_MAX_ENTRY_NAME);
+		out->entries[valid].value = cpu_to_le32(0);
+		valid++;
+		out->valid_entries = cpu_to_le16(valid);
+		log_warning("qcom-adsp-pas: SMP2P out entry[%u]='%s'\n",
+			    valid - 1, entry_name);
 	}
 
-	outbound_ofnode = smem_states_args.node;
-	if (!ofnode_valid(outbound_ofnode)) {
-		log_warning("qcom-adsp-pas: SMP2P qcom,smem-states node invalid\n");
+	if (!valid) {
+		log_warning("qcom-adsp-pas: SMP2P no outbound entries found\n");
 		return -EINVAL;
 	}
-
-	entry_name = ofnode_read_string(outbound_ofnode, "qcom,entry-name");
-	if (!entry_name) {
-		log_warning("qcom-adsp-pas: SMP2P qcom,entry-name missing\n");
-		return -EINVAL;
-	}
-
-	strncpy((char *)out->entries[0].name,
-		entry_name, QPAS_SMP2P_MAX_ENTRY_NAME);
-	out->entries[0].value = 0;
-	out->valid_entries = cpu_to_le16(1);
-	log_warning("qcom-adsp-pas: SMP2P out entry='%s'\n", entry_name);
 
 	ret = qpas_smp2p_kick(info);
 	if (ret) {
