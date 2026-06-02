@@ -32,8 +32,10 @@
 #include <asm-generic/global_data.h>
 #include <asm/io.h>
 #include <asm/cache.h>
+#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/qcom_aoss_qmp.h>
+#include <soc/qcom/rpmh.h>
 #include <u-boot/crc.h>
 #include <lmb.h>
 #include <linux/arm-smccc.h>
@@ -157,6 +159,19 @@ struct qpas_clocks {
 	bool enabled;
 };
 
+struct qpas_bcm_aux {
+	__le32 unit;
+	__le16 width;
+	u8 vcd;
+	u8 reserved;
+} __packed;
+
+struct qpas_bcm_vote {
+	const char *name;
+	u32 addr;
+	u8 vcd;
+};
+
 struct qpas_smp2p_info {
 	ofnode node;
 	ofnode inbound;
@@ -241,6 +256,98 @@ static void qpas_disable_clocks(struct qpas_clocks *clks)
 		clk_disable_bulk(&clks->bulk);
 	if (clks->valid)
 		clk_release_bulk(&clks->bulk);
+}
+
+static int qpas_bcm_get(const char *name, struct qpas_bcm_vote *vote)
+{
+	const struct qpas_bcm_aux *aux;
+	enum cmd_db_hw_type type;
+	size_t aux_len = 0;
+
+	vote->name = name;
+	vote->addr = cmd_db_read_addr(name);
+	if (!vote->addr) {
+		log_warning("qcom-adsp-pas: BCM %s missing cmd-db addr\n",
+			    name);
+		return -ENOENT;
+	}
+
+	type = cmd_db_read_slave_id(name);
+	if (type != CMD_DB_HW_BCM) {
+		log_warning("qcom-adsp-pas: BCM %s cmd-db type=%d expected=%d\n",
+			    name, type, CMD_DB_HW_BCM);
+		return -EINVAL;
+	}
+
+	aux = cmd_db_read_aux_data(name, &aux_len);
+	if (IS_ERR_OR_NULL(aux) || aux_len < sizeof(*aux)) {
+		log_warning("qcom-adsp-pas: BCM %s missing aux data len=%zu\n",
+			    name, aux_len);
+		return -EINVAL;
+	}
+
+	vote->vcd = aux->vcd;
+	log_warning("qcom-adsp-pas: BCM %s addr=%#x unit=%u width=%u vcd=%u\n",
+		    name, vote->addr, le32_to_cpu(aux->unit),
+		    le16_to_cpu(aux->width), vote->vcd);
+
+	return 0;
+}
+
+static int qpas_cdsp_interconnect_vote(struct udevice *rpmh_dev, bool enable)
+{
+	struct qpas_bcm_vote votes[2];
+	struct tcs_cmd cmds[2];
+	int ret;
+	int i;
+
+	if (!rpmh_dev)
+		return -ENODEV;
+
+	/*
+	 * Linux SC7280 ICC maps CDSP's path through nsp_noc:
+	 *   MASTER_CDSP_PROC -> qxm_nsp  -> BCM CO3
+	 *   qns_nsp_gemnoc              -> BCM CO0
+	 *
+	 * qcom_q6v5_prepare() votes UINT_MAX peak bandwidth.  That saturates
+	 * the BCM vote field, so use vote_y=0x3fff here.  vote_x stays zero,
+	 * matching avg_bw=0.
+	 */
+	ret = qpas_bcm_get("CO0", &votes[0]);
+	if (ret)
+		return ret;
+
+	ret = qpas_bcm_get("CO3", &votes[1]);
+	if (ret)
+		return ret;
+
+	if (votes[1].vcd < votes[0].vcd) {
+		struct qpas_bcm_vote tmp = votes[0];
+
+		votes[0] = votes[1];
+		votes[1] = tmp;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(votes); i++) {
+		bool commit = i == ARRAY_SIZE(votes) - 1 ||
+			      votes[i].vcd != votes[i + 1].vcd;
+		u32 vote_y = enable ? BCM_TCS_CMD_VOTE_MASK : 0;
+
+		cmds[i].addr = votes[i].addr;
+		cmds[i].data = BCM_TCS_CMD(commit, enable, 0, vote_y);
+		cmds[i].wait = commit;
+
+		log_warning("qcom-adsp-pas: CDSP ICC %s BCM %s vcd=%u commit=%d data=%#x\n",
+			    enable ? "vote" : "unvote", votes[i].name,
+			    votes[i].vcd, commit, cmds[i].data);
+	}
+
+	ret = rpmh_write(rpmh_dev, RPMH_ACTIVE_ONLY_STATE, cmds,
+			 ARRAY_SIZE(cmds));
+	log_warning("qcom-adsp-pas: CDSP ICC %s ret=%d\n",
+		    enable ? "vote" : "unvote", ret);
+
+	return ret;
 }
 
 static int qpas_enable_power_domains(struct udevice *dev,
@@ -2051,6 +2158,7 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	struct udevice *qmp_dev;
 	struct qpas_fw fw = {};
 	bool qmp_on = false;
+	bool icc_on = false;
 	const char *fw_name;
 	phys_addr_t mem_phys;
 	phys_addr_t reloc_base;
@@ -2150,6 +2258,16 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 			goto out_qmp_off;
 	} else {
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
+	}
+
+	/* Step 2b: CDSP interconnect vote (Linux qcom_q6v5_prepare path) */
+	if (proc == &qpas_cdsp_proc && ofnode_read_bool(node, "interconnects")) {
+		struct udevice *rpmh_dev = pds.count ? pds.pd[0].dev : NULL;
+
+		ret = qpas_cdsp_interconnect_vote(rpmh_dev, true);
+		if (ret)
+			goto out_icc;
+		icc_on = true;
 	}
 
 	/* Step 3: clocks on (XO, aggre2) */
@@ -2435,6 +2553,10 @@ out_unmap:
 out_clocks:
 	if (ret)
 		qpas_disable_clocks(&clks);
+out_icc:
+	if (ret && icc_on)
+		qpas_cdsp_interconnect_vote(pds.count ? pds.pd[0].dev : NULL,
+					    false);
 out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
