@@ -1079,11 +1079,15 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 	do {
 		if (!last_crash_check || get_timer(last_crash_check) >= 100) {
 			last_crash_check = get_timer(0);
-			if (qpas_log_crash_reason(smem, proc, get_timer(start))) {
-				qcom_scm_pas_shutdown(proc->pas_id);
-				proc->failed = true;
-				return -EIO;
-			}
+			/*
+			 * ADSP seeds SMEM with
+			 * "SFR Init: wdog or kernel error suspected." during
+			 * normal early init.  Linux does not treat crash reason
+			 * content as a start failure condition; it waits for the
+			 * SMP2P ready/fatal bits.  Keep this as diagnostic-only
+			 * unless a real fatal bit or timeout occurs.
+			 */
+			qpas_log_crash_reason(smem, proc, get_timer(start));
 		}
 
 		ret = qpas_smp2p_read_entry(smem, &info, &value);
