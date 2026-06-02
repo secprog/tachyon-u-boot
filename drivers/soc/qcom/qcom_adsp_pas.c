@@ -834,6 +834,72 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 	return 0;
 }
 
+static int qpas_find_interrupt_index(ofnode node, const char *needle)
+{
+	const char *name;
+	int count;
+	int ret;
+	int i;
+
+	count = ofnode_read_string_count(node, "interrupt-names");
+	if (count < 0)
+		return count;
+
+	for (i = 0; i < count; i++) {
+		ret = ofnode_read_string_index(node, "interrupt-names", i,
+					       &name);
+		if (ret)
+			return ret;
+
+		if (!strcmp(name, needle))
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+static void qpas_log_q6v5_irq_resources(ofnode node)
+{
+	static const char * const names[] = {
+		"wdog",
+		"fatal",
+		"ready",
+		"handover",
+		"stop-ack",
+		"shutdown-ack",
+	};
+	struct ofnode_phandle_args args;
+	int ret;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = qpas_find_interrupt_index(node, names[i]);
+		if (ret < 0) {
+			log_warning("qcom-adsp-pas: q6v5 irq '%s' missing ret=%d\n",
+				    names[i], ret);
+			continue;
+		}
+
+		ret = ofnode_parse_phandle_with_args(node,
+						     "interrupts-extended",
+						     "#interrupt-cells", 0,
+						     ret, &args);
+		if (ret) {
+			log_warning("qcom-adsp-pas: q6v5 irq '%s' parse ret=%d\n",
+				    names[i], ret);
+			continue;
+		}
+
+		log_warning("qcom-adsp-pas: q6v5 irq '%s' provider=%s cells=%d arg0=%u arg1=%u\n",
+			    names[i], ofnode_get_name(args.node),
+			    args.args_count,
+			    args.args_count > 0 ? args.args[0] : 0,
+			    args.args_count > 1 ? args.args[1] : 0);
+	}
+
+	log_warning("qcom-adsp-pas: q6v5 prepare IRQ parity: Linux enables handover IRQ here; U-Boot has no Qualcomm PDC/SMP2P IRQ backend, using SMEM/SMP2P polling\n");
+}
+
 static int qcom_scm_pas_shutdown(u32 pas_id);
 
 static void qpas_log_pre_release_state(ofnode node)
@@ -2018,6 +2084,15 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		if (ret)
 			return ret;
 	}
+
+	/*
+	 * Linux qcom_q6v5_init() requests the remoteproc IRQs at probe time,
+	 * and qcom_q6v5_prepare() enables handover IRQ before release. U-Boot
+	 * has no Qualcomm PDC/SMP2P IRQ controller backend here, so record the
+	 * same DT resources and rely on the SMEM/SMP2P polling path below for
+	 * ready/fatal/handover/stop observation.
+	 */
+	qpas_log_q6v5_irq_resources(node);
 
 	/* Step 1: QMP load_state on (Linux qcom_q6v5_prepare) */
 	ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
