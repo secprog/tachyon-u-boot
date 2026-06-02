@@ -435,7 +435,7 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 }
 
 /*
- * qpas_smp2p_kick() — Linux qcom_smp2p_kick() equivalent.
+ * qpas_smp2p_kick() - Linux qcom_smp2p_kick() equivalent.
  *
  * Tries mboxes from the SMP2P node first; falls back to qcom,ipc
  * (parses syscon phandle+offset+bit, writes BIT(bit) directly).
@@ -520,7 +520,7 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 }
 
 /*
- * qpas_smp2p_init() — Linux qcom_smp2p_alloc_outbound_item() equivalent.
+ * qpas_smp2p_init() - Linux qcom_smp2p_alloc_outbound_item() equivalent.
  *
  * Follows Linux's two-phase publish/kick sequence:
  *   Phase 1 (header only): clear, write magic/local_pid/remote_pid/
@@ -528,11 +528,11 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
  *   Phase 2 (entries): populate entries[0].name from DT, bump
  *     valid_entries to 1, kick again.
  *
- * Linux does this in two probe stages (probe → for_each_child).
+ * Linux does this in two probe stages (probe -> for_each_child).
  * We do both upfront since ADSP isn't running yet, but preserve
  * the two-kick order for protocol fidelity.
  *
- * Does NOT allocate item 429 — ADSP firmware creates its own outbound
+ * Does NOT allocate item 429 - ADSP firmware creates its own outbound
  * item (per-processor ownership model).
  */
 static int qpas_smp2p_init(struct udevice *smem, ofnode node,
@@ -551,7 +551,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	}
 
 	/*
-	 * Allocate outbound item (APPS → ADSP) in the ADSP-private
+	 * Allocate outbound item (APPS -> ADSP) in the ADSP-private
 	 * partition.  Linux: qcom_smem_alloc(remote_pid, smem_id, size).
 	 */
 	ret = smem_alloc(smem, info->remote_pid, info->outbound_item,
@@ -571,7 +571,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	}
 
 	/*
-	 * Phase 1: header → dmb → version → kick (Linux order).
+	 * Phase 1: header -> dmb -> version -> kick (Linux order).
 	 * Linux: memset(out, 0, sizeof(*out)); magic=...; features=...;
 	 * wmb(); version=...; qcom_smp2p_kick().
 	 */
@@ -600,7 +600,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 		return ret;
 	}
 
-	/* Phase 2: entry → valid_entries → kick */
+	/* Phase 2: entry -> valid_entries -> kick */
 	ret = ofnode_parse_phandle_with_args(node, "qcom,smem-states",
 					     NULL, 0, 0, &smem_states_args);
 	if (ret) {
@@ -803,7 +803,7 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 	}
 
 	/* SMEM item must already be initialized by an earlier boot stage
-	 * (ABL/Linux). Do NOT allocate or manually initialize it — that could
+	 * (ABL/Linux). Do NOT allocate or manually initialize it - that could
 	 * corrupt state the ADSP firmware already sees.
 	 */
 	if (le32_to_cpu(item->magic) != QPAS_SMP2P_MAGIC ||
@@ -837,7 +837,7 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 static int qcom_scm_pas_shutdown(u32 pas_id);
 
 /*
- * qpas_wait_for_start() — poll ADSP SMP2P state every 20 ms.
+ * qpas_wait_for_start() - poll ADSP SMP2P state every 20 ms.
  *
  * Mirrors Linux's Q6V5 IRQ-driven wait: watches fatal, ready, handover,
  * stop-ack, and shutdown-ack bits.  On handover (Linux qcom_pas_handover),
@@ -908,7 +908,7 @@ static int qpas_wait_for_start(ofnode node, struct qpas_clocks *clks,
 			last_trace = get_timer(0);
 		}
 
-		/* Fatal: ADSP crashed — shutdown and report */
+		/* Fatal: ADSP crashed - shutdown and report */
 		if (value & BIT(info.fatal_bit)) {
 			size_t cr_size = 0;
 			char *reason;
@@ -1939,14 +1939,14 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
 		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
 
-	/* Runtime DT check — U-Boot may fix up the DT at boot */
+	/* Runtime DT check - U-Boot may fix up the DT at boot */
 	log_warning("qcom-adsp-pas: dt has iommus=%d interconnects=%d\n",
 		    ofnode_read_bool(node, "iommus"),
 		    ofnode_read_bool(node, "interconnects"));
 
 	/*
 	 * Linux qcom_q6v5_pas start order:
-	 *   1. qcom_q6v5_prepare()   — QMP load_state on
+	 *   1. qcom_q6v5_prepare()   - QMP load_state on
 	 *   2. proxy power domains on (with INT_MAX perf state)
 	 *   3. XO / aggre2 clocks on
 	 *   4. qcom_mdt_pas_load()
@@ -1956,6 +1956,30 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * We follow the same order here.  On SC7280/QCM6490 the DT has
 	 * qcom,qmp; failure to resolve/probe it is fatal.
 	 */
+
+	/*
+	 * Step 0: SMP2P init.
+	 *
+	 * Linux's qcom_smp2p driver probes independently and creates the APSS
+	 * outbound "master-kernel" SMEM item before remoteproc start. Do this
+	 * before qcom_q6v5_prepare()/QMP load_state, not just before PAS auth.
+	 */
+	{
+		struct qpas_smp2p_info smp2p_info = {};
+		struct udevice *smem_dev;
+
+		ret = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
+		if (ret) {
+			log_warning("qcom-adsp-pas: SMEM lookup for SMP2P ret=%d\n",
+				    ret);
+			return ret;
+		}
+
+		ret = qpas_smp2p_init(smem_dev, node, &smp2p_info);
+		log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", ret);
+		if (ret)
+			return ret;
+	}
 
 	/* Step 1: QMP load_state on (Linux qcom_q6v5_prepare) */
 	ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
@@ -2076,36 +2100,10 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		goto out_free_metadata;
 	}
 
-	/* Step 4.5: SMP2P init — Linux smp2p.c probe equivalent.
-	 *
-	 * U-Boot must do what Linux's smp2p platform driver would
-	 * normally handle: allocate and initialize the APSS outbound
-	 * SMEM item (428), populate the outbound entry, and kick the
-	 * SMP2P edge via IPCC.  Failure is fatal — Linux's Q6V5 init
-	 * depends on SMP2P SMEM state availability and would fail
-	 * probe if the SMP2P driver hadn't registered it.
-	 */
-	{
-		struct qpas_smp2p_info smp2p_info = {};
-		struct udevice *smem_dev;
-
-		ret = uclass_first_device_err(UCLASS_SMEM, &smem_dev);
-		if (ret) {
-			log_warning("qcom-adsp-pas: SMEM lookup for SMP2P ret=%d\n",
-				    ret);
-			goto out_free_metadata;
-		}
-
-		ret = qpas_smp2p_init(smem_dev, node, &smp2p_info);
-		log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", ret);
-		if (ret)
-			goto out_free_metadata;
-	}
-
 	/*
-	 * CRC the region again right before auth_and_reset, after
-	 * PIL info store and SMP2P init.  If crc_before_auth !=
-	 * crc_after_load, something wrote to the ADSP region.
+	 * CRC the region again right before auth_and_reset, after PIL info
+	 * store. If crc_before_auth != crc_after_load, something wrote to the
+	 * ADSP region.
 	 */
 	log_warning("qcom-adsp-pas: adsp crc_before_auth=%08x\n",
 		    crc32(0, mem_region, mem_size));
@@ -2121,7 +2119,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	 * Diagnostic survival poll: check SMP2P item 429 and crash
 	 * reason 423 every 50ms for 600ms (under the known ~1000ms
 	 * reset threshold).  On crash, follow Linux stop order:
-	 *   smp2p stop-bit → wait stop-ack → SCM shutdown → cleanup.
+	 *   smp2p stop-bit -> wait stop-ack -> SCM shutdown -> cleanup.
 	 *
 	 * When CONFIG_QCOM_ADSP_PAS_STANDALONE is set, skip the
 	 * diagnostic entirely and wait for ADSP ready via the full
@@ -2204,9 +2202,9 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		/*
 		 * Linux stop order (qcom_q6v5_pas_remove / qcom_pas_stop):
 		 *   1. Best-effort smp2p stop bit (may time out, item 429
-		 *      may not exist — Linux ignores -ETIMEDOUT here)
+		 *      may not exist - Linux ignores -ETIMEDOUT here)
 		 *   2. Bounded stop-ack wait (100 ms max)
-		 *   3. SCM PAS shutdown — ALWAYS called, even if stop-ack
+		 *   3. SCM PAS shutdown - ALWAYS called, even if stop-ack
 		 *      never appears
 		 *   4. Unwind resources (goto cleanup labels)
 		 */
@@ -2256,7 +2254,7 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		}
 
 		/*
-		 * Always call SCM PAS shutdown — Linux calls this
+		 * Always call SCM PAS shutdown - Linux calls this
 		 * unconditionally after the bounded stop-ack wait,
 		 * even if stop-ack timed out.
 		 */
