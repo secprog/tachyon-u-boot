@@ -82,7 +82,6 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_SCM_INTERRUPTED			1
 #define QCOM_SCM_EBUSY_WAIT_MS			30
 #define QCOM_SCM_EBUSY_MAX_RETRY		20
-#define QCOM_ADSP_PRE_AUTH_DELAY_MS		5000
 
 /*
  * DEBUG: Set to 1 to skip SCM auth_and_reset + SMP2P wait entirely.
@@ -836,6 +835,44 @@ static int qpas_smp2p_write_stop(struct udevice *smem,
 }
 
 static int qcom_scm_pas_shutdown(u32 pas_id);
+
+static void qpas_log_pre_release_state(ofnode node)
+{
+	struct qpas_smp2p_info info = {};
+	struct udevice *smem;
+	size_t cr_sz = 0;
+	char *cr;
+	u32 value = 0;
+	int ret;
+
+	ret = qpas_find_smp2p(node, &info);
+	if (ret) {
+		log_warning("qcom-adsp-pas: pre-release SMP2P discovery ret=%d\n",
+			    ret);
+		return;
+	}
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &smem);
+	if (ret) {
+		log_warning("qcom-adsp-pas: pre-release SMEM lookup ret=%d\n",
+			    ret);
+		return;
+	}
+
+	ret = qpas_smp2p_read_entry(smem, &info, &value);
+	log_warning("qcom-adsp-pas: pre-release SMP2P read ret=%d value=%08x\n",
+		    ret, value);
+
+	cr = smem_get(smem, SMEM_HOST_APPS, QCOM_ADSP_CRASH_REASON_SMEM,
+		      &cr_sz);
+	if (IS_ERR_OR_NULL(cr) || !cr_sz) {
+		log_warning("qcom-adsp-pas: pre-release crash reason empty\n");
+		return;
+	}
+
+	log_warning("qcom-adsp-pas: pre-release crash reason='%.*s'\n",
+		    (int)min(cr_sz, (size_t)96), cr);
+}
 
 /*
  * qpas_wait_for_start() - poll ADSP SMP2P state every 20 ms.
@@ -2109,11 +2146,9 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 	log_warning("qcom-adsp-pas: adsp crc_before_auth=%08x\n",
 		    crc32(0, mem_region, mem_size));
 
-	/* Step 5: SCM auth_and_reset */
-	log_warning("qcom-adsp-pas: pre-auth delay %u ms before ADSP release\n",
-		    QCOM_ADSP_PRE_AUTH_DELAY_MS);
-	mdelay(QCOM_ADSP_PRE_AUTH_DELAY_MS);
+	qpas_log_pre_release_state(node);
 
+	/* Step 5: SCM auth_and_reset */
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
@@ -2345,6 +2380,9 @@ int qcom_adsp_pas_boot(void)
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &dev);
 	if (!ret || qpas_booted)
 		return 0;
+
+	if (qpas_adsp_failed && ret == -EIO)
+		return ret;
 
 	log_warning("qcom-adsp-pas: DM device lookup/probe failed ret=%d\n", ret);
 	return ret;
