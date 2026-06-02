@@ -82,6 +82,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_SCM_INTERRUPTED			1
 #define QCOM_SCM_EBUSY_WAIT_MS			30
 #define QCOM_SCM_EBUSY_MAX_RETRY		20
+#define QCOM_ADSP_PRE_AUTH_DELAY_MS		5000
 
 /*
  * DEBUG: Set to 1 to skip SCM auth_and_reset + SMP2P wait entirely.
@@ -2109,6 +2110,10 @@ static int qcom_adsp_pas_boot_node(struct udevice *dev, ofnode node)
 		    crc32(0, mem_region, mem_size));
 
 	/* Step 5: SCM auth_and_reset */
+	log_warning("qcom-adsp-pas: pre-auth delay %u ms before ADSP release\n",
+		    QCOM_ADSP_PRE_AUTH_DELAY_MS);
+	mdelay(QCOM_ADSP_PRE_AUTH_DELAY_MS);
+
 	log_warning("qcom-adsp-pas: preparing to boot ADSP\n");
 	ret = qcom_scm_pas_auth_and_reset(QCOM_ADSP_PAS_ID);
 	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
