@@ -52,6 +52,8 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_ADSP_DEFAULT_FW			"adsp.mdt"
 #define QCOM_ADSP_PAS_ID			1
 #define QCOM_ADSP_CRASH_REASON_SMEM		423
+#define QCOM_ADSP_ERR_LOG_SMEM			611
+#define QCOM_ADSP_ERR_CRASH_LOG_ADSP_SMEM	11
 #define QCOM_CDSP_COMPAT			"qcom,sc7280-cdsp-pas"
 #define QCOM_CDSP_DEFAULT_FW			"cdsp.mdt"
 #define QCOM_CDSP_PAS_ID			18
@@ -1062,6 +1064,66 @@ static bool qpas_log_crash_reason(struct udevice *smem, struct qpas_proc *proc,
 	return true;
 }
 
+static bool qpas_ascii_has_payload(const char *buf, size_t size)
+{
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		if (buf[i] >= 0x20 && buf[i] <= 0x7e)
+			return true;
+	}
+
+	return false;
+}
+
+static void qpas_log_smem_ascii_item(struct udevice *smem, u32 host, u32 item,
+				     const char *label, size_t max_len)
+{
+	char line[257];
+	const char *buf;
+	size_t size = 0;
+	size_t len;
+	size_t i;
+
+	buf = smem_get(smem, host, item, &size);
+	if (IS_ERR_OR_NULL(buf)) {
+		log_warning("qcom-adsp-pas: %s host=%u item=%u unavailable ptr=%p size=%zu\n",
+			    label, host, item, buf, size);
+		return;
+	}
+
+	len = min(size, min(max_len, sizeof(line) - 1));
+	if (!len || !qpas_ascii_has_payload(buf, len)) {
+		log_warning("qcom-adsp-pas: %s host=%u item=%u size=%zu empty/non-ascii\n",
+			    label, host, item, size);
+		return;
+	}
+
+	for (i = 0; i < len; i++) {
+		char c = buf[i];
+
+		line[i] = (c >= 0x20 && c <= 0x7e) ? c : ' ';
+	}
+	line[len] = '\0';
+
+	log_warning("qcom-adsp-pas: %s host=%u item=%u size=%zu text='%s'\n",
+		    label, host, item, size, line);
+}
+
+static void qpas_log_adsp_error_smem(struct udevice *smem,
+				     const struct qpas_smp2p_info *info)
+{
+	qpas_log_smem_ascii_item(smem, info->remote_pid,
+				 QCOM_ADSP_ERR_LOG_SMEM,
+				 "ADSP ERR_LOG_SMEM_ITEM", 256);
+	qpas_log_smem_ascii_item(smem, SMEM_HOST_APPS,
+				 QCOM_ADSP_ERR_LOG_SMEM,
+				 "ADSP ERR_LOG_SMEM_ITEM fallback", 256);
+	qpas_log_smem_ascii_item(smem, SMEM_HOST_APPS,
+				 QCOM_ADSP_ERR_CRASH_LOG_ADSP_SMEM,
+				 "ADSP legacy crash-log", 256);
+}
+
 /*
  * qpas_wait_for_start() - poll ADSP SMP2P state every 20 ms.
  *
@@ -1155,6 +1217,8 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 				    proc->name, get_timer(start), value);
 
 			qpas_log_crash_reason(smem, proc, get_timer(start));
+			if (proc == &qpas_adsp_proc)
+				qpas_log_adsp_error_smem(smem, &info);
 			qcom_scm_pas_shutdown(proc->pas_id);
 			proc->failed = true;
 			return -EIO;
@@ -1190,6 +1254,8 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 		    proc->name, get_timer(start));
 
 	qpas_log_crash_reason(smem, proc, get_timer(start));
+	if (proc == &qpas_adsp_proc)
+		qpas_log_adsp_error_smem(smem, &info);
 	qcom_scm_pas_shutdown(proc->pas_id);
 	proc->failed = true;
 
