@@ -1377,11 +1377,18 @@ wait_altmode:
 	}
 
 	if (ret == -ENODEV) {
-		if (!cached_altmode_valid) {
+		/*
+		 * Save every fresh no-DP notification so orientation stays
+		 * current across cable re-plug events.  On session-reuse
+		 * calls altmode is still zeroed (no re-parse), so guard
+		 * with an orientation check to avoid overwriting the cache.
+		 */
+		if (altmode->orientation != QCOM_PMIC_GLINK_ORIENTATION_NONE) {
 			cached_altmode = *altmode;
 			cached_altmode_valid = true;
 		}
-		*altmode = cached_altmode;
+		if (cached_altmode_valid)
+			*altmode = cached_altmode;
 		return ret;
 	}
 
