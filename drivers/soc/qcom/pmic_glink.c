@@ -1376,8 +1376,14 @@ wait_altmode:
 		return 0;
 	}
 
-	if (ret == -ENODEV)
+	if (ret == -ENODEV) {
+		if (!cached_altmode_valid) {
+			cached_altmode = *altmode;
+			cached_altmode_valid = true;
+		}
+		*altmode = cached_altmode;
 		return ret;
+	}
 
 	if (cached_altmode_valid) {
 		*altmode = cached_altmode;
