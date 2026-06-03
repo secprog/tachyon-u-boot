@@ -140,10 +140,8 @@
 
 /* Enable USB-C Display (DP Alt Mode) */
 &usb_1 {
-	dr_mode = "host";
 	/* Enable DisplayPort Alternate Mode for USB-C video out */
 	snps,dis_u2_entry_quirk;
 	snps,dis_u1_entry_quirk;
-	maximum-speed = "super-speed";
 	status = "okay";
 };
