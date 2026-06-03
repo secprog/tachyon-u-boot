@@ -32,11 +32,8 @@
 #include <asm-generic/global_data.h>
 #include <asm/io.h>
 #include <asm/cache.h>
-#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/qcom_aoss_qmp.h>
-#include <soc/qcom/rpmh.h>
-#include <u-boot/crc.h>
 #include <lmb.h>
 #include <linux/arm-smccc.h>
 #include <linux/bitops.h>
@@ -54,10 +51,6 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_ADSP_CRASH_REASON_SMEM		423
 #define QCOM_ADSP_ERR_LOG_SMEM			611
 #define QCOM_ADSP_ERR_CRASH_LOG_ADSP_SMEM	11
-#define QCOM_CDSP_COMPAT			"qcom,sc7280-cdsp-pas"
-#define QCOM_CDSP_DEFAULT_FW			"cdsp.mdt"
-#define QCOM_CDSP_PAS_ID			18
-#define QCOM_CDSP_CRASH_REASON_SMEM		601
 #define QCOM_MODEM_PARTITION			"modem_a"
 #define QCOM_ADSP_START_TIMEOUT_MS		5000
 #define QPAS_MAX_POWER_DOMAINS			4
@@ -93,18 +86,6 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_SCM_EBUSY_WAIT_MS			30
 #define QCOM_SCM_EBUSY_MAX_RETRY		20
 
-/*
- * DEBUG: Set to 1 to skip SCM auth_and_reset + SMP2P wait entirely.
- * Use this to verify the board stays alive without starting the ADSP.
- * If the board still powers off, the issue is NOT the ADSP firmware itself
- * but rather power domains / memory-region mapping / earlier steps.
- * Set back to 0 for normal operation.
- */
-#define QCOM_ADSP_SKIP_BOOT			0
-
-#define QPAS_PIL_RELOC_COMPAT			"qcom,pil-reloc-info"
-#define QPAS_PIL_RELOC_NAME_LEN		8
-#define QPAS_PIL_RELOC_ENTRY_SIZE		(QPAS_PIL_RELOC_NAME_LEN + sizeof(u64) + sizeof(u32))
 #define SCM_SMC_FNID(s, c)			((((s) & 0xff) << 8) | ((c) & 0xff))
 
 #define QCOM_SCM_VAL				0
@@ -147,7 +128,6 @@ struct qpas_proc {
 	const char *compat;
 	const char *default_fw;
 	const char *load_state;
-	const char *pil_image;
 	u32 pas_id;
 	u32 crash_reason_smem;
 	bool booted;
@@ -164,23 +144,6 @@ struct qpas_clocks {
 	struct clk_bulk bulk;
 	bool valid;
 	bool enabled;
-};
-
-struct qpas_bcm_aux {
-	__le32 unit;
-	__le16 width;
-	u8 vcd;
-	u8 reserved;
-} __packed;
-
-struct qpas_bcm_vote {
-	const char *name;
-	u32 addr;
-	u32 unit;
-	u16 width;
-	u8 vcd;
-	u32 vote_x;
-	u32 vote_y;
 };
 
 struct qpas_smp2p_info {
@@ -228,19 +191,8 @@ static struct qpas_proc qpas_adsp_proc = {
 	.compat = QCOM_ADSP_COMPAT,
 	.default_fw = QCOM_ADSP_DEFAULT_FW,
 	.load_state = "adsp",
-	.pil_image = "adsp",
 	.pas_id = QCOM_ADSP_PAS_ID,
 	.crash_reason_smem = QCOM_ADSP_CRASH_REASON_SMEM,
-};
-
-static struct qpas_proc qpas_cdsp_proc = {
-	.name = "CDSP",
-	.compat = QCOM_CDSP_COMPAT,
-	.default_fw = QCOM_CDSP_DEFAULT_FW,
-	.load_state = "cdsp",
-	.pil_image = "cdsp",
-	.pas_id = QCOM_CDSP_PAS_ID,
-	.crash_reason_smem = QCOM_CDSP_CRASH_REASON_SMEM,
 };
 
 static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
@@ -260,8 +212,8 @@ static int qpas_enable_clocks(struct udevice *dev, struct qpas_clocks *clks)
 	clks->valid = true;
 
 	ret = clk_enable_bulk(&clks->bulk);
-	log_warning("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
-		    ret, clks->bulk.count);
+	log_debug("qcom-adsp-pas: clk_enable_bulk ret=%d count=%d\n",
+		  ret, clks->bulk.count);
 	if (ret)
 		return ret;
 
@@ -275,159 +227,6 @@ static void qpas_disable_clocks(struct qpas_clocks *clks)
 		clk_disable_bulk(&clks->bulk);
 	if (clks->valid)
 		clk_release_bulk(&clks->bulk);
-}
-
-static int qpas_bcm_get(const char *name, struct qpas_bcm_vote *vote)
-{
-	const struct qpas_bcm_aux *aux;
-	enum cmd_db_hw_type type;
-	size_t aux_len = 0;
-
-	vote->name = name;
-	vote->addr = cmd_db_read_addr(name);
-	if (!vote->addr) {
-		log_warning("qcom-adsp-pas: BCM %s missing cmd-db addr\n",
-			    name);
-		return -ENOENT;
-	}
-
-	type = cmd_db_read_slave_id(name);
-	if (type != CMD_DB_HW_BCM) {
-		log_warning("qcom-adsp-pas: BCM %s cmd-db type=%d expected=%d\n",
-			    name, type, CMD_DB_HW_BCM);
-		return -EINVAL;
-	}
-
-	aux = cmd_db_read_aux_data(name, &aux_len);
-	if (IS_ERR_OR_NULL(aux) || aux_len < sizeof(*aux)) {
-		log_warning("qcom-adsp-pas: BCM %s missing aux data len=%zu\n",
-			    name, aux_len);
-		return -EINVAL;
-	}
-
-	vote->vcd = aux->vcd;
-	vote->unit = le32_to_cpu(aux->unit);
-	vote->width = le16_to_cpu(aux->width);
-	log_warning("qcom-adsp-pas: BCM %s addr=%#x unit=%u width=%u vcd=%u\n",
-		    name, vote->addr, vote->unit, vote->width, vote->vcd);
-
-	return 0;
-}
-
-static u64 qpas_div_round_up_u64(u64 dividend, u64 divisor)
-{
-	return (dividend + divisor - 1) / divisor;
-}
-
-static u32 qpas_bcm_vote_field(u64 bw, u32 unit)
-{
-	u64 val;
-
-	if (!bw || !unit)
-		return 0;
-
-	val = qpas_div_round_up_u64(bw, unit);
-	if (val > BCM_TCS_CMD_VOTE_MASK)
-		return BCM_TCS_CMD_VOTE_MASK;
-
-	return val;
-}
-
-static u64 qpas_icb_scale_bw(u64 bw, u64 dividend, u64 divisor)
-{
-	if (!bw || !dividend || !divisor)
-		return 0;
-
-	return qpas_div_round_up_u64(bw * dividend, divisor);
-}
-
-static int qpas_cdsp_proxy_vote(struct udevice *rpmh_dev, bool enable)
-{
-	const char * const names[] = { "CO3", "CN1" };
-	struct qpas_bcm_vote votes[ARRAY_SIZE(names)];
-	struct tcs_cmd cmds[ARRAY_SIZE(names)];
-	int ret;
-	int i;
-	int j;
-
-	if (!rpmh_dev)
-		return -ENODEV;
-
-	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		ret = qpas_bcm_get(names[i], &votes[i]);
-		if (ret)
-			return ret;
-	}
-
-	/*
-	 * Tachyon's XBL reports SocKodiakLAA.  Kodiak PilProxyVoteLib votes
-	 * only MASTER_CDSP_PROC -> SLAVE_CLK_CTL with ICB TYPE_3
-	 * ib=100 MB/s, ab=100 MB/s.
-	 *
-	 * Kodiak ICB route:
-	 *   master qxm_nsp       -> BCM CO3, width 32, agg ports 2
-	 *   slave  qhs_clk_ctl   -> BCM CN1, width 4,  agg ports 1
-	 *
-	 * Qualcomm's ICB aggregation scales by bcm_width/node_width, then
-	 * encodes ceil(ib_or_ab / bcm_unit) into the BCM vote fields.
-	 */
-	for (i = 0; i < ARRAY_SIZE(votes); i++) {
-		if (!strcmp(votes[i].name, "CO3")) {
-			u64 ib = qpas_icb_scale_bw(100000000ULL,
-						   votes[i].width, 32);
-			u64 ab = qpas_icb_scale_bw(100000000ULL,
-						   votes[i].width, 32 * 2);
-
-			votes[i].vote_y = qpas_bcm_vote_field(ib,
-							      votes[i].unit);
-			votes[i].vote_x = qpas_bcm_vote_field(ab,
-							      votes[i].unit);
-		} else if (!strcmp(votes[i].name, "CN1")) {
-			u64 ib = qpas_icb_scale_bw(100000000ULL,
-						   votes[i].width, 4);
-			u64 ab = qpas_icb_scale_bw(100000000ULL,
-						   votes[i].width, 4);
-
-			votes[i].vote_y = qpas_bcm_vote_field(ib,
-							      votes[i].unit);
-			votes[i].vote_x = qpas_bcm_vote_field(ab,
-							      votes[i].unit);
-		}
-	}
-
-	for (i = 0; i < ARRAY_SIZE(votes) - 1; i++) {
-		for (j = i + 1; j < ARRAY_SIZE(votes); j++) {
-			if (votes[j].vcd < votes[i].vcd) {
-				struct qpas_bcm_vote tmp = votes[i];
-
-				votes[i] = votes[j];
-				votes[j] = tmp;
-			}
-		}
-	}
-
-	for (i = 0; i < ARRAY_SIZE(votes); i++) {
-		bool commit = i == ARRAY_SIZE(votes) - 1 ||
-			      votes[i].vcd != votes[i + 1].vcd;
-		u32 vote_x = enable ? votes[i].vote_x : 0;
-		u32 vote_y = enable ? votes[i].vote_y : 0;
-		bool valid = enable && (vote_x || vote_y);
-
-		cmds[i].addr = votes[i].addr;
-		cmds[i].data = BCM_TCS_CMD(commit, valid, vote_x, vote_y);
-		cmds[i].wait = commit;
-
-		log_warning("qcom-adsp-pas: CDSP proxy %s BCM %s vcd=%u commit=%d x=%#x y=%#x data=%#x\n",
-			    enable ? "vote" : "unvote", votes[i].name,
-			    votes[i].vcd, commit, vote_x, vote_y, cmds[i].data);
-	}
-
-	ret = rpmh_write(rpmh_dev, RPMH_ACTIVE_ONLY_STATE, cmds,
-			 ARRAY_SIZE(cmds));
-	log_warning("qcom-adsp-pas: CDSP proxy %s ret=%d\n",
-		    enable ? "vote" : "unvote", ret);
-
-	return ret;
 }
 
 static int qpas_enable_power_domains(struct udevice *dev,
@@ -484,8 +283,8 @@ static int qpas_enable_power_domains(struct udevice *dev,
 				    i, ret);
 
 		ret = power_domain_on(&pds->pd[i]);
-		log_warning("qcom-adsp-pas: power_domain_on index=%d id=%lu ret=%d\n",
-			    i, pds->pd[i].id, ret);
+		log_debug("qcom-adsp-pas: power_domain_on index=%d id=%lu ret=%d\n",
+			  i, pds->pd[i].id, ret);
 		if (ret)
 			goto err_off;
 
@@ -512,8 +311,8 @@ static void qpas_disable_power_domains(struct qpas_power_domains *pds)
 		pds->enabled--;
 		power_domain_set_performance_state(&pds->pd[pds->enabled], 0);
 		ret = power_domain_off(&pds->pd[pds->enabled]);
-		log_warning("qcom-adsp-pas: power_domain_off index=%d id=%lu ret=%d\n",
-			    pds->enabled, pds->pd[pds->enabled].id, ret);
+		log_debug("qcom-adsp-pas: power_domain_off index=%d id=%lu ret=%d\n",
+			  pds->enabled, pds->pd[pds->enabled].id, ret);
 	}
 }
 
@@ -650,13 +449,13 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 			if (ret)
 				return ret;
 
-			log_warning("qcom-adsp-pas: SMP2P local_pid=%u remote_pid=%u item=%u entry='%s' fatal=%u ready=%u handover=%u stop_ack=%u shutdown_ack=%u\n",
-				    info->local_pid, info->remote_pid,
-				    info->inbound_item, info->entry_name,
-				    info->fatal_bit, info->ready_bit,
-				    info->handover_bit,
-				    info->stop_ack_bit,
-				    info->shutdown_ack_bit);
+			log_debug("qcom-adsp-pas: SMP2P local_pid=%u remote_pid=%u in_item=%u out_item=%u entry='%s' fatal=%u ready=%u handover=%u stop_ack=%u shutdown_ack=%u\n",
+				  info->local_pid, info->remote_pid,
+				  info->inbound_item, info->outbound_item,
+				  info->entry_name, info->fatal_bit,
+				  info->ready_bit, info->handover_bit,
+				  info->stop_ack_bit,
+				  info->shutdown_ack_bit);
 			return 0;
 		}
 	}
@@ -704,8 +503,8 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 				ret = ops->request(&mbox);
 			if (!ret) {
 				ret = mbox_send(&mbox, NULL);
-				log_warning("qcom-adsp-pas: SMP2P kick ret=%d\n",
-					    ret);
+				log_debug("qcom-adsp-pas: SMP2P kick ret=%d\n",
+					  ret);
 				return 0;
 			}
 		}
@@ -736,9 +535,9 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 
 					writel(BIT(ipc_data[2]),
 					       base + ipc_data[1]);
-					log_warning("qcom-adsp-pas: SMP2P kick via qcom,ipc off=%x bit=%u\n",
-						    ipc_data[1],
-						    ipc_data[2]);
+					log_debug("qcom-adsp-pas: SMP2P kick via qcom,ipc off=%x bit=%u\n",
+						  ipc_data[1],
+						  ipc_data[2]);
 					return 0;
 				}
 			}
@@ -781,8 +580,8 @@ static int qpas_smp2p_prepare_ipcc_irq(const struct qpas_smp2p_info *info)
 	}
 
 	ret = qcom_ipcc_prepare_signal(ipcc_dev, args.args[0], args.args[1]);
-	log_warning("qcom-adsp-pas: SMP2P IPCC recv enable client=%u signal=%u ret=%d\n",
-		    args.args[0], args.args[1], ret);
+	log_debug("qcom-adsp-pas: SMP2P IPCC recv enable client=%u signal=%u ret=%d\n",
+		  args.args[0], args.args[1], ret);
 
 	return ret;
 }
@@ -857,11 +656,11 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 	out->version = QPAS_SMP2P_VERSION;	/* Linux 6.8: version must be 1 */
 	qpas_flush_shared_range(out, sizeof(*out));
 
-	log_warning("qcom-adsp-pas: SMP2P header done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x\n",
-		    info->outbound_item,
-		    le32_to_cpu(out->magic), out->version,
-		    le16_to_cpu(out->local_pid), le16_to_cpu(out->remote_pid),
-		    out->features[0]);
+	log_debug("qcom-adsp-pas: SMP2P header done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x\n",
+		  info->outbound_item,
+		  le32_to_cpu(out->magic), out->version,
+		  le16_to_cpu(out->local_pid), le16_to_cpu(out->remote_pid),
+		  out->features[0]);
 
 	ret = qpas_smp2p_kick(info);
 	if (ret) {
@@ -897,8 +696,8 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 		out->entries[valid].value = cpu_to_le32(0);
 		valid++;
 		out->valid_entries = cpu_to_le16(valid);
-		log_warning("qcom-adsp-pas: SMP2P out entry[%u]='%s'\n",
-			    valid - 1, entry_name);
+		log_debug("qcom-adsp-pas: SMP2P out entry[%u]='%s'\n",
+			  valid - 1, entry_name);
 	}
 
 	if (!valid) {
@@ -951,22 +750,14 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 	int i;
 
 	/*
-	 * Linux reads inbound items using remote_pid (e.g. host=2 for
-	 * ADSP). Try remote_pid first, then SMEM_HOST_APPS fallback.
-	 * Log both distinctly so we can tell which path resolves (if any).
+	 * Linux reads inbound items using remote_pid (e.g. host=2 for ADSP).
+	 * Fall back to global/APPS only if no private item is visible.
 	 */
 	item = smem_get(smem, info->remote_pid, info->inbound_item, &size);
 	if (IS_ERR_OR_NULL(item)) {
-		log_warning("qcom-adsp-pas: inbound remote_pid=%u item=%u ptr=%p size=%zu\n",
-			    info->remote_pid, info->inbound_item, item, size);
 		size = 0;
 		item = smem_get(smem, SMEM_HOST_APPS,
 				info->inbound_item, &size);
-		log_warning("qcom-adsp-pas: inbound APPS/global item=%u ptr=%p size=%zu\n",
-			    info->inbound_item, item, size);
-	} else {
-		log_warning("qcom-adsp-pas: inbound remote_pid=%u item=%u ptr=%p size=%zu OK\n",
-			    info->remote_pid, info->inbound_item, item, size);
 	}
 	if (IS_ERR_OR_NULL(item))
 		return -EAGAIN;
@@ -996,110 +787,7 @@ static int qpas_smp2p_read_entry(struct udevice *smem,
 	return -EAGAIN;
 }
 
-static int qpas_find_interrupt_index(ofnode node, const char *needle)
-{
-	const char *name;
-	int count;
-	int ret;
-	int i;
-
-	count = ofnode_read_string_count(node, "interrupt-names");
-	if (count < 0)
-		return count;
-
-	for (i = 0; i < count; i++) {
-		ret = ofnode_read_string_index(node, "interrupt-names", i,
-					       &name);
-		if (ret)
-			return ret;
-
-		if (!strcmp(name, needle))
-			return i;
-	}
-
-	return -ENOENT;
-}
-
-static void qpas_log_q6v5_irq_resources(ofnode node)
-{
-	static const char * const names[] = {
-		"wdog",
-		"fatal",
-		"ready",
-		"handover",
-		"stop-ack",
-		"shutdown-ack",
-	};
-	struct ofnode_phandle_args args;
-	int ret;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		ret = qpas_find_interrupt_index(node, names[i]);
-		if (ret < 0) {
-			log_warning("qcom-adsp-pas: q6v5 irq '%s' missing ret=%d\n",
-				    names[i], ret);
-			continue;
-		}
-
-		ret = ofnode_parse_phandle_with_args(node,
-						     "interrupts-extended",
-						     "#interrupt-cells", 0,
-						     ret, &args);
-		if (ret) {
-			log_warning("qcom-adsp-pas: q6v5 irq '%s' parse ret=%d\n",
-				    names[i], ret);
-			continue;
-		}
-
-		log_warning("qcom-adsp-pas: q6v5 irq '%s' provider=%s cells=%d arg0=%u arg1=%u\n",
-			    names[i], ofnode_get_name(args.node),
-			    args.args_count,
-			    args.args_count > 0 ? args.args[0] : 0,
-			    args.args_count > 1 ? args.args[1] : 0);
-	}
-
-	log_warning("qcom-adsp-pas: q6v5 prepare IRQ parity: Linux enables handover IRQ here; U-Boot has no Qualcomm PDC/SMP2P IRQ backend, using SMEM/SMP2P polling\n");
-}
-
 static int qcom_scm_pas_shutdown(u32 pas_id);
-
-static void qpas_log_pre_release_state(struct qpas_proc *proc, ofnode node)
-{
-	struct qpas_smp2p_info info = {};
-	struct udevice *smem;
-	size_t cr_sz = 0;
-	char *cr;
-	u32 value = 0;
-	int ret;
-
-	ret = qpas_find_smp2p(node, &info);
-	if (ret) {
-		log_warning("qcom-adsp-pas: pre-release SMP2P discovery ret=%d\n",
-			    ret);
-		return;
-	}
-
-	ret = uclass_first_device_err(UCLASS_SMEM, &smem);
-	if (ret) {
-		log_warning("qcom-adsp-pas: pre-release SMEM lookup ret=%d\n",
-			    ret);
-		return;
-	}
-
-	ret = qpas_smp2p_read_entry(smem, &info, &value);
-	log_warning("qcom-adsp-pas: pre-release SMP2P read ret=%d value=%08x\n",
-		    ret, value);
-
-	cr = smem_get(smem, SMEM_HOST_APPS, proc->crash_reason_smem, &cr_sz);
-	if (IS_ERR_OR_NULL(cr) || !cr_sz) {
-		log_warning("qcom-adsp-pas: pre-release crash reason empty\n");
-		return;
-	}
-
-	log_warning("qcom-adsp-pas: pre-release crash reason='%.*s'\n",
-		    (int)min(cr_sz, (size_t)96), cr);
-}
 
 static bool qpas_log_crash_reason(struct udevice *smem, struct qpas_proc *proc,
 				  ulong elapsed)
@@ -1229,10 +917,6 @@ static void qpas_log_adsp_error_smem(struct udevice *smem,
 			    "ADSP SMP2P inbound DT item");
 	qpas_log_smp2p_item(smem, SMEM_HOST_APPS, info->inbound_item,
 			    "ADSP SMP2P inbound DT item fallback");
-	qpas_log_smp2p_item(smem, info->remote_pid, 616,
-			    "ADSP SMP2P probe item616");
-	qpas_log_smp2p_item(smem, info->remote_pid, 617,
-			    "ADSP SMP2P probe item617");
 	qpas_log_smem_ascii_item(smem, info->remote_pid,
 				 QCOM_ADSP_ERR_LOG_SMEM,
 				 "ADSP ERR_LOG_SMEM_ITEM", 256);
@@ -1267,8 +951,6 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 	u32 value;
 	bool handover_seen = false;
 	bool pending_logged = false;
-	ulong last_trace = 0;
-	ulong last_crash_check = 0;
 	int ret;
 
 	ret = qpas_find_smp2p(node, &info);
@@ -1288,24 +970,11 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 
 	start = get_timer(0);
 	do {
-		if (!last_crash_check || get_timer(last_crash_check) >= 100) {
-			last_crash_check = get_timer(0);
-			/*
-			 * ADSP seeds SMEM with
-			 * "SFR Init: wdog or kernel error suspected." during
-			 * normal early init.  Linux does not treat crash reason
-			 * content as a start failure condition; it waits for the
-			 * SMP2P ready/fatal bits.  Keep this as diagnostic-only
-			 * unless a real fatal bit or timeout occurs.
-			 */
-			qpas_log_crash_reason(smem, proc, get_timer(start));
-		}
-
 		ret = qpas_smp2p_read_entry(smem, &info, &value);
 		if (ret == -EAGAIN) {
 			if (!pending_logged) {
-				log_warning("qcom-adsp-pas: waiting for SMP2P entry '%s' (elapsed=%lu ms)\n",
-					    info.entry_name, get_timer(start));
+				log_debug("qcom-adsp-pas: waiting for SMP2P entry '%s' (elapsed=%lu ms)\n",
+					  info.entry_name, get_timer(start));
 				pending_logged = true;
 			}
 			mdelay(20);
@@ -1316,20 +985,16 @@ static int qpas_wait_for_start(struct qpas_proc *proc, ofnode node,
 			return ret;
 		}
 
-		/* Trace all bits every 20ms once the entry is readable */
-		if (get_timer(last_trace) >= 20 || !last_trace) {
-			log_warning("qcom-adsp-pas: t=%lu smp2p=%08x fatal=%d ready=%d handover=%d stop=%d shutdown=%d\n",
-				    get_timer(start), value,
-				    !!(value & BIT(info.fatal_bit)),
-				    !!(value & BIT(info.ready_bit)),
-				    info.handover_bit != U32_MAX ?
-					    !!(value & BIT(info.handover_bit)) : -1,
-				    info.stop_ack_bit != U32_MAX ?
-					    !!(value & BIT(info.stop_ack_bit)) : -1,
-				    info.shutdown_ack_bit != U32_MAX ?
-					    !!(value & BIT(info.shutdown_ack_bit)) : -1);
-			last_trace = get_timer(0);
-		}
+		log_debug("qcom-adsp-pas: t=%lu smp2p=%08x fatal=%d ready=%d handover=%d stop=%d shutdown=%d\n",
+			  get_timer(start), value,
+			  !!(value & BIT(info.fatal_bit)),
+			  !!(value & BIT(info.ready_bit)),
+			  info.handover_bit != U32_MAX ?
+				  !!(value & BIT(info.handover_bit)) : -1,
+			  info.stop_ack_bit != U32_MAX ?
+				  !!(value & BIT(info.stop_ack_bit)) : -1,
+			  info.shutdown_ack_bit != U32_MAX ?
+				  !!(value & BIT(info.shutdown_ack_bit)) : -1);
 
 		/* Fatal: ADSP crashed - shutdown and report */
 		if (value & BIT(info.fatal_bit)) {
@@ -1549,18 +1214,18 @@ static int qcom_scm_pas_init_image(u32 pas_id, const void *metadata,
 
 	desc.args[1] = qpas_metadata.phys;
 
-	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE svc=%x cmd=%x arginfo=%x pas_id=%u metadata_phys=%llx metadata_size=%zu below4g=%d noncache=1 lmb=1\n",
-		    QCOM_SCM_SVC_PIL,
-		    QCOM_SCM_PIL_PAS_INIT_IMAGE,
-		    desc.arginfo,
-		    pas_id,
-		    (unsigned long long)qpas_metadata.phys, size,
-		    qpas_metadata.phys + qpas_metadata.size <= 0x100000000ULL);
+	log_debug("qcom-adsp-pas: SCM PAS_INIT_IMAGE svc=%x cmd=%x arginfo=%x pas_id=%u metadata_phys=%llx metadata_size=%zu below4g=%d noncache=1 lmb=1\n",
+		  QCOM_SCM_SVC_PIL,
+		  QCOM_SCM_PIL_PAS_INIT_IMAGE,
+		  desc.arginfo,
+		  pas_id,
+		  (unsigned long long)qpas_metadata.phys, size,
+		  qpas_metadata.phys + qpas_metadata.size <= 0x100000000ULL);
 
 	ret = qcom_scm_call(&desc, &res);
 
-	log_warning("qcom-adsp-pas: SCM PAS_INIT_IMAGE ret=%d result0=%llu result1=%llu result2=%llu\n",
-		    ret, res.result[0], res.result[1], res.result[2]);
+	log_debug("qcom-adsp-pas: SCM PAS_INIT_IMAGE ret=%d result0=%llu result1=%llu result2=%llu\n",
+		  ret, res.result[0], res.result[1], res.result[2]);
 
 	if (ret || res.result[0]) {
 		log_warning("qcom-adsp-pas: init_image ret=%d scm_result=%llu\n",
@@ -1586,18 +1251,18 @@ static int qcom_scm_pas_mem_setup(u32 pas_id, phys_addr_t addr, size_t size)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP svc=%x cmd=%x arginfo=%x pas_id=%u addr=%llx size=%llx\n",
-		    QCOM_SCM_SVC_PIL,
-		    QCOM_SCM_PIL_PAS_MEM_SETUP,
-		    desc.arginfo,
-		    pas_id,
-		    (unsigned long long)addr,
-		    (unsigned long long)size);
+	log_debug("qcom-adsp-pas: SCM PAS_MEM_SETUP svc=%x cmd=%x arginfo=%x pas_id=%u addr=%llx size=%llx\n",
+		  QCOM_SCM_SVC_PIL,
+		  QCOM_SCM_PIL_PAS_MEM_SETUP,
+		  desc.arginfo,
+		  pas_id,
+		  (unsigned long long)addr,
+		  (unsigned long long)size);
 
 	ret = qcom_scm_call(&desc, &res);
 
-	log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP ret=%d result0=%llu result1=%llu result2=%llu\n",
-		    ret, res.result[0], res.result[1], res.result[2]);
+	log_debug("qcom-adsp-pas: SCM PAS_MEM_SETUP ret=%d result0=%llu result1=%llu result2=%llu\n",
+		  ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
 }
@@ -1613,16 +1278,16 @@ static int qcom_scm_pas_auth_and_reset(u32 pas_id)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET svc=%x cmd=%x arginfo=%x pas_id=%u\n",
-		    QCOM_SCM_SVC_PIL,
-		    QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
-		    desc.arginfo,
-		    pas_id);
+	log_debug("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET svc=%x cmd=%x arginfo=%x pas_id=%u\n",
+		  QCOM_SCM_SVC_PIL,
+		  QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
+		  desc.arginfo,
+		  pas_id);
 
 	ret = qcom_scm_call(&desc, &res);
 
-	log_warning("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET ret=%d result0=%llu result1=%llu result2=%llu\n",
-		    ret, res.result[0], res.result[1], res.result[2]);
+	log_debug("qcom-adsp-pas: SCM PAS_AUTH_AND_RESET ret=%d result0=%llu result1=%llu result2=%llu\n",
+		  ret, res.result[0], res.result[1], res.result[2]);
 
 	return ret ? ret : (int)res.result[0];
 }
@@ -1638,7 +1303,7 @@ static int qcom_scm_pas_shutdown(u32 pas_id)
 	struct qcom_scm_res res;
 	int ret;
 
-	log_warning("qcom-adsp-pas: shutdown pas_id=%u\n", pas_id);
+	log_debug("qcom-adsp-pas: shutdown pas_id=%u\n", pas_id);
 
 	ret = qcom_scm_call(&desc, &res);
 	if (ret || res.result[0])
@@ -1654,12 +1319,12 @@ static void qpas_prepare_storage(void)
 
 	if (IS_ENABLED(CONFIG_UFS)) {
 		ret = ufs_probe();
-		log_warning("qcom-adsp-pas: ufs_probe ret=%d\n", ret);
+		log_debug("qcom-adsp-pas: ufs_probe ret=%d\n", ret);
 	}
 
 	if (IS_ENABLED(CONFIG_SCSI)) {
 		ret = scsi_scan(false);
-		log_warning("qcom-adsp-pas: scsi_scan ret=%d\n", ret);
+		log_debug("qcom-adsp-pas: scsi_scan ret=%d\n", ret);
 	}
 }
 
@@ -1680,34 +1345,34 @@ static int qpas_find_modem_partition(struct blk_desc **descp, int *partp)
 			continue;
 		}
 
-		log_warning("qcom-adsp-pas: checking blk dev=%s devnum=%d hwpart=%d uclass_id=%d part_type=%d lba=%llu blksz=%lu\n",
-			    dev->name,
-			    desc->devnum,
-			    desc->hwpart,
-			    desc->uclass_id,
-			    desc->part_type,
-			    (u64)desc->lba,
-			    (ulong)desc->blksz);
+		log_debug("qcom-adsp-pas: checking blk dev=%s devnum=%d hwpart=%d uclass_id=%d part_type=%d lba=%llu blksz=%lu\n",
+			  dev->name,
+			  desc->devnum,
+			  desc->hwpart,
+			  desc->uclass_id,
+			  desc->part_type,
+			  (u64)desc->lba,
+			  (ulong)desc->blksz);
 
 		if (desc->part_type == PART_TYPE_UNKNOWN)
-			log_warning("qcom-adsp-pas: blk dev=%s devnum=%d has PART_TYPE_UNKNOWN; still trying %s\n",
-				    dev->name, desc->devnum, QCOM_MODEM_PARTITION);
+			log_debug("qcom-adsp-pas: blk dev=%s devnum=%d has PART_TYPE_UNKNOWN; still trying %s\n",
+				  dev->name, desc->devnum, QCOM_MODEM_PARTITION);
 
 		part = part_get_info_by_name(desc, QCOM_MODEM_PARTITION, &info);
-		log_warning("qcom-adsp-pas: part_get_info_by_name dev=%s devnum=%d name=%s ret=%d\n",
-			    dev->name, desc->devnum, QCOM_MODEM_PARTITION, part);
+		log_debug("qcom-adsp-pas: part_get_info_by_name dev=%s devnum=%d name=%s ret=%d\n",
+			  dev->name, desc->devnum, QCOM_MODEM_PARTITION, part);
 
 		if (part >= 0) {
 			*descp = desc;
 			*partp = part;
-			log_warning("qcom-adsp-pas: found %s on blk dev=%s devnum=%d hwpart=%d part=%d start=%llu size=%llu\n",
-				    QCOM_MODEM_PARTITION,
-				    dev->name,
-				    desc->devnum,
-				    desc->hwpart,
-				    part,
-				    (u64)info.start,
-				    (u64)info.size);
+			log_debug("qcom-adsp-pas: found %s on blk dev=%s devnum=%d hwpart=%d part=%d start=%llu size=%llu\n",
+				  QCOM_MODEM_PARTITION,
+				  dev->name,
+				  desc->devnum,
+				  desc->hwpart,
+				  part,
+				  (u64)info.start,
+				  (u64)info.size);
 			return 0;
 		}
 	}
@@ -1725,17 +1390,17 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 	loff_t read;
 	int ret;
 
-	log_warning("qcom-adsp-pas: fs select devnum=%d hwpart=%d part=%d path=%s\n",
-		    desc->devnum, desc->hwpart, part, path);
+	log_debug("qcom-adsp-pas: fs select devnum=%d hwpart=%d part=%d path=%s\n",
+		  desc->devnum, desc->hwpart, part, path);
 
 	ret = fs_set_blk_dev_with_part(desc, part);
-	log_warning("qcom-adsp-pas: fs_set_blk_dev_with_part ret=%d\n", ret);
+	log_debug("qcom-adsp-pas: fs_set_blk_dev_with_part ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = fs_size(path, &size);
-	log_warning("qcom-adsp-pas: fs_size path=%s ret=%d size=%llu\n",
-			path, ret, (u64)size);
+	log_debug("qcom-adsp-pas: fs_size path=%s ret=%d size=%llu\n",
+		  path, ret, (u64)size);
 	if (ret)
 		return ret;
 
@@ -1744,8 +1409,8 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 	* block device/partition again before fs_read().
 	*/
 	ret = fs_set_blk_dev_with_part(desc, part);
-	log_warning("qcom-adsp-pas: fs_set_blk_dev_with_part before read ret=%d\n",
-			ret);
+	log_debug("qcom-adsp-pas: fs_set_blk_dev_with_part before read ret=%d\n",
+		  ret);
 	if (ret)
 		return ret;
 
@@ -1756,8 +1421,8 @@ static int qpas_read_file_exact(struct blk_desc *desc, int part,
 
 	read = 0;
 	ret = fs_read(path, (ulong)buf, 0, size, &read);
-	log_warning("qcom-adsp-pas: fs_read path=%s ret=%d read=%llu expected=%llu\n",
-		    path, ret, (u64)read, (u64)size);
+	log_debug("qcom-adsp-pas: fs_read path=%s ret=%d read=%llu expected=%llu\n",
+		  path, ret, (u64)read, (u64)size);
 	if (ret || read != size) {
 		free(buf);
 		return -EIO;
@@ -1800,8 +1465,8 @@ static int qpas_read_firmware(struct qpas_fw *fw, const char *dt_fw_name)
 
 		ret = qpas_read_file_exact(desc, part, candidate[i],
 					   &fw->data, &fw->size);
-		log_warning("qcom-adsp-pas: read %s ret=%d size=%zu\n",
-			    candidate[i], ret, ret ? 0 : fw->size);
+		log_debug("qcom-adsp-pas: read %s ret=%d size=%zu\n",
+			  candidate[i], ret, ret ? 0 : fw->size);
 		if (!ret) {
 			fw->desc = desc;
 			fw->part = part;
@@ -1835,8 +1500,8 @@ static int qpas_read_segment(const struct qpas_fw *fw, unsigned int segment,
 
 	ret = qpas_read_file_exact(fw->desc, fw->part, seg_path, &buf,
 				   &read_size);
-	log_warning("qcom-adsp-pas: read segment %s ret=%d size=%zu expected=%zu\n",
-		    seg_path, ret, ret ? 0 : read_size, size);
+	log_debug("qcom-adsp-pas: read segment %s ret=%d size=%zu expected=%zu\n",
+		  seg_path, ret, ret ? 0 : read_size, size);
 	if (ret)
 		return ret;
 
@@ -1990,22 +1655,22 @@ static int qpas_mdt_init_image(struct qpas_proc *proc, const struct qpas_fw *fw,
 	int ret;
 	int i;
 
-	log_warning("qcom-adsp-pas: MDT hdr phnum=%u entry=%08x\n",
-		    ehdr->e_phnum, ehdr->e_entry);
+	log_debug("qcom-adsp-pas: MDT hdr phnum=%u entry=%08x\n",
+		  ehdr->e_phnum, ehdr->e_entry);
 
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		const Elf32_Phdr *phdr = &phdrs[i];
 
-		log_warning("qcom-adsp-pas: phdr[%d] type=%08x flags=%08x off=%08x paddr=%08x filesz=%08x memsz=%08x valid=%d reloc=%d\n",
-			    i,
-			    le32_to_cpu(phdr->p_type),
-			    le32_to_cpu(phdr->p_flags),
-			    le32_to_cpu(phdr->p_offset),
-			    le32_to_cpu(phdr->p_paddr),
-			    le32_to_cpu(phdr->p_filesz),
-			    le32_to_cpu(phdr->p_memsz),
-			    qpas_mdt_phdr_loadable(phdr),
-			    !!(le32_to_cpu(phdr->p_flags) & QCOM_MDT_RELOCATABLE));
+		log_debug("qcom-adsp-pas: phdr[%d] type=%08x flags=%08x off=%08x paddr=%08x filesz=%08x memsz=%08x valid=%d reloc=%d\n",
+			  i,
+			  le32_to_cpu(phdr->p_type),
+			  le32_to_cpu(phdr->p_flags),
+			  le32_to_cpu(phdr->p_offset),
+			  le32_to_cpu(phdr->p_paddr),
+			  le32_to_cpu(phdr->p_filesz),
+			  le32_to_cpu(phdr->p_memsz),
+			  qpas_mdt_phdr_loadable(phdr),
+			  !!(le32_to_cpu(phdr->p_flags) & QCOM_MDT_RELOCATABLE));
 
 		if (!qpas_mdt_phdr_loadable(phdr))
 			continue;
@@ -2020,12 +1685,12 @@ static int qpas_mdt_init_image(struct qpas_proc *proc, const struct qpas_fw *fw,
 			max_addr = ALIGN(phdr->p_paddr + phdr->p_memsz, SZ_4K);
 	}
 
-	log_warning("qcom-adsp-pas: MDT summary relocate=%d min_addr=%08llx max_addr=%08llx mem_phys=%llx mem_setup_size=%llx\n",
-		    relocate,
-		    (unsigned long long)min_addr,
-		    (unsigned long long)max_addr,
-		    (unsigned long long)mem_phys,
-		    (unsigned long long)(max_addr - min_addr));
+	log_debug("qcom-adsp-pas: MDT summary relocate=%d min_addr=%08llx max_addr=%08llx mem_phys=%llx mem_setup_size=%llx\n",
+		  relocate,
+		  (unsigned long long)min_addr,
+		  (unsigned long long)max_addr,
+		  (unsigned long long)mem_phys,
+		  (unsigned long long)(max_addr - min_addr));
 
 	ret = qpas_mdt_read_metadata(fw, &metadata, &metadata_len);
 	if (ret)
@@ -2041,8 +1706,8 @@ static int qpas_mdt_init_image(struct qpas_proc *proc, const struct qpas_fw *fw,
 		ret = qcom_scm_pas_mem_setup(proc->pas_id, mem_phys,
 					     max_addr - min_addr);
 	} else {
-		log_warning("qcom-adsp-pas: SCM PAS_MEM_SETUP skipped relocate=%d\n",
-			    relocate);
+		log_debug("qcom-adsp-pas: SCM PAS_MEM_SETUP skipped relocate=%d\n",
+			  relocate);
 	}
 
 	return ret;
@@ -2104,9 +1769,9 @@ static int qpas_mdt_load_segments(const struct qpas_fw *fw, void *mem_region,
 		}
 
 		ptr = (u8 *)mem_region + offset;
-		log_warning("qcom-adsp-pas: load seg=%d dst=%p paddr=%08x filesz=%u memsz=%u split=%d\n",
-			    i, ptr, phdr->p_paddr, phdr->p_filesz,
-			    phdr->p_memsz, split);
+		log_debug("qcom-adsp-pas: load seg=%d dst=%p paddr=%08x filesz=%u memsz=%u split=%d\n",
+			  i, ptr, phdr->p_paddr, phdr->p_filesz,
+			  phdr->p_memsz, split);
 
 		if (phdr->p_filesz && !split) {
 			if (phdr->p_offset + phdr->p_filesz > fw->size)
@@ -2155,167 +1820,14 @@ static int qpas_get_memory_region(ofnode node, phys_addr_t *addrp,
 	if (!vaddr)
 		return -ENOMEM;
 
-	log_warning("qcom-adsp-pas: memory-region phys=%llx size=%llx vaddr=%p\n",
-		    (unsigned long long)res.start,
-		    (unsigned long long)resource_size(&res),
-		    vaddr);
+	log_debug("qcom-adsp-pas: memory-region phys=%llx size=%llx vaddr=%p\n",
+		  (unsigned long long)res.start,
+		  (unsigned long long)resource_size(&res),
+		  vaddr);
 
 	*addrp = res.start;
 	*sizep = resource_size(&res);
 	*vaddrp = vaddr;
-	return 0;
-}
-
-/*
- * PIL relocation info helpers
- *
- * Linux-parity: store the ADSP firmware base/size into the IMEM
- * pil-reloc-info region so post-mortem debugging tools can locate
- * remoteproc images.  Entry layout:
- *   - 8-byte textual image name (QPAS_PIL_RELOC_NAME_LEN)
- *   - u64 little-endian base address
- *   - u32 little-endian size
- */
-
-static bool qpas_pil_reloc_inited;
-
-static ofnode qpas_find_compatible_recursive(ofnode parent,
-					     const char *compat)
-{
-	ofnode child;
-
-	if (ofnode_device_is_compatible(parent, compat))
-		return parent;
-
-	ofnode_for_each_subnode(child, parent) {
-		ofnode found;
-
-		found = qpas_find_compatible_recursive(child, compat);
-		if (ofnode_valid(found))
-			return found;
-	}
-
-	return ofnode_null();
-}
-
-static ofnode qpas_find_pil_reloc_node(void)
-{
-	return qpas_find_compatible_recursive(ofnode_root(),
-					      QPAS_PIL_RELOC_COMPAT);
-}
-
-static int qpas_pil_info_store(const char *image, phys_addr_t base,
-			       size_t size)
-{
-	ofnode node;
-	struct resource res;
-	void __iomem *vaddr;
-	u8 name[QPAS_PIL_RELOC_NAME_LEN];
-	size_t region_size;
-	size_t num_entries;
-	int slot = -1;
-	int ret;
-	int i;
-
-	node = qpas_find_pil_reloc_node();
-	if (!ofnode_valid(node)) {
-		log_warning("qcom-adsp-pas: PIL reloc node not found, skipping\n");
-		return 0;
-	}
-
-	ret = ofnode_read_resource(node, 0, &res);
-	if (ret) {
-		log_warning("qcom-adsp-pas: PIL reloc resource ret=%d\n", ret);
-		return ret;
-	}
-
-	region_size = resource_size(&res);
-	if (region_size < QPAS_PIL_RELOC_ENTRY_SIZE) {
-		log_warning("qcom-adsp-pas: PIL reloc region too small size=%zu\n",
-			    region_size);
-		return -ENOSPC;
-	}
-
-	vaddr = map_sysmem(res.start, region_size);
-	if (!vaddr) {
-		log_warning("qcom-adsp-pas: PIL reloc map failed phys=%llx\n",
-			    (unsigned long long)res.start);
-		return -ENOMEM;
-	}
-
-	/*
-	 * Linux qcom_pil_info_init() clears the region once on first
-	 * access (memset_io).  Without this, stale boot data or
-	 * previous crash info can defeat empty-slot detection.
-	 */
-	if (!qpas_pil_reloc_inited) {
-		memset((void *)vaddr, 0, region_size);
-		flush_cache(rounddown((ulong)vaddr, ARCH_DMA_MINALIGN),
-			    roundup((ulong)vaddr + region_size,
-				    ARCH_DMA_MINALIGN) -
-			    rounddown((ulong)vaddr, ARCH_DMA_MINALIGN));
-		qpas_pil_reloc_inited = true;
-	}
-
-	memset(name, 0, sizeof(name));
-	strncpy((char *)name, image, QPAS_PIL_RELOC_NAME_LEN);
-
-	num_entries = region_size / QPAS_PIL_RELOC_ENTRY_SIZE;
-
-	for (i = 0; i < (int)num_entries; i++) {
-		u8 *entry = (u8 *)vaddr + (i * QPAS_PIL_RELOC_ENTRY_SIZE);
-
-		/*
-		 * Linux checks only the first byte of the name field:
-		 * a zero byte means the entry is unused.
-		 */
-		if (!entry[0]) {
-			slot = i;
-			break;
-		}
-
-		if (memcmp(entry, name, QPAS_PIL_RELOC_NAME_LEN) == 0) {
-			slot = i;
-			break;
-		}
-	}
-
-	if (slot < 0) {
-		log_warning("qcom-adsp-pas: PIL reloc no free slot\n");
-		unmap_sysmem(vaddr);
-		return -ENOSPC;
-	}
-
-	{
-		u8 *entry = (u8 *)vaddr + (slot * QPAS_PIL_RELOC_ENTRY_SIZE);
-
-		/* Write name */
-		memcpy(entry, name, QPAS_PIL_RELOC_NAME_LEN);
-
-		/* Write base (little-endian u64 via two 32-bit writes) */
-		writel((u32)base,
-		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN));
-		writel((u32)((u64)base >> 32),
-		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 4));
-
-		/* Write size (little-endian u32) */
-		writel((u32)size,
-		       (void __iomem *)(entry + QPAS_PIL_RELOC_NAME_LEN + 8));
-	}
-
-	flush_cache(rounddown((ulong)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
-			      ARCH_DMA_MINALIGN),
-		    roundup((ulong)vaddr + (slot + 1) * QPAS_PIL_RELOC_ENTRY_SIZE,
-			    ARCH_DMA_MINALIGN) -
-		    rounddown((ulong)vaddr + slot * QPAS_PIL_RELOC_ENTRY_SIZE,
-			      ARCH_DMA_MINALIGN));
-
-	unmap_sysmem(vaddr);
-
-	log_warning("qcom-adsp-pas: PIL info image=%s base=%llx size=%zu slot=%d region=%llx+%zx\n",
-		    image, (unsigned long long)base, size, slot,
-		    (unsigned long long)res.start, region_size);
-
 	return 0;
 }
 
@@ -2327,7 +1839,6 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	struct udevice *qmp_dev;
 	struct qpas_fw fw = {};
 	bool qmp_on = false;
-	bool cdsp_proxy_on = false;
 	const char *fw_name;
 	phys_addr_t mem_phys;
 	phys_addr_t reloc_base;
@@ -2345,18 +1856,15 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		return -EIO;
 	}
 
-	/* Dump U-Boot memory layout to check for ADSP region overlap */
-	log_warning("qcom-adsp-pas: U-Boot mem: ram_base=%llx ram_size=%llx ram_top=%llx\n",
-		    (unsigned long long)gd->ram_base,
-		    (unsigned long long)gd->ram_size,
-		    (unsigned long long)gd->ram_top);
-	log_warning("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
-		    (unsigned long long)gd->malloc_base, gd->malloc_limit);
-
-	/* Runtime DT check - U-Boot may fix up the DT at boot */
-	log_warning("qcom-adsp-pas: dt has iommus=%d interconnects=%d\n",
-		    ofnode_read_bool(node, "iommus"),
-		    ofnode_read_bool(node, "interconnects"));
+	log_debug("qcom-adsp-pas: U-Boot mem: ram_base=%llx ram_size=%llx ram_top=%llx\n",
+		  (unsigned long long)gd->ram_base,
+		  (unsigned long long)gd->ram_size,
+		  (unsigned long long)gd->ram_top);
+	log_debug("qcom-adsp-pas: U-Boot malloc: base=%llx limit=%x\n",
+		  (unsigned long long)gd->malloc_base, gd->malloc_limit);
+	log_debug("qcom-adsp-pas: dt has iommus=%d interconnects=%d\n",
+		  ofnode_read_bool(node, "iommus"),
+		  ofnode_read_bool(node, "interconnects"));
 
 	/*
 	 * Linux qcom_q6v5_pas start order:
@@ -2390,19 +1898,9 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 		}
 
 		ret = qpas_smp2p_init(smem_dev, node, &smp2p_info);
-		log_warning("qcom-adsp-pas: SMP2P init ret=%d\n", ret);
 		if (ret)
 			return ret;
 	}
-
-	/*
-	 * Linux qcom_q6v5_init() requests the remoteproc IRQs at probe time,
-	 * and qcom_q6v5_prepare() enables handover IRQ before release. U-Boot
-	 * has no Qualcomm PDC/SMP2P IRQ controller backend here, so record the
-	 * same DT resources and rely on the SMEM/SMP2P polling path below for
-	 * ready/fatal/handover/stop observation.
-	 */
-	qpas_log_q6v5_irq_resources(node);
 
 	/* Step 1: QMP load_state on (Linux qcom_q6v5_prepare) */
 	ret = qcom_aoss_qmp_get_by_node(node, &qmp_dev);
@@ -2413,14 +1911,14 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	}
 
 	ret = qcom_aoss_qmp_load_state(qmp_dev, proc->load_state, true);
-	log_warning("qcom-adsp-pas: QMP load_state %s on ret=%d\n",
-		    proc->load_state, ret);
+	log_debug("qcom-adsp-pas: QMP load_state %s on ret=%d\n",
+		  proc->load_state, ret);
 	if (ret) {
 		return ret;
 	}
 	qmp_on = true;
-	log_warning("qcom-adsp-pas: %s AOP QMP descriptor is firmware-side; settling load_state for %u ms\n",
-		    proc->name, QPAS_AOP_LOAD_STATE_SETTLE_MS);
+	log_debug("qcom-adsp-pas: %s AOP QMP descriptor is firmware-side; settling load_state for %u ms\n",
+		  proc->name, QPAS_AOP_LOAD_STATE_SETTLE_MS);
 	mdelay(QPAS_AOP_LOAD_STATE_SETTLE_MS);
 
 	/* Step 2: proxy power domains on */
@@ -2430,16 +1928,6 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 			goto out_qmp_off;
 	} else {
 		log_warning("qcom-adsp-pas: no bound device; skipping power domains\n");
-	}
-
-	/* Step 2b: CDSP Kodiak PIL proxy vote */
-	if (proc == &qpas_cdsp_proc && ofnode_read_bool(node, "interconnects")) {
-		struct udevice *rpmh_dev = pds.count ? pds.pd[0].dev : NULL;
-
-		ret = qpas_cdsp_proxy_vote(rpmh_dev, true);
-		if (ret)
-			goto out_cdsp_proxy;
-		cdsp_proxy_on = true;
 	}
 
 	/* Step 3: clocks on (XO, aggre2) */
@@ -2463,8 +1951,8 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	if (!fw_name)
 		fw_name = proc->default_fw;
 
-	log_warning("qcom-adsp-pas: boot start firmware=%s mem=%llx size=%zu\n",
-		    fw_name, (unsigned long long)mem_phys, mem_size);
+	log_debug("qcom-adsp-pas: boot start firmware=%s mem=%llx size=%zu\n",
+		  fw_name, (unsigned long long)mem_phys, mem_size);
 
 	/* Check if ADSP memory region overlaps U-Boot heap */
 	if (mem_phys < gd->ram_top && (mem_phys + mem_size) > gd->malloc_base) {
@@ -2483,8 +1971,8 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	 * behaviour on ARMv8, and Device memory write ordering can cause
 	 * unexpected bus-level write decomposition.
 	 */
-	log_warning("qcom-adsp-pas: mapping %s region as write-back cacheable\n",
-		    proc->name);
+	log_debug("qcom-adsp-pas: mapping %s region as write-back cacheable\n",
+		  proc->name);
 	mmu_set_region_dcache_behaviour(mem_phys, mem_size, DCACHE_WRITEBACK);
 
 	/*
@@ -2514,47 +2002,9 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 	if (ret)
 		goto out_free_metadata;
 
-	log_warning("qcom-adsp-pas: load complete, segments=%zu reloc_base=%llx\n",
-		    (size_t)((const Elf32_Ehdr *)fw.data)->e_phnum,
-		    (unsigned long long)reloc_base);
-
-	/*
-	 * CRC the loaded segments to verify memory integrity with
-	 * DCACHE_OFF mapping.  CRC only the used portion of the
-	 * region (Linux: devm_ioremap_resource_wc produces WC, not
-	 * cacheable).  If the CRC is stable and ADSP still fails,
-	 * caching is ruled out.
-	 */
-	log_warning("qcom-adsp-pas: %s crc_after_load=%08x\n",
-		    proc->load_state, crc32(0, mem_region, mem_size));
-
-	/*
-	 * PIL relocation info store (Linux parity: qcom_pil_info_store)
-	 *
-	 * Stores ADSP firmware base/size into IMEM pil-reloc-info region
-	 * so post-mortem debugging tools can locate remoteproc images.
-	 * Linux calls this between qcom_mdt_pas_load() and
-	 * qcom_scm_pas_auth_and_reset().  Not fatal on failure.
-	 */
-	ret = qpas_pil_info_store(proc->pil_image, mem_phys, mem_size);
-	log_warning("qcom-adsp-pas: PIL info store ret=%d\n", ret);
-	if (ret)
-		log_warning("qcom-adsp-pas: continuing despite PIL info failure\n");
-
-	if (QCOM_ADSP_SKIP_BOOT) {
-		log_warning("qcom-adsp-pas: SKIP_BOOT: bypassing auth_and_reset + SMP2P wait\n");
-		proc->booted = true;
-		ret = 0;
-		goto out_free_metadata;
-	}
-
-	/*
-	 * CRC the region again right before auth_and_reset, after PIL info
-	 * store. If crc_before_auth != crc_after_load, something wrote to the
-	 * ADSP region.
-	 */
-	log_warning("qcom-adsp-pas: %s crc_before_flush=%08x\n",
-		    proc->load_state, crc32(0, mem_region, mem_size));
+	log_debug("qcom-adsp-pas: load complete, segments=%zu reloc_base=%llx\n",
+		  (size_t)((const Elf32_Ehdr *)fw.data)->e_phnum,
+		  (unsigned long long)reloc_base);
 
 	/*
 	 * Push all firmware data from dcaches to physical memory.
@@ -2567,17 +2017,9 @@ static int qcom_q6v5_pas_boot_node(struct qpas_proc *proc, struct udevice *dev,
 			   (ulong)mem_region + mem_size);
 	dsb();
 
-	log_warning("qcom-adsp-pas: %s crc_before_auth=%08x\n",
-		    proc->load_state, crc32(0, mem_region, mem_size));
-
-	qpas_log_pre_release_state(proc, node);
-	log_warning("qcom-adsp-pas: %s pre-release: not reading AOP-private QMP descriptor from APSS\n",
-		    proc->name);
-
 	/* Step 5: SCM auth_and_reset */
-	log_warning("qcom-adsp-pas: preparing to boot %s\n", proc->name);
+	log_debug("qcom-adsp-pas: preparing to boot %s\n", proc->name);
 	ret = qcom_scm_pas_auth_and_reset(proc->pas_id);
-	log_warning("qcom-adsp-pas: SCM auth_and_reset returned ret=%d\n", ret);
 	if (ret)
 		goto out_free_metadata;
 
@@ -2602,9 +2044,6 @@ out_unmap:
 out_clocks:
 	if (ret)
 		qpas_disable_clocks(&clks);
-out_cdsp_proxy:
-	if (ret && cdsp_proxy_on)
-		qpas_cdsp_proxy_vote(pds.count ? pds.pd[0].dev : NULL, false);
 out_power_domains:
 	if (ret)
 		qpas_disable_power_domains(&pds);
@@ -2629,7 +2068,6 @@ static int qcom_adsp_pas_probe(struct udevice *dev)
 
 static const struct udevice_id qcom_adsp_pas_ids[] = {
 	{ .compatible = QCOM_ADSP_COMPAT, .data = (ulong)&qpas_adsp_proc },
-	{ .compatible = QCOM_CDSP_COMPAT, .data = (ulong)&qpas_cdsp_proc },
 	{ }
 };
 
@@ -2677,9 +2115,4 @@ static int qcom_q6v5_pas_boot(struct qpas_proc *proc)
 int qcom_adsp_pas_boot(void)
 {
 	return qcom_q6v5_pas_boot(&qpas_adsp_proc);
-}
-
-int qcom_cdsp_pas_boot(void)
-{
-	return qcom_q6v5_pas_boot(&qpas_cdsp_proc);
 }

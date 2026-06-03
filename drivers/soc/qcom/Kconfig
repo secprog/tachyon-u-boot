@@ -25,7 +25,7 @@ config QCOM_RPMH
 	  if you need to control regulators on Qualcomm platforms, say y here.
 
 config QCOM_ADSP_PAS
-	bool "Qualcomm ADSP/CDSP PAS bootstrap"
+	bool "Qualcomm ADSP PAS bootstrap"
 	depends on ARM64 && OF_CONTROL && BLK && ARCH_SNAPDRAGON
 	select ARM_SMCCC
 	select CLK
@@ -35,22 +35,8 @@ config QCOM_ADSP_PAS
 	select POWER_DOMAIN
 	select QCOM_RPMH_POWER_DOMAIN
 	help
-	  Start Qualcomm ADSP/LPASS and CDSP remote processors through
-	  the Peripheral Authentication Service using firmware stored in
-	  the modem_a FAT partition.
-
-if QCOM_ADSP_PAS
-
-config QCOM_ADSP_PAS_STANDALONE
-	bool "Boot ADSP standalone (bypass PMIC-GLINK)"
-	default n
-	help
-	  Boot ADSP at driver probe time without waiting for PMIC-GLINK
-	  to request it.  The diagnostic shutdown loop (600 ms poll +
-	  SCM shutdown) is skipped; ADSP stays running after auth_and_reset.
-	  Useful for isolating ADSP boot from the Type-C / DP-AltMode path.
-
-endif
+	  Start Qualcomm ADSP/LPASS through the Peripheral Authentication
+	  Service using firmware stored in the modem_a FAT partition.
 
 config QCOM_AOSS_QMP
 	bool "Qualcomm AOSS QMP driver"
