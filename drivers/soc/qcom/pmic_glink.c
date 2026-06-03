@@ -22,6 +22,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <log.h>
+#include <malloc.h>
 #include <mailbox.h>
 #include <mailbox-uclass.h>
 #include <smem.h>
@@ -37,6 +38,7 @@
 #define QPG_TX_BLOCKED_CMD_RESERVE		8
 #define QPG_RX_INTENT_SIZE			512
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
+#define QPG_ALTMODE_TIMEOUT_MS			5000
 
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
@@ -47,6 +49,8 @@
 #define GLINK_CMD_OPEN_ACK			4
 #define GLINK_CMD_INTENT			5
 #define GLINK_CMD_RX_DONE			6
+#define GLINK_CMD_RX_INTENT_REQ			7
+#define GLINK_CMD_RX_INTENT_REQ_ACK		8
 #define GLINK_CMD_TX_DATA			9
 #define GLINK_CMD_TX_DATA_CONT			12
 #define GLINK_CMD_READ_NOTIF			13
@@ -127,6 +131,7 @@ struct qpg {
 	size_t rx_len;
 	u16 lcid;
 	u16 rcid;
+	u32 next_liid;
 	u32 riid;
 	u32 riid_size;
 	bool riid_avail;
@@ -212,6 +217,8 @@ static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
 	if (orientation == 0)
 		return QCOM_PMIC_GLINK_ORIENTATION_NORMAL;
 	if (orientation == 1)
+		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
+	if (orientation == 2)
 		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
 
 	return QCOM_PMIC_GLINK_ORIENTATION_NONE;
@@ -390,7 +397,16 @@ static int qpg_send_open(struct qpg *pg)
 	return qpg_send_open_for(pg, pg->lcid, QPG_CHANNEL_NAME);
 }
 
-static int qpg_send_rx_intent_for(struct qpg *pg, u16 cid, u32 liid)
+static u32 qpg_alloc_liid(struct qpg *pg)
+{
+	if (!pg->next_liid)
+		pg->next_liid = 1;
+
+	return pg->next_liid++;
+}
+
+static int qpg_send_rx_intent_for_size(struct qpg *pg, u16 cid, u32 liid,
+				       u32 size)
 {
 	struct {
 		__le16 cmd;
@@ -402,14 +418,30 @@ static int qpg_send_rx_intent_for(struct qpg *pg, u16 cid, u32 liid)
 		.cmd = cpu_to_le16(GLINK_CMD_INTENT),
 		.lcid = cpu_to_le16(cid),
 		.count = cpu_to_le32(1),
-		.size = cpu_to_le32(QPG_RX_INTENT_SIZE),
+		.size = cpu_to_le32(size),
 		.liid = cpu_to_le32(liid),
 	};
 
 	log_warning("pmic-glink: send RX_INTENT cid=%u liid=%u size=%u\n",
-		    cid, liid, QPG_RX_INTENT_SIZE);
+		    cid, liid, size);
 
 	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
+}
+
+static int qpg_send_rx_intent_for(struct qpg *pg, u16 cid, u32 liid)
+{
+	return qpg_send_rx_intent_for_size(pg, cid, liid,
+					   QPG_RX_INTENT_SIZE);
+}
+
+static int qpg_send_rx_intent_req_ack_for(struct qpg *pg, u16 cid,
+					  bool granted)
+{
+	log_warning("pmic-glink: send RX_INTENT_REQ_ACK cid=%u granted=%d\n",
+		    cid, granted);
+
+	return qpg_send_simple(pg, GLINK_CMD_RX_INTENT_REQ_ACK, cid,
+			       granted);
 }
 
 static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
@@ -601,10 +633,11 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 		__le32 chunk_size;
 		__le32 left_size;
 	} __packed hdr;
-	u8 payload[QPG_RX_INTENT_SIZE];
+	u8 *payload;
 	u32 chunk_size, liid;
 	u16 rx_done_cid = 0;
 	u16 cid;
+	int ret = 0;
 
 	if (avail < sizeof(hdr))
 		return -EAGAIN;
@@ -619,13 +652,17 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 		    liid, chunk_size, le32_to_cpu(hdr.left_size),
 		    avail, chunk_size);
 
-	if (chunk_size > sizeof(payload) || avail < sizeof(hdr) + chunk_size)
+	if (!chunk_size || avail < sizeof(hdr) + chunk_size)
 		return -EAGAIN;
+
+	payload = malloc(chunk_size);
+	if (!payload)
+		return -ENOMEM;
 
 	qpg_rx_peek(pg, payload, sizeof(hdr), chunk_size);
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
-	if (pg->remote_opened && cid == pg->rcid && liid == 1) {
+	if (pg->remote_opened && cid == pg->rcid) {
 		qpg_parse_pmic(pg, altmode, payload, chunk_size);
 		rx_done_cid = pg->lcid;
 	} else {
@@ -634,7 +671,50 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	if (rx_done_cid)
-		qpg_send_rx_done_for(pg, rx_done_cid, liid);
+		ret = qpg_send_rx_done_for(pg, rx_done_cid, liid);
+
+	free(payload);
+
+	return ret;
+}
+
+static int qpg_handle_intent_req(struct qpg *pg, u16 cid, u32 size)
+{
+	bool granted = false;
+	u32 liid = 0;
+	int ack_ret;
+	int ret = 0;
+
+	log_warning("pmic-glink: RX_INTENT_REQ rcid=%u size=%u\n", cid, size);
+
+	if (!pg->remote_opened || cid != pg->rcid) {
+		log_warning("pmic-glink: RX_INTENT_REQ unknown rcid=%u expected=%u\n",
+			    cid, pg->rcid);
+		goto ack;
+	}
+
+	if (!size) {
+		log_warning("pmic-glink: RX_INTENT_REQ invalid size=0\n");
+		goto ack;
+	}
+
+	liid = qpg_alloc_liid(pg);
+	ret = qpg_send_rx_intent_for_size(pg, pg->lcid, liid, size);
+	if (ret) {
+		log_warning("pmic-glink: RX_INTENT_REQ advertise failed ret=%d\n",
+			    ret);
+		goto ack;
+	}
+
+	granted = true;
+
+ack:
+	ack_ret = qpg_send_rx_intent_req_ack_for(pg, pg->lcid, granted);
+	if (ack_ret)
+		return ack_ret;
+
+	log_warning("pmic-glink: RX_INTENT_REQ done granted=%d liid=%u ret=%d\n",
+		    granted, liid, ret);
 
 	return 0;
 }
@@ -689,6 +769,8 @@ static size_t qpg_rx_payload_len(u16 cmd, u32 param2)
 	case GLINK_CMD_VERSION_ACK:
 	case GLINK_CMD_OPEN_ACK:
 	case GLINK_CMD_RX_DONE:
+	case GLINK_CMD_RX_INTENT_REQ:
+	case GLINK_CMD_RX_INTENT_REQ_ACK:
 	case GLINK_CMD_RX_DONE_W_REUSE:
 	case GLINK_CMD_READ_NOTIF:
 		return 0;
@@ -837,6 +919,15 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		if (pg->remote_opened && param1 == pg->rcid &&
 		    param2 == pg->riid)
 			pg->riid_avail = cmd == GLINK_CMD_RX_DONE_W_REUSE;
+		break;
+	case GLINK_CMD_RX_INTENT_REQ:
+		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
+		ret = qpg_handle_intent_req(pg, param1, param2);
+		break;
+	case GLINK_CMD_RX_INTENT_REQ_ACK:
+		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
+		log_warning("pmic-glink: RX_INTENT_REQ_ACK cid=%u granted=%u\n",
+			    param1, param2);
 		break;
 	case GLINK_CMD_READ_NOTIF:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
@@ -995,6 +1086,8 @@ static int qpg_init(struct qpg *pg)
 	size_t size;
 	__le32 *descs;
 	ulong start;
+	bool desc_exists;
+	bool tx_exists;
 	int ret;
 
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
@@ -1048,6 +1141,7 @@ static int qpg_init(struct qpg *pg)
 
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 32);
+	desc_exists = ret == -EEXIST;
 	log_warning("pmic-glink: smem_alloc desc ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
@@ -1065,6 +1159,7 @@ static int qpg_init(struct qpg *pg)
 
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_FIFO_0,
 			 SZ_16K);
+	tx_exists = ret == -EEXIST;
 	log_warning("pmic-glink: smem_alloc tx fifo ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
@@ -1088,8 +1183,13 @@ static int qpg_init(struct qpg *pg)
 		return -ENOENT;
 	}
 
-	*pg->rx_tail = 0;
-	*pg->tx_head = 0;
+	if (!desc_exists && !tx_exists) {
+		*pg->rx_tail = 0;
+		*pg->tx_head = 0;
+	} else {
+		log_warning("pmic-glink: preserving existing fifo ptrs\n");
+	}
+
 	pg->lcid = 1;
 	log_warning("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
 		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
@@ -1100,7 +1200,11 @@ static int qpg_init(struct qpg *pg)
 
 int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 {
-	struct qpg pg = {};
+	static struct qcom_pmic_glink_altmode cached_altmode;
+	static bool cached_altmode_valid;
+	static bool session_ready;
+	static struct qpg pg;
+	u32 liid;
 	int ret;
 
 	if (!altmode)
@@ -1109,6 +1213,15 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	memset(altmode, 0, sizeof(*altmode));
 
 	log_warning("pmic-glink: get_altmode start\n");
+
+	if (session_ready) {
+		log_warning("pmic-glink: reusing session lcid=%u rcid=%u rx_tail=%08x rx_head=%08x\n",
+			    pg.lcid, pg.rcid, le32_to_cpu(*pg.rx_tail),
+			    le32_to_cpu(*pg.rx_head));
+		goto wait_altmode;
+	}
+
+	memset(&pg, 0, sizeof(pg));
 
 	ret = qpg_init(&pg);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
@@ -1155,9 +1268,10 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
-	ret = qpg_send_rx_intent_for(&pg, pg.lcid, 1);
+	liid = qpg_alloc_liid(&pg);
+	ret = qpg_send_rx_intent_for(&pg, pg.lcid, liid);
 	log_warning("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
-		    ret, pg.lcid, 1);
+		    ret, pg.lcid, liid);
 	if (ret)
 		return ret;
 
@@ -1173,10 +1287,29 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
-	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode, 1000);
+	session_ready = true;
+
+wait_altmode:
+	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode,
+			      QPG_ALTMODE_TIMEOUT_MS);
 	log_warning("pmic-glink: wait altmode ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
 		    ret, altmode->dp, altmode->orientation, altmode->pin_assignment,
 		    altmode->hpd, altmode->hpd_irq);
+
+	if (!ret) {
+		cached_altmode = *altmode;
+		cached_altmode_valid = true;
+		return 0;
+	}
+
+	if (cached_altmode_valid) {
+		*altmode = cached_altmode;
+		log_warning("pmic-glink: using cached altmode dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
+			    altmode->dp, altmode->orientation,
+			    altmode->pin_assignment, altmode->hpd,
+			    altmode->hpd_irq);
+		return 0;
+	}
 
 	return ret;
 }
