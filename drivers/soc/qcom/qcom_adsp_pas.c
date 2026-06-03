@@ -1110,9 +1110,72 @@ static void qpas_log_smem_ascii_item(struct udevice *smem, u32 host, u32 item,
 		    label, host, item, size, line);
 }
 
+static void qpas_log_smp2p_item(struct udevice *smem, u32 host, u32 item,
+				const char *label)
+{
+	struct qpas_smp2p_smem_item *smp2p;
+	size_t size = 0;
+	size_t hdr_size = offsetof(struct qpas_smp2p_smem_item, entries);
+	size_t entry_size = sizeof(smp2p->entries[0]);
+	u16 avail;
+	u16 total;
+	u16 valid;
+	u16 i;
+
+	smp2p = smem_get(smem, host, item, &size);
+	if (IS_ERR_OR_NULL(smp2p)) {
+		log_warning("qcom-adsp-pas: %s host=%u item=%u unavailable ptr=%p size=%zu\n",
+			    label, host, item, smp2p, size);
+		return;
+	}
+
+	if (size < hdr_size) {
+		log_warning("qcom-adsp-pas: %s host=%u item=%u too small size=%zu need=%zu\n",
+			    label, host, item, size, hdr_size);
+		return;
+	}
+
+	invalidate_dcache_range(rounddown((ulong)smp2p, ARCH_DMA_MINALIGN),
+				roundup((ulong)smp2p + size, ARCH_DMA_MINALIGN));
+
+	total = le16_to_cpu(smp2p->total_entries);
+	valid = le16_to_cpu(smp2p->valid_entries);
+	avail = min_t(u16, QPAS_SMP2P_MAX_ENTRY,
+		      (size - hdr_size) / entry_size);
+
+	log_warning("qcom-adsp-pas: %s host=%u item=%u size=%zu magic=%08x ver=%u local=%u remote=%u total=%u valid=%u flags=%08x\n",
+		    label, host, item, size, le32_to_cpu(smp2p->magic),
+		    smp2p->version, le16_to_cpu(smp2p->local_pid),
+		    le16_to_cpu(smp2p->remote_pid), total, valid,
+		    le32_to_cpu(smp2p->flags));
+
+	if (total > QPAS_SMP2P_MAX_ENTRY)
+		total = QPAS_SMP2P_MAX_ENTRY;
+	if (total > avail)
+		total = avail;
+	if (valid > total)
+		valid = total;
+
+	for (i = 0; i < valid; i++)
+		log_warning("qcom-adsp-pas: %s entry[%u]='%.*s' value=%08x\n",
+			    label, i, QPAS_SMP2P_MAX_ENTRY_NAME,
+			    smp2p->entries[i].name,
+			    le32_to_cpu(smp2p->entries[i].value));
+}
+
 static void qpas_log_adsp_error_smem(struct udevice *smem,
 				     const struct qpas_smp2p_info *info)
 {
+	qpas_log_smp2p_item(smem, SMEM_HOST_APPS, info->outbound_item,
+			    "ADSP SMP2P outbound DT item");
+	qpas_log_smp2p_item(smem, info->remote_pid, info->inbound_item,
+			    "ADSP SMP2P inbound DT item");
+	qpas_log_smp2p_item(smem, SMEM_HOST_APPS, info->inbound_item,
+			    "ADSP SMP2P inbound DT item fallback");
+	qpas_log_smp2p_item(smem, info->remote_pid, 616,
+			    "ADSP SMP2P probe item616");
+	qpas_log_smp2p_item(smem, info->remote_pid, 617,
+			    "ADSP SMP2P probe item617");
 	qpas_log_smem_ascii_item(smem, info->remote_pid,
 				 QCOM_ADSP_ERR_LOG_SMEM,
 				 "ADSP ERR_LOG_SMEM_ITEM", 256);
