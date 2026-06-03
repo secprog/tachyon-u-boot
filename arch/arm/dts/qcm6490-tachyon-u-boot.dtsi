@@ -131,8 +131,11 @@
 
 /* Keep USB-C/DP related nodes available to U-Boot. Do not change Linux semantics. */
 &usb_1 {
+	status = "okay";
+	maximum-speed = "super-speed";
 	bootph-all;
 };
+
 
 &usb_1_hsphy {
 	bootph-all;
