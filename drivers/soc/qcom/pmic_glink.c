@@ -142,6 +142,8 @@ struct qpg {
 	bool remote_open_ack_pending;
 	bool remote_open_acked;
 	bool pan_acked;
+	bool altmode_notify_seen;
+	bool altmode_no_dp;
 };
 
 /**
@@ -462,6 +464,14 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 }
 
 static int qpg_wait_riid(struct qpg *pg);
+static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg);
+static int qpg_drain_until(struct qpg *pg,
+			   struct qcom_pmic_glink_altmode *altmode,
+			   bool (*done)(struct qpg *,
+					struct qcom_pmic_glink_altmode *),
+			   u32 timeout_ms);
+static bool qpg_done_pan_ack(struct qpg *pg,
+			     struct qcom_pmic_glink_altmode *altmode);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -500,50 +510,67 @@ static int qpg_send_data(struct qpg *pg, const void *data, size_t len)
 	return qpg_send_data_for(pg, pg->lcid, pg->riid, data, len);
 }
 
-static void qpg_parse_sc8280xp_notify(struct qcom_pmic_glink_altmode *altmode,
-				      const void *data, size_t len)
+static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
+				      struct qcom_pmic_glink_altmode *altmode,
+				      const void *data, size_t len,
+				      u32 *portp)
 {
 	const struct qpg_usbc_notify *notify = data;
 	enum qcom_pmic_glink_orientation orientation;
 	u8 mode;
+	u8 port;
 	u16 svid;
 
 	log_warning("pmic-glink: SC8280XP notify len=%zu expected=%zu\n",
 		    len, sizeof(*notify));
 
 	if (len != sizeof(*notify))
-		return;
+		return false;
 
+	port = notify->payload[0];
+	*portp = port;
 	svid = le32_to_cpu(notify->hdr.opcode) >> 16;
 	log_warning("pmic-glink: SC8280XP port=%u orientation=%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
-		    notify->payload[0], notify->payload[1],
+		    port, notify->payload[1],
 		    notify->payload[2], svid,
 		    notify->payload[8] & SC8280XP_DPAM_MASK,
 		    !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK),
 		    !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK));
 	if (svid != USB_TYPEC_DP_SID)
-		return;
-
-	mode = notify->payload[8] & SC8280XP_DPAM_MASK;
-	if (mode < DPAM_HPD_A)
-		return;
+		return true;
 
 	orientation = qpg_orientation(notify->payload[1]);
+	altmode->port = port;
+	altmode->orientation = orientation;
+	altmode->hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
+	altmode->hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
+	pg->altmode_notify_seen = true;
+	mode = notify->payload[8] & SC8280XP_DPAM_MASK;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    notify->payload[1], orientation);
+	if (mode < DPAM_HPD_A) {
+		altmode->dp = false;
+		altmode->pin_assignment = 0;
+		pg->altmode_no_dp = true;
+		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
+			    notify->payload[2], mode);
+		return true;
+	}
+
 	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
 		    mode, mode - DPAM_HPD_A);
 
-	altmode->port = notify->payload[0];
-	altmode->orientation = orientation;
 	altmode->pin_assignment = mode - DPAM_HPD_A;
-	altmode->hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
-	altmode->hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
 	altmode->dp = true;
+	pg->altmode_no_dp = false;
+
+	return true;
 }
 
-static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
-				     const void *data, size_t len)
+static bool qpg_parse_sc8180x_notify(struct qpg *pg,
+				     struct qcom_pmic_glink_altmode *altmode,
+				     const void *data, size_t len,
+				     u32 *portp)
 {
 	const struct qpg_usbc_sc8180x_notify *msg = data;
 	enum qcom_pmic_glink_orientation orientation;
@@ -557,10 +584,11 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 		    len, sizeof(*msg));
 
 	if (len != sizeof(*msg))
-		return;
+		return false;
 
 	notification = le32_to_cpu(msg->notification);
 	port = notification & SC8180X_PORT_MASK;
+	*portp = port;
 	raw_orientation = (notification & SC8180X_ORIENTATION_MASK) >> 8;
 	mux = (notification & SC8180X_MUX_MASK) >> 16;
 	mode = (notification & SC8180X_MODE_MASK) >> 24;
@@ -568,24 +596,53 @@ static void qpg_parse_sc8180x_notify(struct qcom_pmic_glink_altmode *altmode,
 		    notification, port, raw_orientation, mux, mode,
 		    !!(notification & SC8180X_HPD_STATE_MASK),
 		    !!(notification & SC8180X_HPD_IRQ_MASK));
-	if (mux != 2)
-		return;
-
-	if (mode < DPAM_HPD_A)
-		return;
-
 	orientation = qpg_orientation(raw_orientation);
+	altmode->port = port;
+	altmode->orientation = orientation;
+	altmode->hpd = !!(notification & SC8180X_HPD_STATE_MASK);
+	altmode->hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
+	pg->altmode_notify_seen = true;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    raw_orientation, orientation);
+	if (mux != 2 || mode < DPAM_HPD_A) {
+		altmode->dp = false;
+		altmode->pin_assignment = 0;
+		pg->altmode_no_dp = true;
+		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
+			    mux, mode);
+		return true;
+	}
+
 	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
 		    mode, mode - DPAM_HPD_A);
 
-	altmode->port = port;
-	altmode->orientation = orientation;
 	altmode->pin_assignment = mode - DPAM_HPD_A;
-	altmode->hpd = !!(notification & SC8180X_HPD_STATE_MASK);
-	altmode->hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
 	altmode->dp = true;
+	pg->altmode_no_dp = false;
+
+	return true;
+}
+
+static int qpg_send_notify_pan_ack(struct qpg *pg,
+				   struct qcom_pmic_glink_altmode *altmode,
+				   u32 port)
+{
+	int ret;
+
+	log_warning("pmic-glink: send ALTMODE_PAN_ACK port=%u\n", port);
+
+	pg->pan_acked = false;
+	ret = qpg_send_altmode_req(pg, ALTMODE_PAN_ACK, port);
+	log_warning("pmic-glink: send ALTMODE_PAN_ACK ret=%d port=%u\n",
+		    ret, port);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(pg, altmode, qpg_done_pan_ack, 1000);
+	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+		    ret, pg->pan_acked);
+
+	return ret;
 }
 
 static void qpg_parse_pmic(struct qpg *pg,
@@ -594,6 +651,9 @@ static void qpg_parse_pmic(struct qpg *pg,
 {
 	const struct qpg_pmic_hdr *hdr = data;
 	u32 owner, type, raw_opcode;
+	bool ack_notify = false;
+	u32 port = 0;
+	int ret;
 	u16 opcode;
 	u16 svid;
 
@@ -617,11 +677,20 @@ static void qpg_parse_pmic(struct qpg *pg,
 		log_warning("pmic-glink: PAN ACK received\n");
 		break;
 	case USBC_NOTIFY_IND:
-		qpg_parse_sc8280xp_notify(altmode, data, len);
+		ack_notify = qpg_parse_sc8280xp_notify(pg, altmode, data, len,
+						       &port);
 		break;
 	case USBC_SC8180X_NOTIFY_IND:
-		qpg_parse_sc8180x_notify(altmode, data, len);
+		ack_notify = qpg_parse_sc8180x_notify(pg, altmode, data, len,
+						      &port);
 		break;
+	}
+
+	if (ack_notify) {
+		ret = qpg_send_notify_pan_ack(pg, altmode, port);
+		if (ret)
+			log_warning("pmic-glink: ALTMODE_PAN_ACK failed ret=%d port=%u\n",
+				    ret, port);
 	}
 }
 
@@ -1292,6 +1361,11 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 wait_altmode:
 	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode,
 			      QPG_ALTMODE_TIMEOUT_MS);
+	if (ret == -ETIMEDOUT && pg.altmode_notify_seen && pg.altmode_no_dp) {
+		log_warning("pmic-glink: no DP sink active after valid notification\n");
+		ret = -ENODEV;
+	}
+
 	log_warning("pmic-glink: wait altmode ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
 		    ret, altmode->dp, altmode->orientation, altmode->pin_assignment,
 		    altmode->hpd, altmode->hpd_irq);
@@ -1301,6 +1375,9 @@ wait_altmode:
 		cached_altmode_valid = true;
 		return 0;
 	}
+
+	if (ret == -ENODEV)
+		return ret;
 
 	if (cached_altmode_valid) {
 		*altmode = cached_altmode;
