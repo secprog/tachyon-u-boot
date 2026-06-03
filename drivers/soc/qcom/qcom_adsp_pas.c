@@ -209,6 +209,15 @@ struct qpas_smp2p_smem_item {
 	} entries[QPAS_SMP2P_MAX_ENTRY];
 } __packed;
 
+static void qpas_flush_shared_range(const void *ptr, size_t size)
+{
+	ulong start = rounddown((ulong)ptr, ARCH_DMA_MINALIGN);
+	ulong end = roundup((ulong)ptr + size, ARCH_DMA_MINALIGN);
+
+	flush_dcache_range(start, end);
+	dsb();
+}
+
 static struct qpas_proc qpas_adsp_proc = {
 	.name = "ADSP",
 	.compat = QCOM_ADSP_COMPAT,
@@ -797,6 +806,7 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 
 	dmb();
 	out->version = QPAS_SMP2P_VERSION;	/* Linux 6.8: version must be 1 */
+	qpas_flush_shared_range(out, sizeof(*out));
 
 	log_warning("qcom-adsp-pas: SMP2P header done item=%u magic=%08x ver=%u local=%u remote=%u feat=%02x\n",
 		    info->outbound_item,
@@ -846,6 +856,8 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 		log_warning("qcom-adsp-pas: SMP2P no outbound entries found\n");
 		return -EINVAL;
 	}
+
+	qpas_flush_shared_range(out, sizeof(*out));
 
 	ret = qpas_smp2p_kick(info);
 	if (ret) {

@@ -6,16 +6,19 @@
  */
 
 #include <errno.h>
+#include <cpu_func.h>
 #include <dm.h>
 #include <dm/device_compat.h>
 #include <dm/devres.h>
 #include <dm/of_access.h>
 #include <dm/of_addr.h>
+#include <asm/cache.h>
 #include <asm/io.h>
 #include <linux/bug.h>
 #include <linux/err.h>
 #include <linux/ioport.h>
 #include <linux/io.h>
+#include <linux/kernel.h>
 #include <linux/sizes.h>
 #include <smem.h>
 
@@ -304,6 +307,24 @@ phdr_to_first_uncached_entry(struct smem_partition_header *phdr)
 	return p + sizeof(*phdr);
 }
 
+static void qcom_smem_flush_range(const void *ptr, size_t size)
+{
+	ulong start = rounddown((ulong)ptr, ARCH_DMA_MINALIGN);
+	ulong end = roundup((ulong)ptr + size, ARCH_DMA_MINALIGN);
+
+	flush_dcache_range(start, end);
+	dsb();
+}
+
+static void qcom_smem_invalidate_range(const void *ptr, size_t size)
+{
+	ulong start = rounddown((ulong)ptr, ARCH_DMA_MINALIGN);
+	ulong end = roundup((ulong)ptr + size, ARCH_DMA_MINALIGN);
+
+	invalidate_dcache_range(start, end);
+	dsb();
+}
+
 static struct smem_private_entry *
 uncached_entry_next(struct smem_private_entry *e)
 {
@@ -347,6 +368,8 @@ static int qcom_smem_alloc_private(struct qcom_smem *smem,
 	size_t alloc_size;
 	void *cached;
 
+	qcom_smem_invalidate_range(phdr, le32_to_cpu(phdr->size));
+
 	hdr = phdr_to_first_uncached_entry(phdr);
 	end = phdr_to_last_uncached_entry(phdr);
 	cached = phdr_to_last_cached_entry(phdr);
@@ -385,6 +408,8 @@ static int qcom_smem_alloc_private(struct qcom_smem *smem,
 	 */
 	dmb();
 	le32_add_cpu(&phdr->offset_free_uncached, alloc_size);
+	qcom_smem_flush_range(hdr, alloc_size);
+	qcom_smem_flush_range(phdr, sizeof(*phdr));
 
 	return 0;
 }
@@ -418,6 +443,8 @@ static int qcom_smem_alloc_global(struct qcom_smem *smem,
 
 	le32_add_cpu(&header->free_offset, size);
 	le32_add_cpu(&header->available, -size);
+	qcom_smem_flush_range(entry, sizeof(*entry));
+	qcom_smem_flush_range(header, sizeof(*header));
 
 	return 0;
 }
@@ -498,6 +525,8 @@ static void *qcom_smem_get_private(struct qcom_smem *smem,
 				   size_t *size)
 {
 	struct smem_private_entry *e, *end;
+
+	qcom_smem_invalidate_range(phdr, le32_to_cpu(phdr->size));
 
 	e = phdr_to_first_uncached_entry(phdr);
 	end = phdr_to_last_uncached_entry(phdr);
