@@ -43,7 +43,6 @@
 };
 
 &mdss_dp {
-	/delete-property/ assigned-clock-parents;
 	bootph-all;
 };
 
@@ -126,22 +125,31 @@
 	};
 };
 
+&tlmm {
+	bootph-all;
+};
+
+/* Keep USB-C/DP related nodes available to U-Boot. Do not change Linux semantics. */
+&usb_1 {
+	bootph-all;
+};
+
+&usb_1_hsphy {
+	bootph-all;
+};
+
 &usb_1_qmpphy {
 	bootph-all;
 };
 
-&tlmm {
+&usb_1_qmpphy_out {
+	bootph-all;
+};
+
+&usb_1_qmpphy_dp_in {
 	bootph-all;
 };
 
 &{/usb1-sbu-mux} {
 	bootph-all;
-};
-
-/* Enable USB-C Display (DP Alt Mode) */
-&usb_1 {
-	/* Enable DisplayPort Alternate Mode for USB-C video out */
-	snps,dis_u2_entry_quirk;
-	snps,dis_u1_entry_quirk;
-	status = "okay";
 };
