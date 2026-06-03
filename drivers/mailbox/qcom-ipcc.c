@@ -15,9 +15,15 @@
 #include <dm/device_compat.h>
 #include <mailbox-uclass.h>
 #include <asm/io.h>
+#include <linux/bitops.h>
 
 /* IPCC register offsets */
+#define IPCC_REG_CONFIG		0x08
 #define IPCC_REG_SEND_ID		0x0c
+#define IPCC_REG_RECV_SIGNAL_ENABLE	0x14
+#define IPCC_REG_RECV_SIGNAL_CLEAR	0x1c
+
+#define IPCC_CLEAR_ON_RECV_RD		BIT(0)
 
 struct qcom_ipcc_priv {
 	void __iomem *base;
@@ -79,14 +85,55 @@ static int qcom_ipcc_recv(struct mbox_chan *chan, void *data)
 	return -ENODATA;
 }
 
+int qcom_ipcc_prepare_signal(struct udevice *dev, u32 client_id, u32 signal_id)
+{
+	struct qcom_ipcc_priv *priv = dev_get_priv(dev);
+	u32 hwirq = (client_id << 16) | signal_id;
+	u32 config;
+
+	if (!priv || !priv->base)
+		return -ENODEV;
+
+	/*
+	 * Linux clears CLEAR_ON_RECV_RD at probe before setting up the IRQ
+	 * domain. Keep the same hardware mode even though U-Boot polls SMEM
+	 * instead of dispatching real IPCC IRQs.
+	 */
+	config = readl(priv->base + IPCC_REG_CONFIG);
+	if (config & IPCC_CLEAR_ON_RECV_RD) {
+		config &= ~IPCC_CLEAR_ON_RECV_RD;
+		writel(config, priv->base + IPCC_REG_CONFIG);
+	}
+
+	/*
+	 * Linux qcom_ipcc_unmask_irq() writes this hwirq to
+	 * RECV_SIGNAL_ENABLE. Clear the same hwirq once first, because U-Boot
+	 * has no IRQ handler to drain stale pending LPASS->APSS SMP2P signals.
+	 */
+	writel(hwirq, priv->base + IPCC_REG_RECV_SIGNAL_CLEAR);
+	writel(hwirq, priv->base + IPCC_REG_RECV_SIGNAL_ENABLE);
+
+	dev_dbg(dev, "qcom-ipcc: prepared recv client=%u signal=%u hwirq=%08x\n",
+		client_id, signal_id, hwirq);
+
+	return 0;
+}
+
 static int qcom_ipcc_probe(struct udevice *dev)
 {
 	struct qcom_ipcc_priv *priv = dev_get_priv(dev);
+	u32 config;
 
 	priv->base = dev_read_addr_ptr(dev);
 	if (!priv->base) {
 		dev_err(dev, "qcom-ipcc: failed to map registers\n");
 		return -EINVAL;
+	}
+
+	config = readl(priv->base + IPCC_REG_CONFIG);
+	if (config & IPCC_CLEAR_ON_RECV_RD) {
+		config &= ~IPCC_CLEAR_ON_RECV_RD;
+		writel(config, priv->base + IPCC_REG_CONFIG);
 	}
 
 	dev_dbg(dev, "qcom-ipcc: base=%p\n", priv->base);

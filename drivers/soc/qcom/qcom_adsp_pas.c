@@ -110,6 +110,9 @@ DECLARE_GLOBAL_DATA_PTR;
 #define QCOM_SCM_VAL				0
 #define QCOM_SCM_RO				1
 #define QCOM_SCM_RW				2
+
+int qcom_ipcc_prepare_signal(struct udevice *dev, u32 client_id, u32 signal_id);
+
 #define QCOM_SCM_ARGS_IMPL(num, a, b, c, d, e, f, g, h, i, j, ...) \
 	((((a) & 0x3) << 4) | (((b) & 0x3) << 6) | \
 	 (((c) & 0x3) << 8) | (((d) & 0x3) << 10) | \
@@ -741,6 +744,44 @@ static int qpas_smp2p_kick(const struct qpas_smp2p_info *info)
 	return -ENODEV;
 }
 
+static int qpas_smp2p_prepare_ipcc_irq(const struct qpas_smp2p_info *info)
+{
+	struct ofnode_phandle_args args;
+	struct udevice *ipcc_dev;
+	int ret;
+
+	if (!ofnode_valid(info->node))
+		return -ENODEV;
+
+	ret = ofnode_parse_phandle_with_args(info->node, "interrupts-extended",
+					     "#interrupt-cells", 0, 0, &args);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P IPCC irq parse ret=%d\n",
+			    ret);
+		return ret;
+	}
+
+	if (args.args_count < 2) {
+		log_warning("qcom-adsp-pas: SMP2P IPCC irq has %d cells\n",
+			    args.args_count);
+		return -EINVAL;
+	}
+
+	ret = uclass_get_device_by_ofnode(UCLASS_MAILBOX, args.node,
+					  &ipcc_dev);
+	if (ret) {
+		log_warning("qcom-adsp-pas: SMP2P IPCC device lookup ret=%d\n",
+			    ret);
+		return ret;
+	}
+
+	ret = qcom_ipcc_prepare_signal(ipcc_dev, args.args[0], args.args[1]);
+	log_warning("qcom-adsp-pas: SMP2P IPCC recv enable client=%u signal=%u ret=%d\n",
+		    args.args[0], args.args[1], ret);
+
+	return ret;
+}
+
 /*
  * qpas_smp2p_init() - Linux qcom_smp2p_alloc_outbound_item() equivalent.
  *
@@ -867,6 +908,16 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 			    ret);
 		return ret;
 	}
+
+	/*
+	 * Linux's qcom_smp2p probe also wires and unmasks the IPCC receive
+	 * interrupt for this edge. U-Boot polls the SMEM item, but ADSP still
+	 * sees the same APSS-side hardware readiness before release.
+	 */
+	ret = qpas_smp2p_prepare_ipcc_irq(info);
+	if (ret)
+		log_warning("qcom-adsp-pas: SMP2P IPCC recv setup failed ret=%d\n",
+			    ret);
 
 	return 0;
 }
@@ -1166,7 +1217,7 @@ static void qpas_log_smp2p_item(struct udevice *smem, u32 host, u32 item,
 static void qpas_log_adsp_error_smem(struct udevice *smem,
 				     const struct qpas_smp2p_info *info)
 {
-	qpas_log_smp2p_item(smem, SMEM_HOST_APPS, info->outbound_item,
+	qpas_log_smp2p_item(smem, info->remote_pid, info->outbound_item,
 			    "ADSP SMP2P outbound DT item");
 	qpas_log_smp2p_item(smem, info->remote_pid, info->inbound_item,
 			    "ADSP SMP2P inbound DT item");
