@@ -635,8 +635,13 @@ static int qpas_find_smp2p(ofnode node, struct qpas_smp2p_info *info)
 			info->node = smp2p;
 			info->inbound = child;
 			info->local_pid = local_pid;
-			info->inbound_item = smem[1];
-			info->outbound_item = smem[0];
+			/*
+			 * Linux qcom_smp2p stores qcom,smem[0] as inbound and
+			 * qcom,smem[1] as outbound.  For SC7280 ADSP this means
+			 * 443 is ADSP->APSS, while 429 is APSS->ADSP.
+			 */
+			info->inbound_item = smem[0];
+			info->outbound_item = smem[1];
 			strncpy(info->entry_name, entry_name,
 				sizeof(info->entry_name));
 			info->entry_name[sizeof(info->entry_name) - 1] = '\0';
@@ -795,8 +800,8 @@ static int qpas_smp2p_prepare_ipcc_irq(const struct qpas_smp2p_info *info)
  * We do both upfront since ADSP isn't running yet, but preserve
  * the two-kick order for protocol fidelity.
  *
- * Does NOT allocate item 429 - ADSP firmware creates its own outbound
- * item (per-processor ownership model).
+ * Does NOT allocate the inbound item (e.g. SC7280 ADSP item 443) - ADSP
+ * firmware creates its own outbound item (per-processor ownership model).
  */
 static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 			   struct qpas_smp2p_info *info)
@@ -815,7 +820,8 @@ static int qpas_smp2p_init(struct udevice *smem, ofnode node,
 
 	/*
 	 * Allocate outbound item (APPS -> ADSP) in the ADSP-private
-	 * partition.  Linux: qcom_smem_alloc(remote_pid, smem_id, size).
+	 * partition. Linux: qcom_smem_alloc(remote_pid,
+	 * smem_items[SMP2P_OUTBOUND], size). On SC7280 ADSP this is item 429.
 	 */
 	ret = smem_alloc(smem, info->remote_pid, info->outbound_item,
 			 sizeof(*out));
