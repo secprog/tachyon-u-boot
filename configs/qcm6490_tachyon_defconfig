@@ -27,22 +27,20 @@ CONFIG_BOOTDELAY=-1
 
 CONFIG_CMD_PMIC=y
 
-# ADSP PAS-only bring-up: PMIC-GLINK and DP are disabled to prevent
-# auto-triggering ADSP boot from the Type-C/DisplayPort consumer path.
-# Use the 'adsp' shell command to boot ADSP in isolation.
+# USB-C DisplayPort path: PMIC-GLINK boots ADSP on demand, queries
+# Type-C orientation/Alt Mode policy, then the DP driver trains the link.
 CONFIG_LOGLEVEL=4
 CONFIG_LOG_MAX_LEVEL=9
 CONFIG_LOG_DEFAULT_LEVEL=4
 CONFIG_CMD_LOG=y
-CONFIG_CMD_ADSP=y
 CONFIG_DM_MAILBOX=y
 CONFIG_QCOM_IPCC=y
 CONFIG_QCOM_AOSS_QMP=y
 CONFIG_QCOM_ADSP_PAS=y
-# CONFIG_QCOM_PMIC_GLINK is not set
+CONFIG_QCOM_PMIC_GLINK=y
 CONFIG_POWER_DOMAIN=y
 CONFIG_QCOM_RPMH_POWER_DOMAIN=y
-# CONFIG_CLK_QCOM_SC7280_DISPCC is not set
+CONFIG_CLK_QCOM_SC7280_DISPCC=y
 CONFIG_PINCTRL_QCOM_SC7280=y
-# CONFIG_VIDEO_QCOM_TACHYON_DP is not set
-# CONFIG_PHY_QCOM_QMP_COMBO is not set
+CONFIG_VIDEO_QCOM_TACHYON_DP=y
+CONFIG_PHY_QCOM_QMP_COMBO=y

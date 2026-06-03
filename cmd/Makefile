@@ -18,7 +18,6 @@ obj-$(CONFIG_CMD_ACPI) += acpi.o
 obj-$(CONFIG_CMD_ADDRMAP) += addrmap.o
 obj-$(CONFIG_CMD_AES) += aes.o
 obj-$(CONFIG_CMD_ADC) += adc.o
-obj-$(CONFIG_CMD_ADSP) += adsp.o
 obj-$(CONFIG_CMD_ARMFLASH) += armflash.o
 obj-$(CONFIG_BLK) += blk_common.o
 obj-$(CONFIG_CMD_BOOTDEV) += bootdev.o

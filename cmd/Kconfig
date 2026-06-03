@@ -2725,18 +2725,6 @@ config CMD_SCMI
 	  platforms to manage system resources.
 endmenu
 
-menu "Qualcomm commands"
-config CMD_ADSP
-	bool "adsp/cdsp - boot Qualcomm PAS processors standalone"
-	depends on QCOM_ADSP_PAS
-	help
-	  Provide 'adsp' and 'cdsp' shell commands that boot Qualcomm
-	  remote processors through Peripheral Authentication Service.
-	  This is intended for bring-up testing without the DP/USB-C /
-	  PMIC-GLINK consumer path.
-
-endmenu
-
 menu "Filesystem commands"
 config CMD_BTRFS
 	bool "Enable the 'btrsubvol' command"
