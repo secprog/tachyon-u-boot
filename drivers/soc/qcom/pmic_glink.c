@@ -93,7 +93,8 @@
 #define QPG_UCSI_NTFY_CMD_COMPLETE	BIT(0)	/* Linux BIT(16) >> 16 */
 #define QPG_UCSI_NTFY_ERROR		BIT(15)	/* Linux BIT(31) >> 16 */
 #define QPG_UCSI_NTFY_ALL		0xdbe7	/* Linux 0xdbe70000 >> 16 */
-#define UCSI_CCI_NOT_SUPPORTED			BIT(25)
+#define UCSI_CCI_NOT_SUPPORTED			BIT(24)
+#define UCSI_CCI_ACK_COMPLETE			BIT(25)
 #define UCSI_CCI_ERROR				BIT(30)
 #define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
 #define UCSI_CCI_RESET_COMPLETE		BIT(27)
@@ -1915,6 +1916,8 @@ static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
 				   bool command_complete)
 {
 	u16 d2 = 0;
+	ulong start;
+	u32 cci;
 	int ret;
 
 	if (connector_change)
@@ -1926,8 +1929,33 @@ static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
 		UCSI_CTRL_D2(UCSI_CMD_ACK_CC_CI, d2));
 	log_warning("pmic-glink: UCSI ACK_CC_CI ret=%d connector=%d command=%d\n",
 		    ret, connector_change, command_complete);
+	if (ret)
+		return ret;
 
-	return ret;
+	/*
+	 * Linux parity: block until ACK_COMPLETE appears in CCI.
+	 * ucsi_acknowledge() in Linux uses sync_control which waits
+	 * for command completion.  Use 5000 ms.
+	 */
+	start = get_timer(0);
+	do {
+		mdelay(20);
+		if (get_timer(start) >= 5000)
+			break;
+		ret = qpg_send_ucsi_read(pg);
+		if (ret)
+			return ret;
+		cci = qpg_ucsi_cci(pg);
+		if (cci & UCSI_CCI_ACK_COMPLETE) {
+			log_warning("pmic-glink: UCSI ACK_CC_CI complete cci=%08x\n",
+				    cci);
+			return 0;
+		}
+	} while (1);
+
+	log_warning("pmic-glink: UCSI ACK_CC_CI timeout cci=%08x\n",
+		    qpg_ucsi_cci(pg));
+	return -ETIMEDOUT;
 }
 
 static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
@@ -1953,7 +1981,7 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 	if (ret)
 		return ret;
 
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 1000);
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
 	if (ret)
 		return ret;
 
@@ -2106,7 +2134,15 @@ static int qpg_send_ucsi_get_current_cam(struct qpg *pg, u8 port)
 static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
 					    u8 offset, u8 count)
 {
-	/* recipient=connector(0) in low byte, port+1 in high byte */
+	/*
+	 * Byte layout matches the original ad-hoc write:
+	 *   byte 10 = recipient (connector=0)
+	 *   byte 11 = connector number (port+1)
+	 *   byte 12 = alternate mode offset
+	 *   byte 13 = number of alternate modes - 1
+	 * d2 bits 16-23 = byte 10, bits 24-31 = byte 11
+	 * d4 bits 32-39 = byte 12, bits 40-47 = byte 13
+	 */
 	u16 d2 = (u16)(port + 1) << 8;
 	u32 d4 = (u32)offset | ((u32)(count ? count - 1 : 0) << 8);
 	u64 control = UCSI_CTRL_D2_D4(UCSI_CMD_GET_ALTERNATE_MODE, d2, d4);
@@ -2120,7 +2156,7 @@ static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
 	if (ret)
 		return ret;
 
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 1000);
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
 	if (ret)
 		return ret;
 
