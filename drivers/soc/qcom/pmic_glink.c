@@ -1474,29 +1474,31 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	u8 raw_orientation = pin[1];
 	u8 mux = pin[2];
 	u16 vid = get_unaligned_le16(pin + 4);
-	u16 svid = get_unaligned_le16(pin + 6);
+	u16 svid_le = get_unaligned_le16(pin + 6);
+	u16 svid_be = ((u16)pin[6] << 8) | pin[7];
 	u8 mode = pin[8] & SC8280XP_DPAM_MASK;
 	bool hpd = !!(pin[8] & SC8280XP_HPD_STATE_MASK);
 	bool hpd_irq = !!(pin[8] & SC8280XP_HPD_IRQ_MASK);
+	bool dp_svid = svid_le == USB_TYPEC_DP_SID ||
+		       svid_be == USB_TYPEC_DP_SID;
+	bool dp_active = mode >= DPAM_HPD_A &&
+			 (dp_svid || mux == 2 || mux == 3);
 	u8 port = pin[0];
 
 	orientation = qpg_orientation(raw_orientation);
-	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid=%04x dpam=%02x hpd=%u irq=%u\n",
-		    source, port, raw_orientation, orientation, mux, vid, svid,
-		    mode, hpd, hpd_irq);
+	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid_le=%04x svid_be=%04x svid_raw=%02x%02x dpam=%02x hpd=%u irq=%u\n",
+		    source, port, raw_orientation, orientation, mux, vid,
+		    svid_le, svid_be, pin[6], pin[7], mode, hpd, hpd_irq);
 
 	pg->notify.seen = true;
 	pg->notify.port = port;
 	pg->notify.raw_orientation = raw_orientation;
 	pg->notify.orientation = orientation;
 	pg->notify.mux = mux;
-	pg->notify.svid = svid;
+	pg->notify.svid = dp_svid ? USB_TYPEC_DP_SID : svid_le;
 	pg->notify.dpam = mode;
 	pg->notify.hpd = hpd;
 	pg->notify.hpd_irq = hpd_irq;
-
-	if (svid != USB_TYPEC_DP_SID)
-		return;
 
 	altmode->port = port;
 	altmode->orientation = orientation;
@@ -1504,13 +1506,13 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	altmode->hpd_irq = hpd_irq;
 	pg->altmode_notify_seen = true;
 
-	if (mode < DPAM_HPD_A) {
+	if (!dp_active) {
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
 		qpg_program_sbu_mux(orientation, false);
-		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u\n",
-			    source, mux, mode);
+		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u dp_svid=%u\n",
+			    source, mux, mode, dp_svid);
 		return;
 	}
 
@@ -2376,6 +2378,10 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 			if (!refresh_ret &&
 			    qpg_done_altmode(&qpg_session, &altmode))
 				notify_ret = 0;
+			else if (notify_ret == -ETIMEDOUT &&
+				 qpg_session.altmode_notify_seen &&
+				 qpg_session.altmode_no_dp)
+				notify_ret = -ENODEV;
 		}
 		if (notify_ret)
 			ret = notify_ret;
