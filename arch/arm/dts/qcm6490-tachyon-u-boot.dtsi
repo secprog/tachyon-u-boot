@@ -42,8 +42,6 @@
 };
 
 &mdss_dp {
-	/delete-property/ assigned-clocks;
-	/delete-property/ assigned-clock-parents;
 	bootph-all;
 };
 
