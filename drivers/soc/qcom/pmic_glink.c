@@ -68,14 +68,17 @@
 #define UCSI_WRITE_BUFFER_REQ			0x12
 #define UCSI_NOTIFY_IND			0x13
 
+#define USBC_CMD_READ_REQ			0x14
 #define USBC_SC8180X_NOTIFY_IND			0x13
 #define USBC_CMD_WRITE_REQ			0x15
 #define USBC_NOTIFY_IND				0x16
 
 #define ALTMODE_PAN_EN				0x10
 #define ALTMODE_PAN_ACK				0x11
+#define ALTMODE_READ_SEL			0x12
 
 #define UCSI_BUFFER_SIZE			48
+#define USBC_READ_BUFFER_SIZE			32
 #define UCSI_CMD_ACK_CC_CI			4
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
 #define UCSI_CMD_GET_CAPABILITY			6
@@ -94,6 +97,9 @@
 #define UCSI_CCI_DATA_LENGTH_SHIFT		8
 #define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
 #define UCSI_ACK_CC_CI_COMMAND_COMPLETE		BIT(1)
+
+#define USBC_READ_SEL_PIN_ASSIGNMENT		1
+#define USBC_READ_DATA_PIN_ASSIGNMENT		1
 
 #define USB_TYPEC_DP_SID			0xff01
 #define DPAM_HPD_A				1
@@ -157,6 +163,17 @@ struct qpg_ucsi_notify {
 	__le32 reserved;
 } __packed;
 
+struct qpg_usbc_read_req {
+	struct qpg_pmic_hdr hdr;
+	__le32 reserved;
+} __packed;
+
+struct qpg_usbc_read_resp {
+	struct qpg_pmic_hdr hdr;
+	u8 read_buffer[USBC_READ_BUFFER_SIZE];
+	__le32 return_code;
+} __packed;
+
 struct qpg_usbc_notify {
 	struct qpg_pmic_hdr hdr;
 	u8 payload[16];
@@ -215,11 +232,14 @@ struct qpg {
 	bool altmode_no_dp;
 	bool ucsi_read_acked;
 	bool ucsi_write_acked;
+	bool usbc_read_acked;
 	bool ucsi_notify_seen;
 	u32 ucsi_notification;
 	u32 ucsi_read_return_code;
 	u32 ucsi_write_return_code;
+	u32 usbc_read_return_code;
 	u8 ucsi_read_buffer[UCSI_BUFFER_SIZE];
+	u8 usbc_read_buffer[USBC_READ_BUFFER_SIZE];
 	struct qpg_notify_debug notify;
 };
 
@@ -613,6 +633,8 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 static int qpg_wait_riid(struct qpg *pg);
 static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg);
 static int qpg_send_ucsi_read(struct qpg *pg);
+static int qpg_send_usbc_read(struct qpg *pg,
+			      struct qcom_pmic_glink_altmode *altmode);
 static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port);
 static int qpg_drain_until(struct qpg *pg,
 			   struct qcom_pmic_glink_altmode *altmode,
@@ -625,6 +647,8 @@ static bool qpg_done_ucsi_read(struct qpg *pg,
 			       struct qcom_pmic_glink_altmode *altmode);
 static bool qpg_done_ucsi_write(struct qpg *pg,
 				struct qcom_pmic_glink_altmode *altmode);
+static bool qpg_done_usbc_read(struct qpg *pg,
+			       struct qcom_pmic_glink_altmode *altmode);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -823,21 +847,20 @@ static int qpg_send_notify_pan_ack(struct qpg *pg,
 	return ret;
 }
 
-static void qpg_parse_pmic(struct qpg *pg,
+static bool qpg_parse_pmic(struct qpg *pg,
 			   struct qcom_pmic_glink_altmode *altmode,
-			   const void *data, size_t len)
+			   const void *data, size_t len, u32 *pan_ack_port)
 {
 	const struct qpg_pmic_hdr *hdr = data;
 	u32 owner, type, raw_opcode;
 	bool ack_notify = false;
 	u32 port = 0;
-	int ret;
 	u16 opcode;
 	u16 svid;
 
 	if (len < sizeof(*hdr)) {
 		log_warning("pmic-glink: PMIC msg too short len=%zu\n", len);
-		return;
+		return false;
 	}
 
 	owner = le32_to_cpu(hdr->owner);
@@ -906,16 +929,39 @@ static void qpg_parse_pmic(struct qpg *pg,
 			break;
 		}
 
-		return;
+		return false;
 	}
 
 	if (owner != PMIC_GLINK_OWNER_USBC_PAN) {
 		log_warning("pmic-glink: unsupported PMIC owner=%u opcode=%02x len=%zu\n",
 			    owner, opcode, len);
-		return;
+		return false;
 	}
 
 	switch (opcode) {
+	case USBC_CMD_READ_REQ: {
+		const struct qpg_usbc_read_resp *resp = data;
+
+		pg->usbc_read_acked = true;
+		if (len >= sizeof(*resp)) {
+			const u8 *buf = resp->read_buffer;
+
+			pg->usbc_read_return_code =
+				le32_to_cpu(resp->return_code);
+			memcpy(pg->usbc_read_buffer, resp->read_buffer,
+			       sizeof(pg->usbc_read_buffer));
+			log_warning("pmic-glink: USBC READ ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				    pg->usbc_read_return_code,
+				    buf[0], buf[1], buf[2], buf[3],
+				    buf[4], buf[5], buf[6], buf[7],
+				    buf[8], buf[9], buf[10], buf[11],
+				    buf[12], buf[13], buf[14], buf[15]);
+		} else {
+			log_warning("pmic-glink: USBC READ short len=%zu expected=%zu\n",
+				    len, sizeof(*resp));
+		}
+		break;
+	}
 	case USBC_CMD_WRITE_REQ:
 		pg->pan_acked = true;
 		log_warning("pmic-glink: PAN ACK received\n");
@@ -931,11 +977,11 @@ static void qpg_parse_pmic(struct qpg *pg,
 	}
 
 	if (ack_notify) {
-		ret = qpg_send_notify_pan_ack(pg, altmode, port);
-		if (ret)
-			log_warning("pmic-glink: ALTMODE_PAN_ACK failed ret=%d port=%u\n",
-				    ret, port);
+		*pan_ack_port = port;
+		return true;
 	}
+
+	return false;
 }
 
 static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
@@ -949,6 +995,8 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	u8 *payload;
 	u32 chunk_size, liid;
 	u16 rx_done_cid = 0;
+	bool pan_ack_pending = false;
+	u32 pan_ack_port = 0;
 	u16 cid;
 	int ret = 0;
 
@@ -976,7 +1024,8 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	qpg_rx_advance(pg, ALIGN(sizeof(hdr) + chunk_size, 8));
 
 	if (pg->remote_opened && cid == pg->rcid) {
-		qpg_parse_pmic(pg, altmode, payload, chunk_size);
+		pan_ack_pending = qpg_parse_pmic(pg, altmode, payload,
+						 chunk_size, &pan_ack_port);
 		rx_done_cid = pg->lcid;
 	} else {
 		log_warning("pmic-glink: RX data on unknown cid=%u liid=%u len=%u\n",
@@ -985,6 +1034,13 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 
 	if (rx_done_cid)
 		ret = qpg_send_rx_done_for(pg, rx_done_cid, liid);
+
+	if (!ret && pan_ack_pending) {
+		ret = qpg_send_notify_pan_ack(pg, altmode, pan_ack_port);
+		if (ret)
+			log_warning("pmic-glink: ALTMODE_PAN_ACK failed ret=%d port=%u\n",
+				    ret, pan_ack_port);
+	}
 
 	free(payload);
 
@@ -1361,6 +1417,12 @@ static bool qpg_done_ucsi_write(struct qpg *pg,
 	return pg->ucsi_write_acked;
 }
 
+static bool qpg_done_usbc_read(struct qpg *pg,
+			       struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->usbc_read_acked;
+}
+
 static bool qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
@@ -1402,6 +1464,140 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME, cmd, arg);
 
 	return qpg_send_data(pg, &req, sizeof(req));
+}
+
+static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
+					  struct qcom_pmic_glink_altmode *altmode,
+					  const u8 *pin, const char *source)
+{
+	enum qcom_pmic_glink_orientation orientation;
+	u8 raw_orientation = pin[1];
+	u8 mux = pin[2];
+	u16 vid = get_unaligned_le16(pin + 4);
+	u16 svid = get_unaligned_le16(pin + 6);
+	u8 mode = pin[8] & SC8280XP_DPAM_MASK;
+	bool hpd = !!(pin[8] & SC8280XP_HPD_STATE_MASK);
+	bool hpd_irq = !!(pin[8] & SC8280XP_HPD_IRQ_MASK);
+	u8 port = pin[0];
+
+	orientation = qpg_orientation(raw_orientation);
+	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid=%04x dpam=%02x hpd=%u irq=%u\n",
+		    source, port, raw_orientation, orientation, mux, vid, svid,
+		    mode, hpd, hpd_irq);
+
+	pg->notify.seen = true;
+	pg->notify.port = port;
+	pg->notify.raw_orientation = raw_orientation;
+	pg->notify.orientation = orientation;
+	pg->notify.mux = mux;
+	pg->notify.svid = svid;
+	pg->notify.dpam = mode;
+	pg->notify.hpd = hpd;
+	pg->notify.hpd_irq = hpd_irq;
+
+	if (svid != USB_TYPEC_DP_SID)
+		return;
+
+	altmode->port = port;
+	altmode->orientation = orientation;
+	altmode->hpd = hpd;
+	altmode->hpd_irq = hpd_irq;
+	pg->altmode_notify_seen = true;
+
+	if (mode < DPAM_HPD_A) {
+		altmode->dp = false;
+		altmode->pin_assignment = 0;
+		pg->altmode_no_dp = true;
+		qpg_program_sbu_mux(orientation, false);
+		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u\n",
+			    source, mux, mode);
+		return;
+	}
+
+	altmode->pin_assignment = mode - DPAM_HPD_A;
+	altmode->dp = true;
+	pg->altmode_no_dp = false;
+	qpg_program_sbu_mux(orientation, true);
+	log_warning("pmic-glink: %s DP active pin_assignment=%u\n",
+		    source, altmode->pin_assignment);
+}
+
+static void qpg_log_usbc_read(struct qpg *pg,
+			      struct qcom_pmic_glink_altmode *altmode)
+{
+	const u8 *buf = pg->usbc_read_buffer;
+	u32 data_type = get_unaligned_le32(buf);
+
+	log_warning("pmic-glink: USBC READ decoded ret=%u data_type=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    pg->usbc_read_return_code, data_type,
+		    buf[0], buf[1], buf[2], buf[3],
+		    buf[4], buf[5], buf[6], buf[7],
+		    buf[8], buf[9], buf[10], buf[11],
+		    buf[12], buf[13], buf[14], buf[15]);
+
+	if (data_type == USBC_READ_DATA_PIN_ASSIGNMENT)
+		qpg_apply_usbc_pin_assignment(pg, altmode, buf + 4,
+					      "USBC READ");
+}
+
+static int qpg_send_usbc_read(struct qpg *pg,
+			      struct qcom_pmic_glink_altmode *altmode)
+{
+	struct qpg_usbc_read_req req = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USBC_PAN),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(USBC_CMD_READ_REQ),
+	};
+	int ret;
+
+	pg->usbc_read_acked = false;
+	pg->usbc_read_return_code = 0xffffffff;
+
+	log_warning("pmic-glink: owner=%u channel=%s USBC_READ_REQ\n",
+		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME);
+
+	ret = qpg_send_data(pg, &req, sizeof(req));
+	log_warning("pmic-glink: send USBC_READ_REQ ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(pg, altmode, qpg_done_usbc_read, 1000);
+	log_warning("pmic-glink: wait USBC_READ ret=%d ack=%d\n",
+		    ret, pg->usbc_read_acked);
+	if (!ret)
+		qpg_log_usbc_read(pg, altmode);
+
+	return ret;
+}
+
+static int qpg_send_usbc_read_select(struct qpg *pg, u32 read_sel)
+{
+	struct qcom_pmic_glink_altmode altmode = {};
+	int ret;
+
+	pg->pan_acked = false;
+	ret = qpg_send_altmode_req(pg, ALTMODE_READ_SEL, read_sel);
+	log_warning("pmic-glink: send READ_SEL ret=%d sel=%u\n", ret, read_sel);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(pg, &altmode, qpg_done_pan_ack, 1000);
+	log_warning("pmic-glink: wait READ_SEL_ACK ret=%d pan_acked=%d\n",
+		    ret, pg->pan_acked);
+
+	return ret;
+}
+
+static int qpg_refresh_usbc_pin_assignment(struct qpg *pg,
+					   struct qcom_pmic_glink_altmode *altmode)
+{
+	int ret;
+
+	ret = qpg_send_usbc_read_select(pg, USBC_READ_SEL_PIN_ASSIGNMENT);
+	if (ret)
+		return ret;
+
+	return qpg_send_usbc_read(pg, altmode);
 }
 
 static int qpg_send_ucsi_read(struct qpg *pg)
@@ -2055,6 +2251,7 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 
 int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 {
+	int refresh_ret;
 	int ret;
 
 	if (!altmode)
@@ -2070,6 +2267,16 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 
 	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_altmode,
 			      QPG_ALTMODE_TIMEOUT_MS);
+	if (ret) {
+		refresh_ret = qpg_refresh_usbc_pin_assignment(&qpg_session,
+							      altmode);
+		log_warning("pmic-glink: USBC pin refresh ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
+			    refresh_ret, altmode->dp, altmode->orientation,
+			    altmode->pin_assignment, altmode->hpd,
+			    altmode->hpd_irq);
+		if (!refresh_ret && qpg_done_altmode(&qpg_session, altmode))
+			ret = 0;
+	}
 	if (ret == -ETIMEDOUT && qpg_session.altmode_notify_seen &&
 	    qpg_session.altmode_no_dp) {
 		log_warning("pmic-glink: no DP sink active after valid notification\n");
@@ -2121,6 +2328,7 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 	int adsp_ret = 0;
 	int open_ret = 0;
 	int pan_ret = 0;
+	int refresh_ret;
 	int notify_ret;
 	int ret;
 	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
@@ -2161,6 +2369,14 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 		notify_ret = qpg_drain_until(&qpg_session, &altmode,
 					     qpg_done_altmode,
 					     timeout_ms);
+		if (notify_ret) {
+			refresh_ret = qpg_refresh_usbc_pin_assignment(&qpg_session,
+								     &altmode);
+			printf("USBC refresh: ret=%d\n", refresh_ret);
+			if (!refresh_ret &&
+			    qpg_done_altmode(&qpg_session, &altmode))
+				notify_ret = 0;
+		}
 		if (notify_ret)
 			ret = notify_ret;
 	}
