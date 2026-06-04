@@ -50,6 +50,10 @@
 	bootph-all;
 };
 
+&apps_smmu {
+	bootph-all;
+};
+
 &{/reserved-memory} {
 	bootph-all;
 };
