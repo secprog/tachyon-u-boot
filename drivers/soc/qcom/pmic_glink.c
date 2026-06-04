@@ -89,9 +89,9 @@
 #define UCSI_CMD_GET_CAM_SUPPORTED		13
 #define UCSI_CMD_GET_CURRENT_CAM		14
 #define UCSI_CMD_GET_CONNECTOR_STATUS		18
-#define UCSI_ENABLE_NTFY_CMD_COMPLETE	BIT(0)
-#define UCSI_ENABLE_NTFY_ERROR		BIT(1)
-#define UCSI_ENABLE_NTFY_ALL		0xdbe70000
+#define QPG_UCSI_NTFY_CMD_COMPLETE	BIT(0)	/* Linux BIT(16) >> 16 */
+#define QPG_UCSI_NTFY_ERROR		BIT(15)	/* Linux BIT(31) >> 16 */
+#define QPG_UCSI_NTFY_ALL		0xdbe7	/* Linux 0xdbe70000 >> 16 */
 #define UCSI_CCI_NOT_SUPPORTED			BIT(25)
 #define UCSI_CCI_ERROR				BIT(30)
 #define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
@@ -119,14 +119,6 @@
 #define SC8280XP_DPAM_MASK			0x3f
 #define SC8280XP_HPD_STATE_MASK			BIT(6)
 #define SC8280XP_HPD_IRQ_MASK			BIT(7)
-
-/* QMP USB3-DP combo PHY COM block registers */
-#define QMP_V3_DP_COM_PHY_MODE_CTRL		0x000
-#define QMP_V3_DP_COM_TYPEC_CTRL		0x010
-#define QMP_DP_COM_USB3_MODE			BIT(0)
-#define QMP_DP_COM_DP_MODE			BIT(1)
-#define QMP_DP_COM_SW_PORTSELECT_VAL		BIT(0)
-#define QMP_DP_COM_SW_PORTSELECT_MUX		BIT(1)
 
 struct qpg_msg {
 	__le16 cmd;
@@ -254,7 +246,6 @@ struct qpg {
 	u8 ucsi_read_buffer[UCSI_BUFFER_SIZE];
 	u8 usbc_read_buffer[USBC_READ_BUFFER_SIZE];
 	struct qpg_notify_debug notify;
-	void *qmp_phy_base;	/* QMP USB3-DP combo PHY COM block iomap */
 };
 
 static struct qpg qpg_session;
@@ -757,19 +748,6 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		qpg_program_sbu_mux(orientation, false);
 		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
 			    notify->payload[2], mode);
-		/* Set QMP PHY to USB3 mode so USB data paths work */
-		if (pg->qmp_phy_base) {
-			u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-			if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-				typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-			writel(typec,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-			writel(QMP_DP_COM_USB3_MODE,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-			log_warning("pmic-glink: QMP PHY -> USB3 orient=%u\n",
-				    orientation);
-		}
 		return true;
 	}
 
@@ -780,20 +758,6 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_program_sbu_mux(orientation, true);
-
-	/* Put QMP combo PHY into DP mode with correct orientation */
-	if (pg->qmp_phy_base) {
-		u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-		if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-			typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-		writel(typec,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-		writel(QMP_DP_COM_DP_MODE,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-		log_warning("pmic-glink: QMP PHY -> DP orient=%u\n",
-			    orientation);
-	}
 
 	return true;
 }
@@ -852,18 +816,6 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		qpg_program_sbu_mux(orientation, false);
 		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
 			    mux, mode);
-		if (pg->qmp_phy_base) {
-			u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-			if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-				typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-			writel(typec,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-			writel(QMP_DP_COM_USB3_MODE,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-			log_warning("pmic-glink: QMP PHY -> USB3 orient=%u\n",
-				    orientation);
-		}
 		return true;
 	}
 
@@ -874,19 +826,6 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_program_sbu_mux(orientation, true);
-
-	if (pg->qmp_phy_base) {
-		u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-		if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-			typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-		writel(typec,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-		writel(QMP_DP_COM_DP_MODE,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-		log_warning("pmic-glink: QMP PHY -> DP orient=%u\n",
-			    orientation);
-	}
 
 	return true;
 }
@@ -1585,16 +1524,6 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 		qpg_program_sbu_mux(orientation, false);
 		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u dp_svid=%u\n",
 			    source, mux, mode, dp_svid);
-		if (pg->qmp_phy_base) {
-			u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-			if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-				typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-			writel(typec,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-			writel(QMP_DP_COM_USB3_MODE,
-			       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-		}
 		return;
 	}
 
@@ -1604,19 +1533,6 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	qpg_program_sbu_mux(orientation, true);
 	log_warning("pmic-glink: %s DP active pin_assignment=%u\n",
 		    source, altmode->pin_assignment);
-
-	if (pg->qmp_phy_base) {
-		u32 typec = QMP_DP_COM_SW_PORTSELECT_MUX;
-
-		if (orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
-			typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
-		writel(typec,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_TYPEC_CTRL);
-		writel(QMP_DP_COM_DP_MODE,
-		       pg->qmp_phy_base + QMP_V3_DP_COM_PHY_MODE_CTRL);
-		log_warning("pmic-glink: QMP PHY -> DP orient=%u (%s)\n",
-			    orientation, source);
-	}
 }
 
 static void qpg_log_usbc_read(struct qpg *pg,
@@ -2087,29 +2003,21 @@ static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
 
 static int qpg_enable_ucsi_notifications_phase2(struct qpg *pg)
 {
-	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase2 mask=%08x\n",
-		    UCSI_ENABLE_NTFY_ALL);
+	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase2 mask=%04x\n",
+		    QPG_UCSI_NTFY_ALL);
 	return qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
-				     UCSI_ENABLE_NTFY_ALL, true);
+				     QPG_UCSI_NTFY_ALL, true);
 }
 
 static int qpg_enable_ucsi_notifications(struct qpg *pg)
 {
 	u16 phase1_mask;
-	int ret;
 
-	phase1_mask = UCSI_ENABLE_NTFY_CMD_COMPLETE | UCSI_ENABLE_NTFY_ERROR;
+	phase1_mask = QPG_UCSI_NTFY_CMD_COMPLETE | QPG_UCSI_NTFY_ERROR;
 	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase1 mask=%04x\n",
 		    phase1_mask);
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
-				    phase1_mask, true);
-	if (ret) {
-		log_warning("pmic-glink: UCSI phase1 enable failed ret=%d\n",
-			    ret);
-		return ret;
-	}
-
-	return qpg_enable_ucsi_notifications_phase2(pg);
+	return qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
+				     phase1_mask, true);
 }
 
 static int qpg_init(struct qpg *pg)
@@ -2231,37 +2139,6 @@ static int qpg_init(struct qpg *pg)
 		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
 		    le32_to_cpu(*pg->rx_tail), le32_to_cpu(*pg->rx_head));
 
-	/*
-	 * Discover QMP USB3-DP combo PHY for Type-C orientation/mode
-	 * programming.  The PHY owns TYPEC_CTRL and PHY_MODE_CTRL, which
-	 * must be set when the PMIC notifies DP altmode active (equivalent
-	 * to Linux's typec_switch_set + typec_mux_set).
-	 */
-	{
-		ofnode qmp_phy = ofnode_by_compatible(ofnode_null(),
-					"qcom,sc7280-qmp-usb3-dp-phy");
-		fdt_addr_t phy_addr;
-		fdt_size_t phy_size;
-
-		if (!ofnode_valid(qmp_phy)) {
-			log_warning("pmic-glink: QMP PHY node not found\n");
-		} else {
-			phy_addr = ofnode_get_addr_size(qmp_phy, "reg",
-							&phy_size);
-			if (phy_addr == FDT_ADDR_T_NONE || phy_size < 0x3000) {
-				log_warning("pmic-glink: QMP PHY bad addr=%llx size=%llx\n",
-					    (u64)phy_addr, (u64)phy_size);
-			} else {
-				pg->qmp_phy_base = map_physmem(phy_addr,
-							       phy_size,
-							       MAP_NOCACHE);
-				log_warning("pmic-glink: QMP PHY mapped addr=%llx size=%llx base=%p\n",
-					    (u64)phy_addr, (u64)phy_size,
-					    pg->qmp_phy_base);
-			}
-		}
-	}
-
 	return 0;
 }
 
@@ -2373,61 +2250,6 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 	if (glink_open_retp)
 		*glink_open_retp = 0;
-
-	/*
-	 * Linux UCSI init sequence:
-	 *   1. PPM_RESET
-	 *   2. SET_NOTIFICATION_ENABLE = CMD_COMPLETE | ERROR  (phase 1)
-	 *   3. GET_CAPABILITY + connector queries (basic info)
-	 *   4. SET_NOTIFICATION_ENABLE = UCSI_ENABLE_NTFY_ALL (phase 2)
-	 */
-	ret = qpg_send_ucsi_ppm_reset(&qpg_session);
-	if (ret)
-		log_warning("pmic-glink: UCSI PPM_RESET ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_command(&qpg_session,
-				    UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
-				    UCSI_ENABLE_NTFY_CMD_COMPLETE |
-				    UCSI_ENABLE_NTFY_ERROR, true);
-	if (ret)
-		log_warning("pmic-glink: UCSI phase1 enable ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_capability(&qpg_session);
-	if (ret)
-		log_warning("pmic-glink: UCSI capability ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_connector_capability(&qpg_session, 0);
-	if (ret)
-		log_warning("pmic-glink: UCSI connector capability ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	if (ret)
-		log_warning("pmic-glink: UCSI connector status ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_cam_supported(&qpg_session, 0);
-	if (ret)
-		log_warning("pmic-glink: UCSI CAM_SUPPORTED ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_current_cam(&qpg_session, 0);
-	if (ret)
-		log_warning("pmic-glink: UCSI CURRENT_CAM ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_send_ucsi_get_alternate_mode(&qpg_session, 0, 0, 2);
-	if (ret)
-		log_warning("pmic-glink: UCSI ALT_MODE ignored ret=%d\n",
-			    ret);
-
-	ret = qpg_enable_ucsi_notifications_phase2(&qpg_session);
-	if (ret)
-		log_warning("pmic-glink: UCSI phase2 enable ignored ret=%d\n",
-			    ret);
 
 	qpg_session.pan_acked = false;
 	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
@@ -2699,11 +2521,79 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
+static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
+		       char *const argv[])
+{
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	int ret;
+
+	if (argc != 1)
+		return CMD_RET_USAGE;
+
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+
+	printf("ADSP boot: ret=%d\n", adsp_ret);
+	printf("GLINK open: ret=%d\n", open_ret);
+	printf("PAN_EN: ret=%d\n", pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_ppm_reset(&qpg_session);
+	printf("UCSI PPM_RESET: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_enable_ucsi_notifications(&qpg_session);
+	printf("UCSI notifications phase1: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_capability(&qpg_session);
+	printf("UCSI capability: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_connector_capability(&qpg_session, 0);
+	printf("UCSI connector capability: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+	printf("UCSI connector status: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_cam_supported(&qpg_session, 0);
+	printf("UCSI CAM_SUPPORTED: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_current_cam(&qpg_session, 0);
+	printf("UCSI CURRENT_CAM: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_send_ucsi_get_alternate_mode(&qpg_session, 0, 0, 2);
+	printf("UCSI ALT_MODE: ret=%d\n", ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	ret = qpg_enable_ucsi_notifications_phase2(&qpg_session);
+	printf("UCSI notifications phase2: ret=%d\n", ret);
+
+	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
 static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		  char *const argv[])
 {
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "altmode"))
 		return do_qpg_altmode(cmdtp, flag, argc - 1, argv + 1);
+	if (argc == 2 && !strcmp(argv[1], "ucsi"))
+		return do_qpg_ucsi(cmdtp, flag, argc - 1, argv + 1);
 
 	return CMD_RET_USAGE;
 }
@@ -2711,5 +2601,6 @@ static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 U_BOOT_CMD(
 	qpg, 3, 1, do_qpg,
 	"Qualcomm PMIC-GLINK diagnostics",
-	"altmode [timeout_ms] - boot ADSP, open PMIC-GLINK, enable PAN, print Type-C altmode notification"
+	"altmode [timeout_ms] - boot ADSP, open PMIC-GLINK, enable PAN, print Type-C altmode notification\n"
+	"ucsi - run UCSI reset/discovery diagnostics"
 );

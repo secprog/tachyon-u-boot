@@ -443,6 +443,22 @@ struct tachyon_qmp_named_reg {
 	u16 off;
 };
 
+struct tachyon_qmp_offsets {
+	u16 com;
+	u16 dp_serdes;
+	u16 dp_tx0;
+	u16 dp_tx1;
+	u16 dp_phy;
+};
+
+static const struct tachyon_qmp_offsets tachyon_qmp_sc7280_offsets = {
+	.com		= 0x0000,
+	.dp_serdes	= QMP_OFF_DP_SERDES,
+	.dp_tx0		= QMP_OFF_DP_TX0,
+	.dp_tx1		= QMP_OFF_DP_TX1,
+	.dp_phy		= QMP_OFF_DP_PHY,
+};
+
 struct tachyon_dp_audio_format {
 	u8 format_code;
 	u8 max_channels;
@@ -464,6 +480,10 @@ struct tachyon_dp_priv {
 	void __iomem *link;
 	void __iomem *p0;
 	void __iomem *phy;
+	void __iomem *qmp_com;
+	void __iomem *qmp_dp_serdes;
+	void __iomem *qmp_dp_tx0;
+	void __iomem *qmp_dp_tx1;
 	void __iomem *phy_dp;
 	void __iomem *dpu;
 	void __iomem *vbif;
@@ -1526,7 +1546,7 @@ static void tachyon_dp_release_sbu_mux(struct tachyon_dp_priv *priv)
  */
 static u8 tachyon_dp_qmp_com_readb(struct tachyon_dp_priv *priv, u32 reg)
 {
-	return readl(priv->phy + reg) & 0xff;
+	return readl(priv->qmp_com + reg) & 0xff;
 }
 
 /*
@@ -1543,10 +1563,8 @@ static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
-		    readl(priv->phy + QMP_OFF_DP_SERDES +
-			  QMP_V4_COM_C_READY_STATUS) & 0xff,
-		    readl(priv->phy + QMP_OFF_DP_SERDES +
-			  QMP_V4_COM_CMN_STATUS) & 0xff);
+		    readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+		    readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff);
 }
 
 /*
@@ -1565,9 +1583,9 @@ static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
 		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
-	writel(typec, priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+	writel(typec, priv->qmp_com + QMP_V3_DP_COM_TYPEC_CTRL);
 	writel(QMP_DP_COM_DP_MODE,
-	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+	       priv->qmp_com + QMP_V3_DP_COM_PHY_MODE_CTRL);
 
 	log_warning("QMP COM orientation update: TYPEC=%02x MODE=%02x\n",
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
@@ -1661,7 +1679,7 @@ static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
 static void tachyon_dp_qmp_dump_pll_state(struct tachyon_dp_priv *priv,
 					  const char *tag)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 	static const struct tachyon_qmp_named_reg regs[] = {
 		{ "SW_RESET", QMP_V4_COM_SW_RESET },
 		{ "RESETSM_CNTRL", QMP_V4_COM_RESETSM_CNTRL },
@@ -1696,8 +1714,8 @@ static void tachyon_dp_qmp_dump_pll_state(struct tachyon_dp_priv *priv,
 static void tachyon_dp_qmp_dump_lane_power_state(struct tachyon_dp_priv *priv,
 						 const char *tag)
 {
-	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
-	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	void __iomem *tx0 = priv->qmp_dp_tx0;
+	void __iomem *tx1 = priv->qmp_dp_tx1;
 
 	log_warning("QMP DP PHY %s: PD_CTL=%02x DP_PHY_CFG=%02x DP_PHY_CFG1=%02x DP_STATUS=%02x\n",
 		    tag,
@@ -1719,6 +1737,7 @@ static void tachyon_dp_qmp_dump_lane_power_state(struct tachyon_dp_priv *priv,
 
 static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv)
 {
+	const struct tachyon_qmp_offsets *offs = &tachyon_qmp_sc7280_offsets;
 	struct ofnode_phandle_args args;
 	fdt_addr_t addr;
 	fdt_size_t size;
@@ -1734,7 +1753,19 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 		return -EINVAL;
 
 	priv->phy = map_sysmem(addr, size);
-	priv->phy_dp = (void __iomem *)((u8 __iomem *)priv->phy + QMP_OFF_DP_PHY);
+	priv->qmp_com = (void __iomem *)((u8 __iomem *)priv->phy + offs->com);
+	priv->qmp_dp_serdes = (void __iomem *)((u8 __iomem *)priv->phy +
+					       offs->dp_serdes);
+	priv->qmp_dp_tx0 = (void __iomem *)((u8 __iomem *)priv->phy +
+					    offs->dp_tx0);
+	priv->qmp_dp_tx1 = (void __iomem *)((u8 __iomem *)priv->phy +
+					    offs->dp_tx1);
+	priv->phy_dp = (void __iomem *)((u8 __iomem *)priv->phy +
+					offs->dp_phy);
+
+	log_warning("QMP offsets: base=%p com=%p dp_serdes=%p tx0=%p tx1=%p dp_phy=%p\n",
+		    priv->phy, priv->qmp_com, priv->qmp_dp_serdes,
+		    priv->qmp_dp_tx0, priv->qmp_dp_tx1, priv->phy_dp);
 
 	/*
 	 * Let the QMP combo PHY provider perform the common Linux-style
@@ -1881,7 +1912,7 @@ static void tachyon_dp_qmp_rate_serdes_table(struct tachyon_dp_priv *priv,
 
 static int tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 	const struct tachyon_qmp_reg *rate_tbl;
 	int rate_tbl_count;
 
@@ -1916,15 +1947,15 @@ static int tachyon_dp_qmp_program_serdes(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_qmp_program_tx_table(struct tachyon_dp_priv *priv)
 {
-	tachyon_qmp_write_table(priv->phy + QMP_OFF_DP_TX0, qmp_v4_dp_tx_tbl,
+	tachyon_qmp_write_table(priv->qmp_dp_tx0, qmp_v4_dp_tx_tbl,
 				ARRAY_SIZE(qmp_v4_dp_tx_tbl));
-	tachyon_qmp_write_table(priv->phy + QMP_OFF_DP_TX1, qmp_v4_dp_tx_tbl,
+	tachyon_qmp_write_table(priv->qmp_dp_tx1, qmp_v4_dp_tx_tbl,
 				ARRAY_SIZE(qmp_v4_dp_tx_tbl));
 }
 
 static void tachyon_dp_qmp_deassert_serdes_reset(struct tachyon_dp_priv *priv)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 
 	/* De-assert SW reset; all init values are now latched */
 	writel(0, serdes + QMP_V4_COM_SW_RESET);
@@ -1938,7 +1969,7 @@ static void tachyon_dp_qmp_dump_serdes_table(struct tachyon_dp_priv *priv,
 					     const struct tachyon_qmp_reg *regs,
 					     int count)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 	u8 actual;
 	int i;
 
@@ -1952,7 +1983,7 @@ static void tachyon_dp_qmp_dump_serdes_table(struct tachyon_dp_priv *priv,
 
 static void tachyon_dp_qmp_dump_serdes_pre_ready(struct tachyon_dp_priv *priv)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 	const struct tachyon_qmp_reg *rate_tbl;
 	int rate_tbl_count;
 
@@ -2006,8 +2037,8 @@ static const u8 qmp_dp_v3_swing_hbr_rbr[4][4] = {
 
 static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 {
-	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
-	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	void __iomem *tx0 = priv->qmp_dp_tx0;
+	void __iomem *tx1 = priv->qmp_dp_tx1;
 	const u8 (*swing_tbl)[4];
 	const u8 (*pre_tbl)[4];
 	u8 swing = 0, pre = 0;
@@ -2079,8 +2110,8 @@ static int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
  */
 static void tachyon_dp_qmp_v4_program_tx_bias(struct tachyon_dp_priv *priv)
 {
-	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
-	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	void __iomem *tx0 = priv->qmp_dp_tx0;
+	void __iomem *tx1 = priv->qmp_dp_tx1;
 	bool reverse = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE;
 	u32 bias0_en, bias1_en;
 	u32 drvr0_en, drvr1_en;
@@ -2120,8 +2151,8 @@ static void tachyon_dp_qmp_v4_program_tx_bias(struct tachyon_dp_priv *priv)
  */
 static void tachyon_dp_qmp_program_tx_levels(struct tachyon_dp_priv *priv)
 {
-	void __iomem *tx0 = priv->phy + QMP_OFF_DP_TX0;
-	void __iomem *tx1 = priv->phy + QMP_OFF_DP_TX1;
+	void __iomem *tx0 = priv->qmp_dp_tx0;
+	void __iomem *tx1 = priv->qmp_dp_tx1;
 
 	writel(0x0a, tx0 + QMP_V3_TX_TX_POL_INV);
 	writel(0x0a, tx1 + QMP_V3_TX_TX_POL_INV);
@@ -2168,7 +2199,7 @@ static int tachyon_dp_qmp_configure_dp_clocks(struct tachyon_dp_priv *priv)
  */
 static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 	u32 mode;
 	u32 vco_div;
 	u32 tx01, tx23;
@@ -2252,7 +2283,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 	tachyon_dp_qmp_dump_pll_state(priv, "before C_READY poll");
 
 	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
+				  priv->qmp_dp_serdes,
 				  QMP_V4_COM_C_READY_STATUS,
 				  BIT(0), BIT(0), "C_READY");
 	if (ret) {
@@ -2268,7 +2299,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 
 	/* Poll CMN_STATUS bit0 */
 	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
+				  priv->qmp_dp_serdes,
 				  QMP_V4_COM_CMN_STATUS,
 				  BIT(0), BIT(0), "CMN_STATUS bit0");
 	if (ret) {
@@ -2282,7 +2313,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 
 	/* Poll CMN_STATUS bit1 */
 	ret = tachyon_dp_qmp_poll(priv,
-				  priv->phy + QMP_OFF_DP_SERDES,
+				  priv->qmp_dp_serdes,
 				  QMP_V4_COM_CMN_STATUS,
 				  BIT(1), BIT(1), "CMN_STATUS bit1");
 	if (ret) {
@@ -2375,7 +2406,7 @@ static int tachyon_dp_qmp_v4_configure_dp_phy(struct tachyon_dp_priv *priv)
  */
 static void tachyon_dp_qmp_dp_phy_teardown_for_retune(struct tachyon_dp_priv *priv)
 {
-	void __iomem *serdes = priv->phy + QMP_OFF_DP_SERDES;
+	void __iomem *serdes = priv->qmp_dp_serdes;
 
 	log_warning("QMP DP teardown for retune\n");
 
@@ -2472,17 +2503,17 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
 	writel(QMP_DP_COM_DP_MODE,
-	       priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL);
+	       priv->qmp_com + QMP_V3_DP_COM_PHY_MODE_CTRL);
 	writel(typec,
-	       priv->phy + QMP_V3_DP_COM_TYPEC_CTRL);
+	       priv->qmp_com + QMP_V3_DP_COM_TYPEC_CTRL);
 
 	/* Compact register dump before DP SerDes programming */
 	com_pwr = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL);
 	rovrd   = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL);
 	swr     = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET);
 	swi     = tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL);
-	c_ready = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff;
-	cmn     = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff;
+	c_ready = readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff;
+	cmn     = readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff;
 	dp_pd   = tachyon_dp_qmp_pd_low(priv);
 	dp_status = tachyon_dp_qmp_status_low(priv);
 
@@ -2498,8 +2529,8 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		return ret;
 
 	/* Compact register dump after DP SerDes programming */
-	c_ready = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_C_READY_STATUS) & 0xff;
-	cmn     = readl(priv->phy + QMP_OFF_DP_SERDES + QMP_V4_COM_CMN_STATUS) & 0xff;
+	c_ready = readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff;
+	cmn     = readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff;
 	dp_pd   = tachyon_dp_qmp_pd_low(priv);
 	dp_status = tachyon_dp_qmp_status_low(priv);
 
@@ -2553,7 +2584,7 @@ static void tachyon_dp_aux_log_first_failure(struct tachyon_dp_priv *priv,
 		    readl(priv->aux + REG_DP_AUX_LIMITS),
 		    tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv),
-		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    dm_gpio_is_valid(&priv->sbu_enable) ?
 			    dm_gpio_get_value(&priv->sbu_enable) : -1,
 		    dm_gpio_is_valid(&priv->sbu_select) ?
@@ -5051,8 +5082,8 @@ static void tachyon_dp_prepare_aux_for_orientation(
 	pd_low = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
 
 	log_warning("DP AUX orientation state: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x SBU_EN=%d SBU_SEL=%d AUX_CTRL=%08x AUX_STATUS=%08x AUX_TRANS=%08x\n",
-		    readl(priv->phy + QMP_V3_DP_COM_TYPEC_CTRL) & 0xff,
-		    readl(priv->phy + QMP_V3_DP_COM_PHY_MODE_CTRL) & 0xff,
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
 		    pd_low,
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_STATUS) & 0xff,
 		    dm_gpio_is_valid(&priv->sbu_enable) ?
