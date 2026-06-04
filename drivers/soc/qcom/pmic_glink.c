@@ -79,6 +79,7 @@
 
 #define UCSI_BUFFER_SIZE			48
 #define USBC_READ_BUFFER_SIZE			32
+#define UCSI_CMD_PPM_RESET			1
 #define UCSI_CMD_ACK_CC_CI			4
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
 #define UCSI_CMD_GET_CAPABILITY			6
@@ -91,6 +92,7 @@
 #define UCSI_CCI_NOT_SUPPORTED			BIT(25)
 #define UCSI_CCI_ERROR				BIT(30)
 #define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
+#define UCSI_CCI_RESET_COMPLETE		BIT(27)
 #define UCSI_CCI_CONNECTOR_CHANGE_MASK		GENMASK(7, 1)
 #define UCSI_CCI_CONNECTOR_CHANGE_SHIFT		1
 #define UCSI_CCI_DATA_LENGTH_MASK		GENMASK(15, 8)
@@ -1790,7 +1792,8 @@ static int qpg_wait_ucsi_cci(struct qpg *pg, u32 old_cci, u32 timeout_ms)
 		if (cci != old_cci &&
 		    (cci & (UCSI_CCI_COMMAND_COMPLETE |
 			    UCSI_CCI_ERROR |
-			    UCSI_CCI_NOT_SUPPORTED))) {
+			    UCSI_CCI_NOT_SUPPORTED |
+			    UCSI_CCI_RESET_COMPLETE))) {
 			log_warning("pmic-glink: UCSI command CCI ready cci=%08x notify_seen=%d notify=%08x\n",
 				    cci, pg->ucsi_notify_seen,
 				    pg->ucsi_notification);
@@ -1863,6 +1866,38 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 	}
 
 	return ret;
+}
+
+static int qpg_send_ucsi_ppm_reset(struct qpg *pg)
+{
+	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	u32 old_cci = qpg_ucsi_cci(pg);
+	u32 cci;
+	int ret;
+
+	write_buffer[8] = UCSI_CMD_PPM_RESET;
+
+	pg->ucsi_notify_seen = false;
+	pg->ucsi_notification = 0;
+
+	ret = qpg_send_ucsi_write(pg, write_buffer);
+	if (ret)
+		return ret;
+
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 1500);
+	if (ret)
+		return ret;
+
+	cci = qpg_ucsi_cci(pg);
+	if (!(cci & UCSI_CCI_RESET_COMPLETE)) {
+		log_warning("pmic-glink: UCSI PPM_RESET missing reset-complete cci=%08x\n",
+			    cci);
+		return -EIO;
+	}
+
+	log_warning("pmic-glink: UCSI PPM_RESET complete cci=%08x\n", cci);
+
+	return 0;
 }
 
 static int qpg_send_ucsi_get_capability(struct qpg *pg)
@@ -2193,6 +2228,11 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 	if (glink_open_retp)
 		*glink_open_retp = 0;
+
+	ret = qpg_send_ucsi_ppm_reset(&qpg_session);
+	if (ret)
+		log_warning("pmic-glink: UCSI PPM_RESET ignored ret=%d\n",
+			    ret);
 
 	ret = qpg_enable_ucsi_notifications(&qpg_session);
 	if (ret)
