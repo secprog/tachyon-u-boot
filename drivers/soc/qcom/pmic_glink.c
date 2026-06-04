@@ -1914,16 +1914,16 @@ static int qpg_wait_ucsi_cci(struct qpg *pg, u32 old_cci, u32 timeout_ms)
 static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
 				   bool command_complete)
 {
-	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	u16 d2 = 0;
 	int ret;
 
-	write_buffer[8] = UCSI_CMD_ACK_CC_CI;
 	if (connector_change)
-		write_buffer[10] |= UCSI_ACK_CC_CI_CONNECTOR_CHANGE;
+		d2 |= UCSI_ACK_CC_CI_CONNECTOR_CHANGE;
 	if (command_complete)
-		write_buffer[10] |= UCSI_ACK_CC_CI_COMMAND_COMPLETE;
+		d2 |= UCSI_ACK_CC_CI_COMMAND_COMPLETE;
 
-	ret = qpg_send_ucsi_write(pg, write_buffer);
+	ret = qpg_ucsi_send_control(pg,
+		UCSI_CTRL_D2(UCSI_CMD_ACK_CC_CI, d2));
 	log_warning("pmic-glink: UCSI ACK_CC_CI ret=%d connector=%d command=%d\n",
 		    ret, connector_change, command_complete);
 
@@ -1933,24 +1933,23 @@ static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
 static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 				 u16 arg16, bool ack)
 {
-	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	u64 control = UCSI_CTRL_CMD(command);
 	u32 old_cci = qpg_ucsi_cci(pg);
 	int ret;
 
-	write_buffer[8] = command;
 	if (command == UCSI_CMD_GET_CONNECTOR_CAPABILITY ||
 	    command == UCSI_CMD_GET_CONNECTOR_STATUS)
-		write_buffer[10] = port + 1;
+		control |= (u64)(port + 1) << 16;
 	else if (command == UCSI_CMD_GET_CAM_SUPPORTED ||
 		 command == UCSI_CMD_GET_CURRENT_CAM)
-		write_buffer[10] = port + 1;
+		control |= (u64)(port + 1) << 16;
 	else if (command == UCSI_CMD_SET_NOTIFICATION_ENABLE)
-		put_unaligned_le16(arg16, write_buffer + 10);
+		control |= (u64)arg16 << 16;
 
 	pg->ucsi_notify_seen = false;
 	pg->ucsi_notification = 0;
 
-	ret = qpg_send_ucsi_write(pg, write_buffer);
+	ret = qpg_ucsi_send_control(pg, control);
 	if (ret)
 		return ret;
 
@@ -1971,34 +1970,90 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 
 static int qpg_send_ucsi_ppm_reset(struct qpg *pg)
 {
-	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
-	u32 old_cci = qpg_ucsi_cci(pg);
+	ulong start;
 	u32 cci;
 	int ret;
 
-	write_buffer[8] = UCSI_CMD_PPM_RESET;
-
-	pg->ucsi_notify_seen = false;
-	pg->ucsi_notification = 0;
-
-	ret = qpg_send_ucsi_write(pg, write_buffer);
+	/*
+	 * Linux parity: if RESET_COMPLETE is already set, clear stale
+	 * state by sending SET_NOTIFICATION_ENABLE with no mask before
+	 * issuing a fresh reset (ucsi_reset_ppm() in Linux).
+	 */
+	ret = qpg_send_ucsi_read(pg);
 	if (ret)
 		return ret;
-
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 1500);
-	if (ret)
-		return ret;
-
 	cci = qpg_ucsi_cci(pg);
-	if (!(cci & UCSI_CCI_RESET_COMPLETE)) {
-		log_warning("pmic-glink: UCSI PPM_RESET missing reset-complete cci=%08x\n",
-			    cci);
-		return -EIO;
+	if (cci & UCSI_CCI_RESET_COMPLETE) {
+		ret = qpg_ucsi_send_control(pg,
+			UCSI_CTRL_CMD(UCSI_CMD_SET_NOTIFICATION_ENABLE));
+		if (ret)
+			return ret;
+
+		start = get_timer(0);
+		do {
+			mdelay(20);
+			ret = qpg_send_ucsi_read(pg);
+			if (ret)
+				return ret;
+			cci = qpg_ucsi_cci(pg);
+			if (cci & UCSI_CCI_COMMAND_COMPLETE)
+				break;
+		} while (get_timer(start) < 10000);
+
+		if (!(cci & UCSI_CCI_COMMAND_COMPLETE)) {
+			log_warning("pmic-glink: UCSI stale-reset-clear timeout cci=%08x\n",
+				    cci);
+			return -ETIMEDOUT;
+		}
+		/* ACK the completion, then proceed to new reset */
+		ret = qpg_ucsi_send_control(pg,
+			UCSI_CTRL_D2(UCSI_CMD_ACK_CC_CI,
+				     UCSI_ACK_CC_CI_COMMAND_COMPLETE));
+		if (ret)
+			return ret;
 	}
 
-	log_warning("pmic-glink: UCSI PPM_RESET complete cci=%08x\n", cci);
+	/* Issue PPM_RESET */
+	ret = qpg_ucsi_send_control(pg, UCSI_CTRL_CMD(UCSI_CMD_PPM_RESET));
+	if (ret)
+		return ret;
 
-	return 0;
+	/*
+	 * Linux-aligned: 10000 ms timeout, 20 ms poll interval.
+	 * Does NOT require cci != old_cci — only waits for RESET_COMPLETE.
+	 * If CCI has non-reset bits while pending, reissue PPM_RESET
+	 * (ucsi_reset_ppm() in Linux reissues on spurious CCI).
+	 */
+	start = get_timer(0);
+	for (;;) {
+		mdelay(20);
+		ret = qpg_send_ucsi_read(pg);
+		if (ret)
+			return ret;
+		cci = qpg_ucsi_cci(pg);
+
+		if (cci & UCSI_CCI_RESET_COMPLETE) {
+			log_warning("pmic-glink: UCSI PPM_RESET complete cci=%08x\n",
+				    cci);
+			return 0;
+		}
+
+		/* CCI has non-reset bits — reissue PPM_RESET (Linux parity) */
+		if (cci & ~UCSI_CCI_RESET_COMPLETE) {
+			log_warning("pmic-glink: UCSI PPM_RESET reissue cci=%08x\n",
+				    cci);
+			ret = qpg_ucsi_send_control(pg,
+				UCSI_CTRL_CMD(UCSI_CMD_PPM_RESET));
+			if (ret)
+				return ret;
+		}
+
+		if (get_timer(start) >= 10000) {
+			log_warning("pmic-glink: UCSI PPM_RESET timeout cci=%08x\n",
+				    cci);
+			return -ETIMEDOUT;
+		}
+	}
 }
 
 static int qpg_send_ucsi_get_capability(struct qpg *pg)
@@ -2051,20 +2106,17 @@ static int qpg_send_ucsi_get_current_cam(struct qpg *pg, u8 port)
 static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
 					    u8 offset, u8 count)
 {
-	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	/* recipient=connector(0) in low byte, port+1 in high byte */
+	u16 d2 = (u16)(port + 1) << 8;
+	u32 d4 = (u32)offset | ((u32)(count ? count - 1 : 0) << 8);
+	u64 control = UCSI_CTRL_D2_D4(UCSI_CMD_GET_ALTERNATE_MODE, d2, d4);
 	u32 old_cci = qpg_ucsi_cci(pg);
 	int ret;
-
-	write_buffer[8] = UCSI_CMD_GET_ALTERNATE_MODE;
-	write_buffer[10] = 0; /* recipient: connector */
-	write_buffer[11] = port + 1;
-	write_buffer[12] = offset;
-	write_buffer[13] = count ? count - 1 : 0;
 
 	pg->ucsi_notify_seen = false;
 	pg->ucsi_notification = 0;
 
-	ret = qpg_send_ucsi_write(pg, write_buffer);
+	ret = qpg_ucsi_send_control(pg, control);
 	if (ret)
 		return ret;
 
@@ -2114,6 +2166,7 @@ static int qpg_enable_ucsi_notifications(struct qpg *pg)
 
 static int qpg_ucsi_prewarm(struct qpg *pg)
 {
+	u16 version;
 	int ret;
 
 	if (pg->ucsi_prewarmed)
@@ -2126,10 +2179,23 @@ static int qpg_ucsi_prewarm(struct qpg *pg)
 
 	log_warning("pmic-glink: UCSI prewarm begin\n");
 
+	/* Read UCSI version first (Linux parity: ucsi_register does this) */
+	ret = qpg_send_ucsi_read(pg);
+	if (!ret) {
+		version = qpg_ucsi_version(pg);
+		log_warning("pmic-glink: UCSI version = 0x%04x\n", version);
+	}
+
 	ret = qpg_send_ucsi_ppm_reset(pg);
 	log_warning("pmic-glink: UCSI prewarm PPM_RESET ret=%d\n", ret);
-	if (ret)
-		return ret;
+	if (ret) {
+		/*
+		 * Non-fatal during bring-up: continue with diagnostic UCSI
+		 * init so we can see whether later commands succeed after
+		 * a reset timeout.
+		 */
+		log_warning("pmic-glink: PPM_RESET failed, continuing diagnostic UCSI init\n");
+	}
 
 	ret = qpg_enable_ucsi_notifications(pg);
 	log_warning("pmic-glink: UCSI prewarm notifications phase1 ret=%d\n",
