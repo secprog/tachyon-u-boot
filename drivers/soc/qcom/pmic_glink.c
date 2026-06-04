@@ -31,6 +31,7 @@
 #include <smem.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/pmic_glink.h>
+#include <asm/unaligned.h>
 #include <time.h>
 
 #define QPG_SMEM_XPRT_DESCRIPTOR		478
@@ -64,6 +65,7 @@
 #define PMIC_GLINK_REQ_RESP			1
 
 #define UCSI_READ_BUFFER_REQ			0x11
+#define UCSI_WRITE_BUFFER_REQ			0x12
 #define UCSI_NOTIFY_IND			0x13
 
 #define USBC_SC8180X_NOTIFY_IND			0x13
@@ -72,6 +74,9 @@
 
 #define ALTMODE_PAN_EN				0x10
 #define ALTMODE_PAN_ACK				0x11
+
+#define UCSI_BUFFER_SIZE			48
+#define UCSI_CMD_GET_CONNECTOR_STATUS		18
 
 #define USB_TYPEC_DP_SID			0xff01
 #define DPAM_HPD_A				1
@@ -107,9 +112,24 @@ struct qpg_usbc_write_req {
 	__le32 reserved;
 } __packed;
 
+struct qpg_ucsi_read_buffer_req {
+	struct qpg_pmic_hdr hdr;
+} __packed;
+
 struct qpg_ucsi_read_buffer_resp {
 	struct qpg_pmic_hdr hdr;
-	u8 read_buffer[48];
+	u8 read_buffer[UCSI_BUFFER_SIZE];
+	__le32 return_code;
+} __packed;
+
+struct qpg_ucsi_write_buffer_req {
+	struct qpg_pmic_hdr hdr;
+	u8 write_buffer[UCSI_BUFFER_SIZE];
+	__le32 reserved;
+} __packed;
+
+struct qpg_ucsi_write_buffer_resp {
+	struct qpg_pmic_hdr hdr;
 	__le32 return_code;
 } __packed;
 
@@ -170,6 +190,10 @@ struct qpg {
 	bool altmode_notify_seen;
 	bool altmode_no_dp;
 	bool ucsi_read_acked;
+	bool ucsi_write_acked;
+	u32 ucsi_read_return_code;
+	u32 ucsi_write_return_code;
+	u8 ucsi_read_buffer[UCSI_BUFFER_SIZE];
 	struct qpg_notify_debug notify;
 };
 
@@ -563,6 +587,7 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 static int qpg_wait_riid(struct qpg *pg);
 static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg);
 static int qpg_send_ucsi_read(struct qpg *pg);
+static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port);
 static int qpg_drain_until(struct qpg *pg,
 			   struct qcom_pmic_glink_altmode *altmode,
 			   bool (*done)(struct qpg *,
@@ -572,6 +597,8 @@ static bool qpg_done_pan_ack(struct qpg *pg,
 			     struct qcom_pmic_glink_altmode *altmode);
 static bool qpg_done_ucsi_read(struct qpg *pg,
 			       struct qcom_pmic_glink_altmode *altmode);
+static bool qpg_done_ucsi_write(struct qpg *pg,
+				struct qcom_pmic_glink_altmode *altmode);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -798,6 +825,7 @@ static void qpg_parse_pmic(struct qpg *pg,
 
 	if (owner == PMIC_GLINK_OWNER_USB_TYPE_C) {
 		const struct qpg_ucsi_read_buffer_resp *resp = data;
+		const struct qpg_ucsi_write_buffer_resp *write_resp = data;
 
 		switch (opcode) {
 		case UCSI_READ_BUFFER_REQ:
@@ -805,6 +833,10 @@ static void qpg_parse_pmic(struct qpg *pg,
 			if (len >= sizeof(*resp)) {
 				const u8 *buf = resp->read_buffer;
 
+				pg->ucsi_read_return_code =
+					le32_to_cpu(resp->return_code);
+				memcpy(pg->ucsi_read_buffer, resp->read_buffer,
+				       sizeof(pg->ucsi_read_buffer));
 				log_warning("pmic-glink: UCSI READ_BUFFER ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 					    le32_to_cpu(resp->return_code),
 					    buf[0], buf[1], buf[2], buf[3],
@@ -814,6 +846,18 @@ static void qpg_parse_pmic(struct qpg *pg,
 			} else {
 				log_warning("pmic-glink: UCSI READ_BUFFER short len=%zu expected=%zu\n",
 					    len, sizeof(*resp));
+			}
+			break;
+		case UCSI_WRITE_BUFFER_REQ:
+			pg->ucsi_write_acked = true;
+			if (len >= sizeof(*write_resp)) {
+				pg->ucsi_write_return_code =
+					le32_to_cpu(write_resp->return_code);
+				log_warning("pmic-glink: UCSI WRITE_BUFFER ret=%u\n",
+					    pg->ucsi_write_return_code);
+			} else {
+				log_warning("pmic-glink: UCSI WRITE_BUFFER short len=%zu expected=%zu\n",
+					    len, sizeof(*write_resp));
 			}
 			break;
 		case UCSI_NOTIFY_IND:
@@ -1274,6 +1318,12 @@ static bool qpg_done_ucsi_read(struct qpg *pg,
 	return pg->ucsi_read_acked;
 }
 
+static bool qpg_done_ucsi_write(struct qpg *pg,
+				struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->ucsi_write_acked;
+}
+
 static bool qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
@@ -1319,7 +1369,7 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 
 static int qpg_send_ucsi_read(struct qpg *pg)
 {
-	struct qpg_ucsi_read_buffer_resp req = {
+	struct qpg_ucsi_read_buffer_req req = {
 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USB_TYPE_C),
 		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
 		.hdr.opcode = cpu_to_le32(UCSI_READ_BUFFER_REQ),
@@ -1340,6 +1390,79 @@ static int qpg_send_ucsi_read(struct qpg *pg)
 	ret = qpg_drain_until(pg, &altmode, qpg_done_ucsi_read, 1000);
 	log_warning("pmic-glink: wait UCSI_READ_BUFFER ret=%d ack=%d\n",
 		    ret, pg->ucsi_read_acked);
+
+	return ret;
+}
+
+static void qpg_log_ucsi_connector_status(struct qpg *pg, u8 port)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u32 cci = get_unaligned_le32(buf + 4);
+	u32 status = get_unaligned_le32(buf + 16);
+	u32 rdo = get_unaligned_le32(buf + 20);
+	u8 power_opmode = (status >> 16) & 0x7;
+	bool connected = status & BIT(19);
+	bool power_direction = status & BIT(20);
+	bool partner_usb = status & BIT(21);
+	bool partner_altmode = status & BIT(22);
+	u8 partner_type = (status >> 29) & 0x7;
+
+	log_warning("pmic-glink: UCSI connector%u ret=%u cci=%08x status=%08x connected=%u pwr_dir=%u usb=%u altmode=%u partner=%u opmode=%u rdo=%08x\n",
+		    port + 1, pg->ucsi_read_return_code, cci, status,
+		    connected, power_direction, partner_usb,
+		    partner_altmode, partner_type, power_opmode, rdo);
+}
+
+static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
+{
+	struct qpg_ucsi_write_buffer_req req = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USB_TYPE_C),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(UCSI_WRITE_BUFFER_REQ),
+	};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int ret;
+
+	memcpy(req.write_buffer, write_buffer, UCSI_BUFFER_SIZE);
+	pg->ucsi_write_acked = false;
+	pg->ucsi_write_return_code = 0xffffffff;
+
+	log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u connector=%u\n",
+		    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
+		    req.write_buffer[8], req.write_buffer[10]);
+
+	ret = qpg_send_data(pg, &req, sizeof(req));
+	log_warning("pmic-glink: send UCSI_WRITE_BUFFER_REQ ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(pg, &altmode, qpg_done_ucsi_write, 1000);
+	log_warning("pmic-glink: wait UCSI_WRITE_BUFFER ret=%d ack=%d code=%u\n",
+		    ret, pg->ucsi_write_acked, pg->ucsi_write_return_code);
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
+{
+	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	int ret;
+
+	/*
+	 * UCSI mailbox layout used by Qualcomm DXE:
+	 * bytes 8..15 are CONTROL.  For GET_CONNECTOR_STATUS:
+	 * CONTROL.Command = 18, CONTROL.ConnectorNumber = 1-based port.
+	 */
+	write_buffer[8] = UCSI_CMD_GET_CONNECTOR_STATUS;
+	write_buffer[10] = port + 1;
+
+	ret = qpg_send_ucsi_write(pg, write_buffer);
+	if (ret)
+		return ret;
+
+	ret = qpg_send_ucsi_read(pg);
+	if (!ret)
+		qpg_log_ucsi_connector_status(pg, port);
 
 	return ret;
 }
@@ -1575,9 +1698,10 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	if (glink_open_retp)
 		*glink_open_retp = 0;
 
-	ret = qpg_send_ucsi_read(&qpg_session);
+	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
 	if (ret)
-		log_warning("pmic-glink: UCSI read poke ignored ret=%d\n", ret);
+		log_warning("pmic-glink: UCSI connector status ignored ret=%d\n",
+			    ret);
 
 	qpg_session.pan_acked = false;
 	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
@@ -1671,9 +1795,10 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 	int pan_ret = 0;
 	int notify_ret;
 	int ret;
+	bool was_ready = qpg_session_ready;
 
 	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	if (!ret) {
+	if (!ret && was_ready) {
 		memset(&altmode, 0, sizeof(altmode));
 		qpg_session.notify.seen = false;
 		qpg_session.altmode_notify_seen = false;
