@@ -38,7 +38,6 @@
 };
 
 &mdss {
-	compatible = "qcom,sc7280-mdss", "simple-bus";
 	bootph-all;
 };
 
