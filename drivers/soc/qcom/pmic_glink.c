@@ -76,7 +76,15 @@
 #define ALTMODE_PAN_ACK				0x11
 
 #define UCSI_BUFFER_SIZE			48
+#define UCSI_CMD_ACK_CC_CI			4
+#define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
 #define UCSI_CMD_GET_CONNECTOR_STATUS		18
+#define UCSI_NOTIFY_ALL			0xffff
+#define UCSI_CCI_NOT_SUPPORTED			BIT(25)
+#define UCSI_CCI_ERROR				BIT(30)
+#define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
+#define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
+#define UCSI_ACK_CC_CI_COMMAND_COMPLETE		BIT(1)
 
 #define USB_TYPEC_DP_SID			0xff01
 #define DPAM_HPD_A				1
@@ -131,6 +139,13 @@ struct qpg_ucsi_write_buffer_req {
 struct qpg_ucsi_write_buffer_resp {
 	struct qpg_pmic_hdr hdr;
 	__le32 return_code;
+} __packed;
+
+struct qpg_ucsi_notify {
+	struct qpg_pmic_hdr hdr;
+	__le32 notification;
+	__le32 receiver;
+	__le32 reserved;
 } __packed;
 
 struct qpg_usbc_notify {
@@ -191,6 +206,8 @@ struct qpg {
 	bool altmode_no_dp;
 	bool ucsi_read_acked;
 	bool ucsi_write_acked;
+	bool ucsi_notify_seen;
+	u32 ucsi_notification;
 	u32 ucsi_read_return_code;
 	u32 ucsi_write_return_code;
 	u8 ucsi_read_buffer[UCSI_BUFFER_SIZE];
@@ -826,6 +843,7 @@ static void qpg_parse_pmic(struct qpg *pg,
 	if (owner == PMIC_GLINK_OWNER_USB_TYPE_C) {
 		const struct qpg_ucsi_read_buffer_resp *resp = data;
 		const struct qpg_ucsi_write_buffer_resp *write_resp = data;
+		const struct qpg_ucsi_notify *notify = data;
 
 		switch (opcode) {
 		case UCSI_READ_BUFFER_REQ:
@@ -861,7 +879,17 @@ static void qpg_parse_pmic(struct qpg *pg,
 			}
 			break;
 		case UCSI_NOTIFY_IND:
-			log_warning("pmic-glink: UCSI notify len=%zu\n", len);
+			pg->ucsi_notify_seen = true;
+			if (len >= sizeof(*notify)) {
+				pg->ucsi_notification =
+					le32_to_cpu(notify->notification);
+				log_warning("pmic-glink: UCSI notify cci=%08x receiver=%u len=%zu\n",
+					    pg->ucsi_notification,
+					    le32_to_cpu(notify->receiver), len);
+			} else {
+				log_warning("pmic-glink: UCSI notify short len=%zu expected=%zu\n",
+					    len, sizeof(*notify));
+			}
 			break;
 		default:
 			log_warning("pmic-glink: USB Type-C owner opcode=%02x len=%zu\n",
@@ -1443,28 +1471,111 @@ static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
 	return ret;
 }
 
-static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
+static u32 qpg_ucsi_cci(struct qpg *pg)
+{
+	return get_unaligned_le32(pg->ucsi_read_buffer + 4);
+}
+
+static int qpg_wait_ucsi_cci(struct qpg *pg, u32 old_cci, u32 timeout_ms)
+{
+	ulong start = get_timer(0);
+	u32 cci;
+	int ret;
+
+	do {
+		ret = qpg_send_ucsi_read(pg);
+		if (ret)
+			return ret;
+
+		cci = qpg_ucsi_cci(pg);
+		if (cci != old_cci &&
+		    (cci & (UCSI_CCI_COMMAND_COMPLETE |
+			    UCSI_CCI_ERROR |
+			    UCSI_CCI_NOT_SUPPORTED))) {
+			log_warning("pmic-glink: UCSI command CCI ready cci=%08x notify_seen=%d notify=%08x\n",
+				    cci, pg->ucsi_notify_seen,
+				    pg->ucsi_notification);
+			return 0;
+		}
+
+		mdelay(20);
+	} while (get_timer(start) < timeout_ms);
+
+	cci = qpg_ucsi_cci(pg);
+	log_warning("pmic-glink: UCSI command CCI timeout cci=%08x notify_seen=%d notify=%08x\n",
+		    cci, pg->ucsi_notify_seen, pg->ucsi_notification);
+
+	return -ETIMEDOUT;
+}
+
+static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
+				   bool command_complete)
 {
 	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
 	int ret;
 
-	/*
-	 * UCSI mailbox layout used by Qualcomm DXE:
-	 * bytes 8..15 are CONTROL.  For GET_CONNECTOR_STATUS:
-	 * CONTROL.Command = 18, CONTROL.ConnectorNumber = 1-based port.
-	 */
-	write_buffer[8] = UCSI_CMD_GET_CONNECTOR_STATUS;
-	write_buffer[10] = port + 1;
+	write_buffer[8] = UCSI_CMD_ACK_CC_CI;
+	if (connector_change)
+		write_buffer[10] |= UCSI_ACK_CC_CI_CONNECTOR_CHANGE;
+	if (command_complete)
+		write_buffer[10] |= UCSI_ACK_CC_CI_COMMAND_COMPLETE;
+
+	ret = qpg_send_ucsi_write(pg, write_buffer);
+	log_warning("pmic-glink: UCSI ACK_CC_CI ret=%d connector=%d command=%d\n",
+		    ret, connector_change, command_complete);
+
+	return ret;
+}
+
+static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
+				 u16 arg16, bool ack)
+{
+	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	u32 old_cci = qpg_ucsi_cci(pg);
+	int ret;
+
+	write_buffer[8] = command;
+	if (command == UCSI_CMD_GET_CONNECTOR_STATUS)
+		write_buffer[10] = port + 1;
+	else if (command == UCSI_CMD_SET_NOTIFICATION_ENABLE)
+		put_unaligned_le16(arg16, write_buffer + 10);
+
+	pg->ucsi_notify_seen = false;
+	pg->ucsi_notification = 0;
 
 	ret = qpg_send_ucsi_write(pg, write_buffer);
 	if (ret)
 		return ret;
 
-	ret = qpg_send_ucsi_read(pg);
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 1000);
+	if (ret)
+		return ret;
+
+	if (ack) {
+		ret = qpg_send_ucsi_ack_cc_ci(pg, false, true);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
+{
+	int ret;
+
+	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CONNECTOR_STATUS, port,
+				    0, true);
 	if (!ret)
 		qpg_log_ucsi_connector_status(pg, port);
 
 	return ret;
+}
+
+static int qpg_enable_ucsi_notifications(struct qpg *pg)
+{
+	return qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
+				     UCSI_NOTIFY_ALL, true);
 }
 
 static int qpg_init(struct qpg *pg)
@@ -1697,6 +1808,11 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 	if (glink_open_retp)
 		*glink_open_retp = 0;
+
+	ret = qpg_enable_ucsi_notifications(&qpg_session);
+	if (ret)
+		log_warning("pmic-glink: UCSI notification enable ignored ret=%d\n",
+			    ret);
 
 	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
 	if (ret)
