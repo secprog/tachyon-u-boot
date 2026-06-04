@@ -19,7 +19,6 @@
 #include <env.h>
 #include <part.h>
 #include <scsi.h>
-#include <dm/device-internal.h>
 #include <dm/uclass.h>
 #include <dm/device.h>
 #include <memalign.h>
@@ -538,46 +537,6 @@ static int efs_read_file(const char* filename, void* buffer, loff_t size) {
 	int r = efs_read(&s_efs, f, buffer, 0, size);
 	efs_close(&s_efs, f);
 	return r;
-}
-
-static int tachyon_probe_video_devices(void)
-{
-	struct uclass *uc;
-	struct udevice *dev;
-	int first_ret = 0;
-	int count = 0;
-	int ret;
-
-	ret = uclass_get(UCLASS_VIDEO, &uc);
-	if (ret)
-		return ret;
-
-	uclass_foreach_dev(dev, uc) {
-		const char *node = ofnode_get_name(dev_ofnode(dev));
-		const char *parent = dev->parent ? dev->parent->name : "<none>";
-
-		printf("Tachyon: video device %s node=%s parent=%s\n",
-		       dev->name, node ? node : "<none>", parent);
-
-		ret = device_probe(dev);
-		printf("Tachyon: video device %s probe ret=%d\n",
-		       dev->name, ret);
-		if (ret && !first_ret)
-			first_ret = ret;
-		count++;
-	}
-
-	return count ? first_ret : -ENODEV;
-}
-
-void qcom_late_init(void)
-{
-	int ret;
-
-	printf("Tachyon: probing video devices\n");
-	ret = tachyon_probe_video_devices();
-	if (ret)
-		printf("Tachyon: video probe returned %d\n", ret);
 }
 
 static int parse_overlay_list(char* buf, int (*cb)(const char*, struct fs_context*), struct fs_context* ctx) {
