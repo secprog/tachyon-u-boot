@@ -473,9 +473,15 @@ struct tachyon_dp_priv {
 	struct clk dpu_clks[TACHYON_DPU_CLK_COUNT];
 	struct phy qmp_phy;
 	bool has_pixel_clk;
+	bool pixel_clk_enabled;
 	bool dp_clk_valid[TACHYON_DP_CORE_CLK_COUNT];
+	bool dp_clk_enabled[TACHYON_DP_CORE_CLK_COUNT];
 	bool dpu_clk_valid[TACHYON_DPU_CLK_COUNT];
+	bool dpu_clk_enabled[TACHYON_DPU_CLK_COUNT];
+	bool dp_core_clocks_enabled;
+	bool dpu_clocks_enabled;
 	bool has_qmp_phy;
+	bool qmp_dp_touched;
 	bool qmp_dp_serdes_programmed;
 	bool qmp_dp_phy_started;
 	struct gpio_desc sbu_enable;
@@ -544,6 +550,9 @@ static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
 	};
 	int i, ret;
 
+	if (priv->dp_core_clocks_enabled)
+		return 0;
+
 	for (i = 0; i < TACHYON_DP_CORE_CLK_COUNT; i++) {
 		if (!priv->dp_clk_valid[i])
 			continue;
@@ -553,8 +562,12 @@ static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
 				    names[i], ret);
 			return ret;
 		}
+		if (!ret)
+			priv->dp_clk_enabled[i] = true;
 		log_warning("DP clk %s enable ret=%d\n", names[i], ret);
 	}
+
+	priv->dp_core_clocks_enabled = true;
 
 	return 0;
 }
@@ -1567,6 +1580,7 @@ static void tachyon_dp_qmp_aux_only_power_on(struct tachyon_dp_priv *priv)
 	udelay(100);
 	writel(QMP_DP_PHY_PD_CTL_AUX_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
+	priv->qmp_dp_touched = true;
 }
 
 /*
@@ -1620,6 +1634,7 @@ static void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
 {
 	writel(QMP_DP_PHY_PD_CTL_POWER_DOWN, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
+	priv->qmp_dp_touched = false;
 	priv->qmp_dp_serdes_programmed = false;
 	priv->qmp_dp_phy_started = false;
 
@@ -1636,6 +1651,7 @@ static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
 	 */
 	writel(QMP_DP_PHY_PD_CTL_4LANE_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
+	priv->qmp_dp_touched = true;
 
 	log_warning("QMP DP power-up all lanes: PD=%02x STATUS=%02x\n",
 		    tachyon_dp_qmp_pd_low(priv),
@@ -4387,9 +4403,15 @@ static void tachyon_dp_program_pixel_clock(struct tachyon_dp_priv *priv)
 	if (ret < 0)
 		log_warning("Failed to set DP pixel clock %u Hz: %d\n", rate,
 			    (int)ret);
+
+	if (priv->pixel_clk_enabled)
+		return;
+
 	ret = clk_enable(&priv->pixel_clk);
 	if (ret < 0)
 		log_warning("Failed to enable DP pixel clock: %d\n", (int)ret);
+	else
+		priv->pixel_clk_enabled = true;
 }
 
 static void tachyon_dp_program_msa_timing(struct tachyon_dp_priv *priv)
@@ -4603,6 +4625,9 @@ static int tachyon_dpu_enable_clocks(struct tachyon_dp_priv *priv)
 	if (priv->dpu_clk_valid[5])
 		clk_set_rate(&priv->dpu_clks[5], 19200000);
 
+	if (priv->dpu_clocks_enabled)
+		return 0;
+
 	for (i = 0; i < TACHYON_DPU_CLK_COUNT; i++) {
 		if (!priv->dpu_clk_valid[i])
 			continue;
@@ -4612,7 +4637,11 @@ static int tachyon_dpu_enable_clocks(struct tachyon_dp_priv *priv)
 				    ret);
 			return ret;
 		}
+		if (!ret)
+			priv->dpu_clk_enabled[i] = true;
 	}
+
+	priv->dpu_clocks_enabled = true;
 
 	return 0;
 }
@@ -4770,6 +4799,159 @@ static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 #else
 	return tachyon_dpu_program_ctl(priv);
 #endif
+}
+
+static void tachyon_dpu_quiesce(struct tachyon_dp_priv *priv)
+{
+	void __iomem *ctl;
+	void __iomem *intf;
+	void __iomem *sspp;
+	int ret;
+
+	if (!priv->dpu || !priv->dpu_clocks_enabled)
+		return;
+
+	ctl = priv->dpu + DPU_CTL_0_BASE;
+	intf = priv->dpu + DPU_INTF_0_BASE;
+	sspp = priv->dpu + DPU_SSPP_DMA0_BASE;
+
+	log_warning("DPU quiesce before OS handoff\n");
+
+	writel(0, intf + DPU_INTF_TIMING_ENGINE_EN);
+	writel(0, intf + DPU_INTF_FRAME_LINE_COUNT_EN);
+	if (priv->p0)
+		writel(0, priv->p0 + MMSS_DP_TIMING_ENGINE_EN);
+
+	writel(0, ctl + DPU_CTL_FETCH_PIPE_ACTIVE);
+	writel(0, ctl + DPU_CTL_INTF_ACTIVE);
+	writel(0, ctl + DPU_CTL_LAYER_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT2_0);
+	writel(0, ctl + DPU_CTL_LAYER_EXT3_0);
+	writel(DPU_CTL_FLUSH_DMA0 | DPU_CTL_FLUSH_LM0 | DPU_CTL_FLUSH_CTL |
+	       DPU_CTL_FLUSH_INTF | DPU_CTL_FLUSH_PERIPH,
+	       ctl + DPU_CTL_FLUSH);
+	writel(1, ctl + DPU_CTL_START);
+
+	ret = tachyon_dp_read_poll(ctl, DPU_CTL_FLUSH, DPU_CTL_FLUSH_DMA0, 0,
+				   5000);
+	if (ret)
+		log_warning("DPU quiesce flush did not commit: %d\n", ret);
+
+	writel(0, sspp + DPU_SSPP_SRC0_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC1_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC2_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC3_ADDR);
+	writel(0, sspp + DPU_SSPP_SRC_OP_MODE);
+	writel(0, sspp + DPU_SSPP_CLK_CTRL);
+	clrbits_le32(priv->dpu + DPU_TOP_BASE + DPU_CLK_CTRL,
+		     DPU_CLK_CTRL_DMA0);
+}
+
+static void tachyon_dp_controller_quiesce(struct tachyon_dp_priv *priv)
+{
+	if (!priv->dp_core_clocks_enabled)
+		return;
+
+	log_warning("DP controller quiesce before OS handoff\n");
+
+	if (priv->link) {
+		writel(0, priv->link + REG_DP_STATE_CTRL);
+		tachyon_dp_mainlink_disable(priv);
+#ifdef CONFIG_VIDEO_TACHYON_DP_AUDIO
+		writel(0, priv->link + REG_DP_AUDIO_CTRL);
+		writel(0, priv->link + REG_DP_AUDIO_CFG);
+#endif
+	}
+
+	if (priv->aux) {
+		writel(DP_AUX_CTRL_RESET, priv->aux + REG_DP_AUX_CTRL);
+		udelay(100);
+		writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
+		writel(0, priv->aux + REG_DP_AUX_CTRL);
+	}
+
+	if (priv->ctrl) {
+		writel(DP_SW_RESET, priv->ctrl + REG_DP_SW_RESET);
+		udelay(100);
+		writel(0, priv->ctrl + REG_DP_SW_RESET);
+	}
+}
+
+static void tachyon_dp_disable_clocks(struct tachyon_dp_priv *priv)
+{
+	int i, ret;
+
+	if (priv->has_pixel_clk && priv->pixel_clk_enabled) {
+		ret = clk_disable(&priv->pixel_clk);
+		if (ret && ret != -ENOSYS)
+			log_warning("Failed to disable DP pixel clock: %d\n",
+				    ret);
+		else
+			priv->pixel_clk_enabled = false;
+	}
+
+	for (i = 0; i < TACHYON_DP_CORE_CLK_COUNT; i++) {
+		if (!priv->dp_clk_enabled[i])
+			continue;
+		ret = clk_disable(&priv->dp_clks[i]);
+		if (ret && ret != -ENOSYS)
+			log_warning("Failed to disable DP clock %d: %d\n",
+				    i, ret);
+		else
+			priv->dp_clk_enabled[i] = false;
+	}
+	priv->dp_core_clocks_enabled = false;
+
+	for (i = 0; i < TACHYON_DPU_CLK_COUNT; i++) {
+		if (!priv->dpu_clk_enabled[i])
+			continue;
+		ret = clk_disable(&priv->dpu_clks[i]);
+		if (ret && ret != -ENOSYS)
+			log_warning("Failed to disable DPU clock %d: %d\n",
+				    i, ret);
+		else
+			priv->dpu_clk_enabled[i] = false;
+	}
+	priv->dpu_clocks_enabled = false;
+}
+
+static void tachyon_dp_quiesce(struct tachyon_dp_priv *priv)
+{
+	int ret;
+
+	tachyon_dpu_quiesce(priv);
+	tachyon_dp_controller_quiesce(priv);
+
+	if (priv->phy_dp && (priv->qmp_dp_touched ||
+			     priv->qmp_dp_serdes_programmed ||
+			     priv->qmp_dp_phy_started))
+		tachyon_dp_qmp_power_down(priv);
+
+	if (priv->has_qmp_phy) {
+		ret = generic_phy_power_off(&priv->qmp_phy);
+		if (ret && ret != -ENOSYS)
+			log_warning("QMP PHY power_off failed: %d\n", ret);
+		ret = generic_phy_exit(&priv->qmp_phy);
+		if (ret && ret != -ENOSYS)
+			log_warning("QMP PHY exit failed: %d\n", ret);
+		priv->has_qmp_phy = false;
+	}
+
+	if (dm_gpio_is_valid(&priv->sbu_enable))
+		dm_gpio_set_value(&priv->sbu_enable, 0);
+	tachyon_dp_release_sbu_mux(priv);
+
+	tachyon_dp_disable_clocks(priv);
+}
+
+static int tachyon_dp_remove(struct udevice *dev)
+{
+	struct tachyon_dp_priv *priv = dev_get_priv(dev);
+
+	tachyon_dp_quiesce(priv);
+
+	return 0;
 }
 
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
@@ -5214,7 +5396,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	tachyon_dp_request_core_clocks(dev, priv);
 	ret = tachyon_dp_enable_core_clocks(priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	ret = clk_get_by_name(dev, "stream_pixel", &priv->pixel_clk);
 	if (!ret) {
@@ -5226,11 +5408,11 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	ret = tachyon_dpu_init(priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	ret = tachyon_dp_find_phy(dev, priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	/* Print QMP base addresses for offset verification */
 	log_warning("DP QMP base: phy=%p phy_dp=%p\n",
@@ -5265,7 +5447,8 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (altmode_ret <= 0) {
 		log_warning("DP Type-C Alt Mode unavailable: ret=%d; refusing to guess orientation/pin assignment\n",
 			    altmode_ret);
-		return altmode_ret < 0 ? altmode_ret : -ENODEV;
+		ret = altmode_ret < 0 ? altmode_ret : -ENODEV;
+		goto err_quiesce;
 	}
 
 	priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
@@ -5276,7 +5459,8 @@ static int tachyon_dp_probe(struct udevice *dev)
 			    priv->orientation, priv->pin_assignment);
 		priv->typec_valid = false;
 		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_NONE;
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_quiesce;
 	}
 
 	tachyon_dp_log_typec_resolved(priv);
@@ -5300,10 +5484,8 @@ static int tachyon_dp_probe(struct udevice *dev)
 	log_warning("DP wait sink done ret=%d orientation=%u\n",
 		    ret, priv->orientation);
 
-	if (ret) {
-		tachyon_dp_release_sbu_mux(priv);
-		return ret;
-	}
+	if (ret)
+		goto err_quiesce;
 
 	ret = tachyon_dp_read_edid_modes(priv);
 	if (ret)
@@ -5340,7 +5522,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	ret = tachyon_dp_link_train(priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	/*
 	 * Re-filter EDID modes against actual trained rate/lanes, which may
@@ -5364,11 +5546,11 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	ret = tachyon_dp_program_mainlink(priv);
 	if (ret)
-		return ret;
+		goto err_quiesce;
 
 	log_warning("DP ready: %ux%u fb=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
 		    width, height, (ulong)plat->base, (ulong)plat->size,
@@ -5379,6 +5561,10 @@ static int tachyon_dp_probe(struct udevice *dev)
 		 priv->aux_nacks, priv->aux_retries);
 
 	return 0;
+
+err_quiesce:
+	tachyon_dp_quiesce(priv);
+	return ret;
 }
 
 static int tachyon_dp_video_sync(struct udevice *dev)
@@ -5613,8 +5799,9 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.of_match	= tachyon_dp_ids,
 	.bind		= tachyon_dp_bind,
 	.probe		= tachyon_dp_probe,
+	.remove		= tachyon_dp_remove,
 	.ops		= &tachyon_dp_ops,
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
-	.flags		= DM_FLAG_PRE_RELOC,
+	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE,
 };
