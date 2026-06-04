@@ -104,6 +104,22 @@
 #define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
 #define UCSI_ACK_CC_CI_COMMAND_COMPLETE		BIT(1)
 
+/*
+ * UCSI u64 control value macros — serialize commands into bytes 8-15
+ * of the UCSI write buffer via put_unaligned_le64().
+ *
+ * Byte layout (LE u64 value):
+ *   bits  0- 7 (byte 8):  command
+ *   bits  8-15 (byte 9):  data length
+ *   bits 16-31 (bytes 10-11): command-specific word (2 bytes)
+ *   bits 32-63 (bytes 12-15): command-specific dword (4 bytes)
+ */
+#define UCSI_CTRL_CMD(cmd)			((u64)(cmd))
+#define UCSI_CTRL_D2(cmd, d2)			\
+	((u64)(cmd) | ((u64)(d2) << 16))
+#define UCSI_CTRL_D2_D4(cmd, d2, d4)		\
+	((u64)(cmd) | ((u64)(d2) << 16) | ((u64)(d4) << 32))
+
 #define USBC_READ_SEL_PIN_ASSIGNMENT		1
 #define USBC_READ_DATA_PIN_ASSIGNMENT		1
 
@@ -1841,6 +1857,19 @@ static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
 static u32 qpg_ucsi_cci(struct qpg *pg)
 {
 	return get_unaligned_le32(pg->ucsi_read_buffer + 4);
+}
+
+static u16 qpg_ucsi_version(struct qpg *pg)
+{
+	return get_unaligned_le16(pg->ucsi_read_buffer + 0);
+}
+
+static int qpg_ucsi_send_control(struct qpg *pg, u64 control)
+{
+	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+
+	put_unaligned_le64(control, write_buffer + 8);
+	return qpg_send_ucsi_write(pg, write_buffer);
 }
 
 static u8 qpg_ucsi_connector_change(struct qpg *pg)
