@@ -109,6 +109,15 @@ config BACKLIGHT_PWM
 	  it understands the standard device tree
 	  (leds/backlight/pwm-backlight.txt)
 
+config QCOM_MDSS_BUS
+	bool "Qualcomm MDSS bus shim"
+	depends on DM && OF_REAL
+	help
+	  Bind Qualcomm MDSS (display-subsystem) nodes as U-Boot simple
+	  buses without modifying the Linux-visible compatible string.
+	  This allows child devices (DSI controller, DisplayPort, PHYs
+	  etc.) to be probed automatically by the DM core.
+
 config BACKLIGHT_GPIO
 	bool "Generic GPIO based Backlight Driver"
 	depends on BACKLIGHT
