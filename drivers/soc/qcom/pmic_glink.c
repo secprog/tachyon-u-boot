@@ -29,6 +29,7 @@
 #include <mailbox.h>
 #include <mailbox-uclass.h>
 #include <mapmem.h>
+#include <phy/qcom_qmp_combo.h>
 #include <smem.h>
 #include <soc/qcom/qcom_adsp_pas.h>
 #include <soc/qcom/pmic_glink.h>
@@ -239,6 +240,7 @@ struct qpg {
 	bool ucsi_write_acked;
 	bool usbc_read_acked;
 	bool ucsi_notify_seen;
+	bool ucsi_prewarmed;
 	u32 ucsi_notification;
 	u32 ucsi_read_return_code;
 	u32 ucsi_write_return_code;
@@ -253,6 +255,7 @@ static bool qpg_session_ready;
 static struct qcom_pmic_glink_altmode qpg_cached_altmode;
 static bool qpg_cached_altmode_valid;
 static int qpg_last_adsp_boot_ret;
+static int qpg_last_ucsi_prewarm_ret;
 
 /**
  * qpg_mbox_from_glink() - Get IPCC mailbox channel from glink-edge DT node.
@@ -396,6 +399,30 @@ static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
 
 	dm_gpio_free(NULL, &sbu_enable);
 	dm_gpio_free(NULL, &sbu_select);
+}
+
+static void qpg_program_qmp_typec(enum qcom_pmic_glink_orientation orientation,
+				  bool dp_svid, u8 pin_assignment)
+{
+	bool reverse;
+	int ret;
+
+	if (orientation == QCOM_PMIC_GLINK_ORIENTATION_NONE)
+		return;
+
+	reverse = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
+	ret = qcom_qmp_combo_typec_set(reverse, dp_svid, pin_assignment);
+	log_warning("pmic-glink: QMP Type-C provider ret=%d dp_svid=%d orientation=%u pin=%u\n",
+		    ret, dp_svid, orientation, pin_assignment);
+}
+
+static void qpg_apply_typec_state(enum qcom_pmic_glink_orientation orientation,
+				  bool dp_svid, u8 pin_assignment)
+{
+	bool dp_active = dp_svid && pin_assignment;
+
+	qpg_program_sbu_mux(orientation, dp_active);
+	qpg_program_qmp_typec(orientation, dp_svid, pin_assignment);
 }
 
 static size_t qpg_rx_avail(struct qpg *pg)
@@ -745,7 +772,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_program_sbu_mux(orientation, false);
+		qpg_apply_typec_state(orientation, false, 0);
 		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
 			    notify->payload[2], mode);
 		return true;
@@ -757,7 +784,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_program_sbu_mux(orientation, true);
+	qpg_apply_typec_state(orientation, true, altmode->pin_assignment);
 
 	return true;
 }
@@ -813,7 +840,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_program_sbu_mux(orientation, false);
+		qpg_apply_typec_state(orientation, false, 0);
 		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
 			    mux, mode);
 		return true;
@@ -825,7 +852,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_program_sbu_mux(orientation, true);
+	qpg_apply_typec_state(orientation, true, altmode->pin_assignment);
 
 	return true;
 }
@@ -1521,7 +1548,7 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_program_sbu_mux(orientation, false);
+		qpg_apply_typec_state(orientation, false, 0);
 		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u dp_svid=%u\n",
 			    source, mux, mode, dp_svid);
 		return;
@@ -1530,7 +1557,7 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_program_sbu_mux(orientation, true);
+	qpg_apply_typec_state(orientation, dp_svid, altmode->pin_assignment);
 	log_warning("pmic-glink: %s DP active pin_assignment=%u\n",
 		    source, altmode->pin_assignment);
 }
@@ -2020,6 +2047,60 @@ static int qpg_enable_ucsi_notifications(struct qpg *pg)
 				     phase1_mask, true);
 }
 
+static int qpg_ucsi_prewarm(struct qpg *pg)
+{
+	int ret;
+
+	if (pg->ucsi_prewarmed)
+		return 0;
+
+	if (qpg_env_bool("qpg_skip_ucsi_prewarm")) {
+		log_warning("pmic-glink: UCSI prewarm skipped by env\n");
+		return 0;
+	}
+
+	log_warning("pmic-glink: UCSI prewarm begin\n");
+
+	ret = qpg_send_ucsi_ppm_reset(pg);
+	log_warning("pmic-glink: UCSI prewarm PPM_RESET ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_enable_ucsi_notifications(pg);
+	log_warning("pmic-glink: UCSI prewarm notifications phase1 ret=%d\n",
+		    ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_send_ucsi_get_capability(pg);
+	log_warning("pmic-glink: UCSI prewarm capability ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_send_ucsi_get_connector_capability(pg, 0);
+	log_warning("pmic-glink: UCSI prewarm connector capability ret=%d\n",
+		    ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_send_ucsi_get_connector_status(pg, 0);
+	log_warning("pmic-glink: UCSI prewarm connector status ret=%d\n",
+		    ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_enable_ucsi_notifications_phase2(pg);
+	log_warning("pmic-glink: UCSI prewarm notifications phase2 ret=%d\n",
+		    ret);
+	if (ret)
+		return ret;
+
+	pg->ucsi_prewarmed = true;
+	log_warning("pmic-glink: UCSI prewarm complete\n");
+
+	return 0;
+}
+
 static int qpg_init(struct qpg *pg)
 {
 	ofnode adsp;
@@ -2171,6 +2252,7 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	memset(&qpg_session, 0, sizeof(qpg_session));
+	qpg_last_ucsi_prewarm_ret = -EINPROGRESS;
 
 	ret = qpg_init(&qpg_session);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
@@ -2250,6 +2332,12 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 	if (glink_open_retp)
 		*glink_open_retp = 0;
+
+	ret = qpg_ucsi_prewarm(&qpg_session);
+	qpg_last_ucsi_prewarm_ret = ret;
+	if (ret)
+		log_warning("pmic-glink: UCSI prewarm failed ret=%d; continuing PAN\n",
+			    ret);
 
 	qpg_session.pan_acked = false;
 	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
@@ -2348,7 +2436,16 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 			altmode->hpd_irq = false;
 			log_warning("pmic-glink: no DP after safe notify (port=%u orient=%u)\n",
 				    safe_port, safe_orient);
-			ret = -ENODEV;
+			refresh_ret = qpg_refresh_usbc_pin_assignment(&qpg_session,
+								      altmode);
+			log_warning("pmic-glink: USBC pin refresh after safe ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
+				    refresh_ret, altmode->dp,
+				    altmode->orientation,
+				    altmode->pin_assignment, altmode->hpd,
+				    altmode->hpd_irq);
+			ret = (!refresh_ret &&
+			       qpg_done_altmode(&qpg_session, altmode)) ? 0 :
+			      -ENODEV;
 		}
 	}
 
@@ -2442,6 +2539,7 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	printf("ADSP boot: ret=%d\n", adsp_ret);
 	printf("GLINK open: ret=%d\n", open_ret);
+	printf("UCSI prewarm: ret=%d\n", qpg_last_ucsi_prewarm_ret);
 	printf("PAN_EN: ret=%d\n", pan_ret);
 	printf("timeout_ms: %u\n", timeout_ms);
 
@@ -2488,7 +2586,14 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 			altmode.port = safe_port;
 			printf("pmic-glink: no DP after safe notify (port=%u orient=%u)\n",
 			       safe_port, safe_orient);
-			notify_ret = -ENODEV;
+			refresh_ret = qpg_refresh_usbc_pin_assignment(&qpg_session,
+								     &altmode);
+			printf("USBC refresh after safe: ret=%d\n", refresh_ret);
+			if (!refresh_ret &&
+			    qpg_done_altmode(&qpg_session, &altmode))
+				notify_ret = 0;
+			else
+				notify_ret = -ENODEV;
 		}
 
 		if (notify_ret == -ETIMEDOUT) {
@@ -2537,6 +2642,7 @@ static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	printf("ADSP boot: ret=%d\n", adsp_ret);
 	printf("GLINK open: ret=%d\n", open_ret);
+	printf("UCSI prewarm: ret=%d\n", qpg_last_ucsi_prewarm_ret);
 	printf("PAN_EN: ret=%d\n", pan_ret);
 	if (ret)
 		return CMD_RET_FAILURE;

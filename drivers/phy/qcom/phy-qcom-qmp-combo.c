@@ -8,6 +8,7 @@
 #include <dm/device_compat.h>
 #include <dm/devres.h>
 #include <generic-phy.h>
+#include <phy/qcom_qmp_combo.h>
 #include <reset.h>
 #include <power/regulator.h>
 #include <asm/io.h>
@@ -39,6 +40,7 @@
 #define DP_MODE                                 BIT(1) /* enables DP mode */
 
 /* QPHY_V3_DP_COM_TYPEC_CTRL register bits */
+#define SW_PORTSELECT_VAL                       BIT(0)
 #define SW_PORTSELECT_MUX                       BIT(1)
 
 /* PHY slot identifiers for device tree phandle arguments */
@@ -238,7 +240,42 @@ struct qmp_combo {
 	struct udevice **vregs;
 	int num_vregs;
 	const struct qmp_phy_cfg *cfg;
+	bool com_initialized;
+	bool typec_valid;
+	bool typec_reverse;
+	bool typec_dp_svid;
+	u8 typec_pin_assignment;
 };
+
+static u32 qmp_combo_typec_ctrl(struct qmp_combo *qmp)
+{
+	u32 typec = SW_PORTSELECT_MUX;
+
+	if (qmp->typec_reverse)
+		typec |= SW_PORTSELECT_VAL;
+
+	return typec;
+}
+
+static u32 qmp_combo_typec_mode(struct qmp_combo *qmp, unsigned long phy_id)
+{
+	if (!qmp->typec_valid)
+		return phy_id == QMP_USB43DP_DP_PHY ? DP_MODE :
+						      USB3_MODE | DP_MODE;
+
+	if (!qmp->typec_dp_svid)
+		return USB3_MODE;
+
+	switch (qmp->typec_pin_assignment) {
+	case 2: /* TYPEC_DP_STATE_C: DP only */
+	case 4: /* TYPEC_DP_STATE_E: DP only */
+		return DP_MODE;
+	case 3: /* TYPEC_DP_STATE_D: USB3 + DP */
+	case 5: /* TYPEC_DP_STATE_F: USB3 + DP */
+	default:
+		return USB3_MODE | DP_MODE;
+	}
+}
 
 static inline void qphy_setbits(void __iomem *base, u32 offset, u32 val)
 {
@@ -279,6 +316,8 @@ static int qmp_combo_com_exit(struct qmp_combo *qmp)
 			dev_warn(qmp->dev, "failed to disable %s: %d\n",
 				 qmp->cfg->vreg_list[i], ret);
 	}
+
+	qmp->com_initialized = false;
 
 	return 0;
 }
@@ -335,8 +374,11 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 		     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
 		     SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
 
-	val = SW_PORTSELECT_MUX;
+	val = qmp_combo_typec_ctrl(qmp);
 	writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
+
+	val = qmp_combo_typec_mode(qmp, phy_id);
+	writel(val, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
 
 	if (phy_id == QMP_USB43DP_DP_PHY) {
 		/*
@@ -344,13 +386,9 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 		 * and release DP reset. The Tachyon DP driver still owns
 		 * DP AUX/link/PHY programming during bring-up.
 		 */
-		writel(DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
-
 		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
 			     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET);
 	} else {
-		writel(USB3_MODE | DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
-
 		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
 			     SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
 			     SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
@@ -361,6 +399,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 	qphy_clrbits(com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
 
 	qphy_setbits(pcs, QPHY_V4_PCS_POWER_DOWN_CONTROL, SW_PWRDN);
+	qmp->com_initialized = true;
 
 	return 0;
 }
@@ -664,3 +703,45 @@ U_BOOT_DRIVER(qmp_combo) = {
 	.probe = qmp_combo_probe,
 	.priv_auto = sizeof(struct qmp_combo),
 };
+
+int qcom_qmp_combo_typec_set(bool reverse, bool dp_svid, u8 pin_assignment)
+{
+	struct udevice *dev;
+	struct qmp_combo *qmp;
+	u32 typec, mode;
+	int ret;
+
+	ret = uclass_get_device_by_driver(UCLASS_PHY, DM_DRIVER_GET(qmp_combo),
+					  &dev);
+	if (ret)
+		return ret;
+
+	qmp = dev_get_priv(dev);
+	if (!qmp || !qmp->com)
+		return -ENODEV;
+
+	qmp->typec_reverse = reverse;
+	qmp->typec_dp_svid = dp_svid;
+	qmp->typec_pin_assignment = pin_assignment;
+	qmp->typec_valid = true;
+
+	typec = qmp_combo_typec_ctrl(qmp);
+	mode = qmp_combo_typec_mode(qmp, QMP_USB43DP_DP_PHY);
+
+	if (qmp->com_initialized) {
+		writel(typec, qmp->com + QPHY_V3_DP_COM_TYPEC_CTRL);
+		writel(mode, qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+	}
+
+	dev_info(dev, "QMP Type-C set reverse=%d dp_svid=%d pin=%u initialized=%d TYPEC=%02x MODE=%02x\n",
+		 reverse, dp_svid, pin_assignment,
+		 qmp->com_initialized,
+		 qmp->com_initialized ?
+			(readl(qmp->com + QPHY_V3_DP_COM_TYPEC_CTRL) & 0xff) :
+			typec,
+		 qmp->com_initialized ?
+			(readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL) & 0xff) :
+			mode);
+
+	return 0;
+}
