@@ -11,6 +11,7 @@
 #define LOG_CATEGORY UCLASS_MISC
 
 #include <asm/gpio.h>
+#include <command.h>
 #include <dm.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
@@ -129,6 +130,18 @@ struct qpg_intent_pair {
 	__le32 iid;
 } __packed;
 
+struct qpg_notify_debug {
+	bool seen;
+	u8 port;
+	u8 raw_orientation;
+	enum qcom_pmic_glink_orientation orientation;
+	u8 mux;
+	u16 svid;
+	u8 dpam;
+	bool hpd;
+	bool hpd_irq;
+};
+
 struct qpg {
 	struct udevice *smem;
 	struct mbox_chan mbox_chan;
@@ -157,7 +170,14 @@ struct qpg {
 	bool altmode_notify_seen;
 	bool altmode_no_dp;
 	bool ucsi_read_acked;
+	struct qpg_notify_debug notify;
 };
+
+static struct qpg qpg_session;
+static bool qpg_session_ready;
+static struct qcom_pmic_glink_altmode qpg_cached_altmode;
+static bool qpg_cached_altmode_valid;
+static int qpg_last_adsp_boot_ret;
 
 /**
  * qpg_mbox_from_glink() - Get IPCC mailbox channel from glink-edge DT node.
@@ -229,11 +249,13 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 
 static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
 {
+	/*
+	 * ADSP PAN orientation is USBPD_PIN_ASSIGNMENT_ORIENTATION_*:
+	 * 0 = normal/CC1, 1 = flip/CC2, 2 = invalid/open.
+	 */
 	if (orientation == 0)
 		return QCOM_PMIC_GLINK_ORIENTATION_NORMAL;
 	if (orientation == 1)
-		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
-	if (orientation == 2)
 		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
 
 	return QCOM_PMIC_GLINK_ORIENTATION_NONE;
@@ -614,16 +636,27 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		    notify->payload[8] & SC8280XP_DPAM_MASK,
 		    !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK),
 		    !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK));
+
+	orientation = qpg_orientation(notify->payload[1]);
+	pg->notify.seen = true;
+	pg->notify.port = port;
+	pg->notify.raw_orientation = notify->payload[1];
+	pg->notify.orientation = orientation;
+	pg->notify.mux = notify->payload[2];
+	pg->notify.svid = svid;
+	pg->notify.dpam = notify->payload[8] & SC8280XP_DPAM_MASK;
+	pg->notify.hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
+	pg->notify.hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
+
 	if (svid != USB_TYPEC_DP_SID)
 		return true;
 
-	orientation = qpg_orientation(notify->payload[1]);
 	altmode->port = port;
 	altmode->orientation = orientation;
-	altmode->hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
-	altmode->hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
+	altmode->hpd = pg->notify.hpd;
+	altmode->hpd_irq = pg->notify.hpd_irq;
 	pg->altmode_notify_seen = true;
-	mode = notify->payload[8] & SC8280XP_DPAM_MASK;
+	mode = pg->notify.dpam;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    notify->payload[1], orientation);
 	if (mode < DPAM_HPD_A) {
@@ -677,10 +710,20 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		    !!(notification & SC8180X_HPD_STATE_MASK),
 		    !!(notification & SC8180X_HPD_IRQ_MASK));
 	orientation = qpg_orientation(raw_orientation);
+	pg->notify.seen = true;
+	pg->notify.port = port;
+	pg->notify.raw_orientation = raw_orientation;
+	pg->notify.orientation = orientation;
+	pg->notify.mux = mux;
+	pg->notify.svid = USB_TYPEC_DP_SID;
+	pg->notify.dpam = mode;
+	pg->notify.hpd = !!(notification & SC8180X_HPD_STATE_MASK);
+	pg->notify.hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
+
 	altmode->port = port;
 	altmode->orientation = orientation;
-	altmode->hpd = !!(notification & SC8180X_HPD_STATE_MASK);
-	altmode->hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
+	altmode->hpd = pg->notify.hpd;
+	altmode->hpd_irq = pg->notify.hpd_irq;
 	pg->altmode_notify_seen = true;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    raw_orientation, orientation);
@@ -1312,6 +1355,8 @@ static int qpg_init(struct qpg *pg)
 	bool tx_exists;
 	int ret;
 
+	qpg_last_adsp_boot_ret = -EINPROGRESS;
+
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
 	log_warning("pmic-glink: smem lookup ret=%d smem=%p\n",
 		    ret, pg->smem);
@@ -1319,6 +1364,7 @@ static int qpg_init(struct qpg *pg)
 		return ret;
 
 	ret = qcom_adsp_pas_boot();
+	qpg_last_adsp_boot_ret = ret;
 	log_warning("pmic-glink: ADSP PAS boot ret=%d\n", ret);
 	if (ret)
 		return ret;
@@ -1420,46 +1466,62 @@ static int qpg_init(struct qpg *pg)
 	return 0;
 }
 
-int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
+static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
+			    int *adsp_boot_retp, int *glink_open_retp,
+			    int *pan_en_retp)
 {
-	static struct qcom_pmic_glink_altmode cached_altmode;
-	static bool cached_altmode_valid;
-	static bool session_ready;
-	static struct qpg pg;
 	u32 liid;
 	int ret;
 
-	if (!altmode)
-		return -EINVAL;
+	if (adsp_boot_retp)
+		*adsp_boot_retp = -EINPROGRESS;
+	if (glink_open_retp)
+		*glink_open_retp = -EINPROGRESS;
+	if (pan_en_retp)
+		*pan_en_retp = -EINPROGRESS;
 
-	memset(altmode, 0, sizeof(*altmode));
-
-	log_warning("pmic-glink: get_altmode start\n");
-
-	if (session_ready) {
+	if (qpg_session_ready) {
 		log_warning("pmic-glink: reusing session lcid=%u rcid=%u rx_tail=%08x rx_head=%08x\n",
-			    pg.lcid, pg.rcid, le32_to_cpu(*pg.rx_tail),
-			    le32_to_cpu(*pg.rx_head));
-		goto wait_altmode;
+			    qpg_session.lcid, qpg_session.rcid,
+			    le32_to_cpu(*qpg_session.rx_tail),
+			    le32_to_cpu(*qpg_session.rx_head));
+		if (adsp_boot_retp)
+			*adsp_boot_retp = 0;
+		if (glink_open_retp)
+			*glink_open_retp = 0;
+		if (pan_en_retp)
+			*pan_en_retp = 0;
+		return 0;
 	}
 
-	memset(&pg, 0, sizeof(pg));
+	memset(&qpg_session, 0, sizeof(qpg_session));
 
-	ret = qpg_init(&pg);
+	ret = qpg_init(&qpg_session);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
-	if (ret)
+	if (adsp_boot_retp)
+		*adsp_boot_retp = qpg_last_adsp_boot_ret;
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
-	ret = qpg_send_version(&pg);
+	ret = qpg_send_version(&qpg_session);
 	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
-	if (ret)
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
-	ret = qpg_drain_until(&pg, altmode, qpg_done_version, 1000);
+	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_version, 1000);
 	log_warning("pmic-glink: wait VERSION_ACK ret=%d version_acked=%d\n",
-		    ret, pg.version_acked);
-	if (ret)
+		    ret, qpg_session.version_acked);
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
 	/*
 	 * Linux-aligned channel open (two-phase):
@@ -1472,53 +1534,92 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	 * We never send local OPEN before the remote has advertised the
 	 * channel.
 	 */
-	ret = qpg_drain_until(&pg, altmode, qpg_done_remote_opened, 2000);
+	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_remote_opened,
+			      2000);
 	log_warning("pmic-glink: wait remote OPEN ret=%d remote_opened=%d rcid=%u\n",
-		    ret, pg.remote_opened, pg.rcid);
-	if (ret)
+		    ret, qpg_session.remote_opened, qpg_session.rcid);
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
-	ret = qpg_service_pmic_open(&pg);
+	ret = qpg_service_pmic_open(&qpg_session);
 	log_warning("pmic-glink: service PMIC OPEN ret=%d local_sent=%d remote_acked=%d\n",
-		    ret, pg.local_open_sent, pg.remote_open_acked);
-	if (ret)
+		    ret, qpg_session.local_open_sent,
+		    qpg_session.remote_open_acked);
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
-	ret = qpg_drain_until(&pg, altmode, qpg_done_open, 2000);
+	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_open, 2000);
 	log_warning("pmic-glink: wait local OPEN_ACK ret=%d open_acked=%d\n",
-		    ret, pg.open_acked);
-	if (ret)
+		    ret, qpg_session.open_acked);
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
 
-	liid = qpg_alloc_liid(&pg);
-	ret = qpg_send_rx_intent_for(&pg, pg.lcid, liid);
+	liid = qpg_alloc_liid(&qpg_session);
+	ret = qpg_send_rx_intent_for(&qpg_session, qpg_session.lcid, liid);
 	log_warning("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
-		    ret, pg.lcid, liid);
-	if (ret)
+		    ret, qpg_session.lcid, liid);
+	if (ret) {
+		if (glink_open_retp)
+			*glink_open_retp = ret;
 		return ret;
+	}
+	if (glink_open_retp)
+		*glink_open_retp = 0;
 
-	ret = qpg_send_ucsi_read(&pg);
+	ret = qpg_send_ucsi_read(&qpg_session);
 	if (ret)
 		log_warning("pmic-glink: UCSI read poke ignored ret=%d\n", ret);
 
-	pg.pan_acked = false;
-	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
+	qpg_session.pan_acked = false;
+	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
 	log_warning("pmic-glink: send PAN_EN ret=%d\n", ret);
-	if (ret)
+	if (ret) {
+		if (pan_en_retp)
+			*pan_en_retp = ret;
 		return ret;
+	}
 
-	ret = qpg_drain_until(&pg, altmode, qpg_done_pan_ack, 1000);
+	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_pan_ack, 1000);
 	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
-		    ret, pg.pan_acked);
+		    ret, qpg_session.pan_acked);
+	if (pan_en_retp)
+		*pan_en_retp = ret;
 	if (ret)
 		return ret;
 
-	session_ready = true;
+	qpg_session_ready = true;
 
-wait_altmode:
-	ret = qpg_drain_until(&pg, altmode, qpg_done_altmode,
+	return 0;
+}
+
+int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
+{
+	int ret;
+
+	if (!altmode)
+		return -EINVAL;
+
+	memset(altmode, 0, sizeof(*altmode));
+
+	log_warning("pmic-glink: get_altmode start\n");
+
+	ret = qpg_open_session(altmode, NULL, NULL, NULL);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_altmode,
 			      QPG_ALTMODE_TIMEOUT_MS);
-	if (ret == -ETIMEDOUT && pg.altmode_notify_seen && pg.altmode_no_dp) {
+	if (ret == -ETIMEDOUT && qpg_session.altmode_notify_seen &&
+	    qpg_session.altmode_no_dp) {
 		log_warning("pmic-glink: no DP sink active after valid notification\n");
 		ret = -ENODEV;
 	}
@@ -1528,8 +1629,8 @@ wait_altmode:
 		    altmode->hpd, altmode->hpd_irq);
 
 	if (!ret) {
-		cached_altmode = *altmode;
-		cached_altmode_valid = true;
+		qpg_cached_altmode = *altmode;
+		qpg_cached_altmode_valid = true;
 		return 0;
 	}
 
@@ -1541,16 +1642,16 @@ wait_altmode:
 		 * with an orientation check to avoid overwriting the cache.
 		 */
 		if (altmode->orientation != QCOM_PMIC_GLINK_ORIENTATION_NONE) {
-			cached_altmode = *altmode;
-			cached_altmode_valid = true;
+			qpg_cached_altmode = *altmode;
+			qpg_cached_altmode_valid = true;
 		}
-		if (cached_altmode_valid)
-			*altmode = cached_altmode;
+		if (qpg_cached_altmode_valid)
+			*altmode = qpg_cached_altmode;
 		return ret;
 	}
 
-	if (cached_altmode_valid) {
-		*altmode = cached_altmode;
+	if (qpg_cached_altmode_valid) {
+		*altmode = qpg_cached_altmode;
 		log_warning("pmic-glink: using cached altmode dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
 			    altmode->dp, altmode->orientation,
 			    altmode->pin_assignment, altmode->hpd,
@@ -1560,3 +1661,73 @@ wait_altmode:
 
 	return ret;
 }
+
+static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
+			  char *const argv[])
+{
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	int notify_ret;
+	int ret;
+
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	if (!ret) {
+		memset(&altmode, 0, sizeof(altmode));
+		qpg_session.notify.seen = false;
+		qpg_session.altmode_notify_seen = false;
+		qpg_session.altmode_no_dp = false;
+		qpg_session.pan_acked = false;
+		pan_ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
+		if (!pan_ret)
+			pan_ret = qpg_drain_until(&qpg_session, &altmode,
+						  qpg_done_pan_ack, 1000);
+		if (pan_ret)
+			ret = pan_ret;
+	}
+
+	printf("ADSP boot: ret=%d\n", adsp_ret);
+	printf("GLINK open: ret=%d\n", open_ret);
+	printf("PAN_EN: ret=%d\n", pan_ret);
+
+	if (!ret) {
+		notify_ret = qpg_drain_until(&qpg_session, &altmode,
+					     qpg_done_altmode,
+					     QPG_ALTMODE_TIMEOUT_MS);
+		if (notify_ret)
+			ret = notify_ret;
+	}
+
+	if (qpg_session.notify.seen) {
+		const struct qpg_notify_debug *notify = &qpg_session.notify;
+
+		printf("notify: port=%u orientation=%u/%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
+		       notify->port, notify->raw_orientation,
+		       notify->orientation, notify->mux, notify->svid,
+		       notify->dpam, notify->hpd, notify->hpd_irq);
+		printf("altmode: ret=%d dp=%u orientation=%u pin=%u hpd=%u irq=%u\n",
+		       ret, altmode.dp, altmode.orientation,
+		       altmode.pin_assignment, altmode.hpd,
+		       altmode.hpd_irq);
+	} else {
+		printf("notify: ret=%d\n", ret);
+	}
+
+	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
+static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
+		  char *const argv[])
+{
+	if (argc == 2 && !strcmp(argv[1], "altmode"))
+		return do_qpg_altmode(cmdtp, flag, argc - 1, argv + 1);
+
+	return CMD_RET_USAGE;
+}
+
+U_BOOT_CMD(
+	qpg, 2, 1, do_qpg,
+	"Qualcomm PMIC-GLINK diagnostics",
+	"altmode - boot ADSP, open PMIC-GLINK, enable PAN, print Type-C altmode notification"
+);
