@@ -78,11 +78,16 @@
 #define UCSI_BUFFER_SIZE			48
 #define UCSI_CMD_ACK_CC_CI			4
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
+#define UCSI_CMD_GET_ALTERNATE_MODE		12
+#define UCSI_CMD_GET_CAM_SUPPORTED		13
+#define UCSI_CMD_GET_CURRENT_CAM		14
 #define UCSI_CMD_GET_CONNECTOR_STATUS		18
 #define UCSI_NOTIFY_ALL			0xffff
 #define UCSI_CCI_NOT_SUPPORTED			BIT(25)
 #define UCSI_CCI_ERROR				BIT(30)
 #define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
+#define UCSI_CCI_DATA_LENGTH_MASK		GENMASK(15, 8)
+#define UCSI_CCI_DATA_LENGTH_SHIFT		8
 #define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
 #define UCSI_ACK_CC_CI_COMMAND_COMPLETE		BIT(1)
 
@@ -1422,6 +1427,20 @@ static int qpg_send_ucsi_read(struct qpg *pg)
 	return ret;
 }
 
+static void qpg_log_ucsi_raw(struct qpg *pg, const char *label)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u32 cci = get_unaligned_le32(buf + 4);
+	u8 len = (cci & UCSI_CCI_DATA_LENGTH_MASK) >> UCSI_CCI_DATA_LENGTH_SHIFT;
+
+	log_warning("pmic-glink: UCSI %s ret=%u cci=%08x len=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    label, pg->ucsi_read_return_code, cci, len,
+		    buf[16], buf[17], buf[18], buf[19],
+		    buf[20], buf[21], buf[22], buf[23],
+		    buf[24], buf[25], buf[26], buf[27],
+		    buf[28], buf[29], buf[30], buf[31]);
+}
+
 static void qpg_log_ucsi_connector_status(struct qpg *pg, u8 port)
 {
 	const u8 *buf = pg->ucsi_read_buffer;
@@ -1439,6 +1458,41 @@ static void qpg_log_ucsi_connector_status(struct qpg *pg, u8 port)
 		    port + 1, pg->ucsi_read_return_code, cci, status,
 		    connected, power_direction, partner_usb,
 		    partner_altmode, partner_type, power_opmode, rdo);
+	qpg_log_ucsi_raw(pg, "CONNECTOR_STATUS");
+}
+
+static void qpg_log_ucsi_cam_supported(struct qpg *pg, u8 port)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u32 bitmap = get_unaligned_le32(buf + 16);
+
+	log_warning("pmic-glink: UCSI connector%u CAM_SUPPORTED bitmap=%08x\n",
+		    port + 1, bitmap);
+	qpg_log_ucsi_raw(pg, "CAM_SUPPORTED");
+}
+
+static void qpg_log_ucsi_current_cam(struct qpg *pg, u8 port)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+
+	log_warning("pmic-glink: UCSI connector%u CURRENT_CAM=%02x\n",
+		    port + 1, buf[16]);
+	qpg_log_ucsi_raw(pg, "CURRENT_CAM");
+}
+
+static void qpg_log_ucsi_alternate_mode(struct qpg *pg, u8 port, u8 offset)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u32 cci = get_unaligned_le32(buf + 4);
+	u8 len = (cci & UCSI_CCI_DATA_LENGTH_MASK) >> UCSI_CCI_DATA_LENGTH_SHIFT;
+	u16 svid0 = get_unaligned_le16(buf + 16);
+	u32 mid0 = get_unaligned_le32(buf + 18);
+	u16 svid1 = get_unaligned_le16(buf + 22);
+	u32 mid1 = get_unaligned_le32(buf + 24);
+
+	log_warning("pmic-glink: UCSI connector%u ALT_MODE off=%u len=%u mode0=svid:%04x mid:%08x mode1=svid:%04x mid:%08x\n",
+		    port + 1, offset, len, svid0, mid0, svid1, mid1);
+	qpg_log_ucsi_raw(pg, "ALT_MODE");
 }
 
 static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
@@ -1455,9 +1509,18 @@ static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
 	pg->ucsi_write_acked = false;
 	pg->ucsi_write_return_code = 0xffffffff;
 
-	log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u connector=%u\n",
-		    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
-		    req.write_buffer[8], req.write_buffer[10]);
+	if (req.write_buffer[8] == UCSI_CMD_SET_NOTIFICATION_ENABLE) {
+		log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u notify_mask=%04x\n",
+			    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
+			    req.write_buffer[8],
+			    get_unaligned_le16(req.write_buffer + 10));
+	} else {
+		log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u b10=%u b11=%u b12=%u b13=%u\n",
+			    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
+			    req.write_buffer[8], req.write_buffer[10],
+			    req.write_buffer[11], req.write_buffer[12],
+			    req.write_buffer[13]);
+	}
 
 	ret = qpg_send_data(pg, &req, sizeof(req));
 	log_warning("pmic-glink: send UCSI_WRITE_BUFFER_REQ ret=%d\n", ret);
@@ -1537,6 +1600,9 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 	write_buffer[8] = command;
 	if (command == UCSI_CMD_GET_CONNECTOR_STATUS)
 		write_buffer[10] = port + 1;
+	else if (command == UCSI_CMD_GET_CAM_SUPPORTED ||
+		 command == UCSI_CMD_GET_CURRENT_CAM)
+		write_buffer[10] = port + 1;
 	else if (command == UCSI_CMD_SET_NOTIFICATION_ENABLE)
 		put_unaligned_le16(arg16, write_buffer + 10);
 
@@ -1558,6 +1624,63 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 	}
 
 	return ret;
+}
+
+static int qpg_send_ucsi_get_cam_supported(struct qpg *pg, u8 port)
+{
+	int ret;
+
+	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CAM_SUPPORTED, port,
+				    0, true);
+	if (!ret)
+		qpg_log_ucsi_cam_supported(pg, port);
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_current_cam(struct qpg *pg, u8 port)
+{
+	int ret;
+
+	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CURRENT_CAM, port,
+				    0, true);
+	if (!ret)
+		qpg_log_ucsi_current_cam(pg, port);
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
+					    u8 offset, u8 count)
+{
+	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
+	u32 old_cci = qpg_ucsi_cci(pg);
+	int ret;
+
+	write_buffer[8] = UCSI_CMD_GET_ALTERNATE_MODE;
+	write_buffer[10] = 0; /* recipient: connector */
+	write_buffer[11] = port + 1;
+	write_buffer[12] = offset;
+	write_buffer[13] = count ? count - 1 : 0;
+
+	pg->ucsi_notify_seen = false;
+	pg->ucsi_notification = 0;
+
+	ret = qpg_send_ucsi_write(pg, write_buffer);
+	if (ret)
+		return ret;
+
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 1000);
+	if (ret)
+		return ret;
+
+	ret = qpg_send_ucsi_ack_cc_ci(pg, false, true);
+	if (ret)
+		return ret;
+
+	qpg_log_ucsi_alternate_mode(pg, port, offset);
+
+	return 0;
 }
 
 static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
@@ -1817,6 +1940,21 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
 	if (ret)
 		log_warning("pmic-glink: UCSI connector status ignored ret=%d\n",
+			    ret);
+
+	ret = qpg_send_ucsi_get_cam_supported(&qpg_session, 0);
+	if (ret)
+		log_warning("pmic-glink: UCSI CAM_SUPPORTED ignored ret=%d\n",
+			    ret);
+
+	ret = qpg_send_ucsi_get_current_cam(&qpg_session, 0);
+	if (ret)
+		log_warning("pmic-glink: UCSI CURRENT_CAM ignored ret=%d\n",
+			    ret);
+
+	ret = qpg_send_ucsi_get_alternate_mode(&qpg_session, 0, 0, 2);
+	if (ret)
+		log_warning("pmic-glink: UCSI ALT_MODE ignored ret=%d\n",
 			    ret);
 
 	qpg_session.pan_acked = false;
