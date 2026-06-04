@@ -2123,7 +2123,15 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 	int pan_ret = 0;
 	int notify_ret;
 	int ret;
+	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
 	bool was_ready = qpg_session_ready;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2)
+		timeout_ms = simple_strtoul(argv[1], NULL, 0);
+	if (!timeout_ms)
+		timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
 
 	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
 	if (!ret && was_ready) {
@@ -2133,9 +2141,13 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 		qpg_session.altmode_no_dp = false;
 		qpg_session.pan_acked = false;
 		pan_ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
-		if (!pan_ret)
+		log_warning("pmic-glink: send PAN_EN ret=%d\n", pan_ret);
+		if (!pan_ret) {
 			pan_ret = qpg_drain_until(&qpg_session, &altmode,
 						  qpg_done_pan_ack, 1000);
+			log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+				    pan_ret, qpg_session.pan_acked);
+		}
 		if (pan_ret)
 			ret = pan_ret;
 	}
@@ -2143,11 +2155,12 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 	printf("ADSP boot: ret=%d\n", adsp_ret);
 	printf("GLINK open: ret=%d\n", open_ret);
 	printf("PAN_EN: ret=%d\n", pan_ret);
+	printf("timeout_ms: %u\n", timeout_ms);
 
 	if (!ret) {
 		notify_ret = qpg_drain_until(&qpg_session, &altmode,
 					     qpg_done_altmode,
-					     QPG_ALTMODE_TIMEOUT_MS);
+					     timeout_ms);
 		if (notify_ret)
 			ret = notify_ret;
 	}
@@ -2173,14 +2186,14 @@ static int do_qpg_altmode(struct cmd_tbl *cmdtp, int flag, int argc,
 static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		  char *const argv[])
 {
-	if (argc == 2 && !strcmp(argv[1], "altmode"))
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "altmode"))
 		return do_qpg_altmode(cmdtp, flag, argc - 1, argv + 1);
 
 	return CMD_RET_USAGE;
 }
 
 U_BOOT_CMD(
-	qpg, 2, 1, do_qpg,
+	qpg, 3, 1, do_qpg,
 	"Qualcomm PMIC-GLINK diagnostics",
-	"altmode - boot ADSP, open PMIC-GLINK, enable PAN, print Type-C altmode notification"
+	"altmode [timeout_ms] - boot ADSP, open PMIC-GLINK, enable PAN, print Type-C altmode notification"
 );
