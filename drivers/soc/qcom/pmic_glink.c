@@ -78,6 +78,8 @@
 #define UCSI_BUFFER_SIZE			48
 #define UCSI_CMD_ACK_CC_CI			4
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
+#define UCSI_CMD_GET_CAPABILITY			6
+#define UCSI_CMD_GET_CONNECTOR_CAPABILITY	7
 #define UCSI_CMD_GET_ALTERNATE_MODE		12
 #define UCSI_CMD_GET_CAM_SUPPORTED		13
 #define UCSI_CMD_GET_CURRENT_CAM		14
@@ -1463,6 +1465,34 @@ static void qpg_log_ucsi_connector_status(struct qpg *pg, u8 port)
 	qpg_log_ucsi_raw(pg, "CONNECTOR_STATUS");
 }
 
+static void qpg_log_ucsi_capability(struct qpg *pg)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u32 attr = get_unaligned_le32(buf + 16);
+	u64 cap = get_unaligned_le64(buf + 16);
+	u8 connectors = (cap >> 32) & 0x7f;
+	u32 optional = (cap >> 40) & 0xffffff;
+	u8 altmodes = buf[24];
+
+	log_warning("pmic-glink: UCSI CAPABILITY attr=%08x connectors=%u optional=%06x altmodes=%u\n",
+		    attr, connectors, optional, altmodes);
+	qpg_log_ucsi_raw(pg, "CAPABILITY");
+}
+
+static void qpg_log_ucsi_connector_capability(struct qpg *pg, u8 port)
+{
+	const u8 *buf = pg->ucsi_read_buffer;
+	u8 opmode = buf[16];
+	bool provider = buf[17] & BIT(0);
+	bool consumer = buf[17] & BIT(1);
+
+	log_warning("pmic-glink: UCSI connector%u CAP opmode=%02x altmode=%u usb3=%u usb2=%u drp=%u provider=%u consumer=%u\n",
+		    port + 1, opmode, !!(opmode & BIT(7)), !!(opmode & BIT(6)),
+		    !!(opmode & BIT(5)), !!(opmode & BIT(2)), provider,
+		    consumer);
+	qpg_log_ucsi_raw(pg, "CONNECTOR_CAP");
+}
+
 static void qpg_log_ucsi_cam_supported(struct qpg *pg, u8 port)
 {
 	const u8 *buf = pg->ucsi_read_buffer;
@@ -1606,7 +1636,8 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 	int ret;
 
 	write_buffer[8] = command;
-	if (command == UCSI_CMD_GET_CONNECTOR_STATUS)
+	if (command == UCSI_CMD_GET_CONNECTOR_CAPABILITY ||
+	    command == UCSI_CMD_GET_CONNECTOR_STATUS)
 		write_buffer[10] = port + 1;
 	else if (command == UCSI_CMD_GET_CAM_SUPPORTED ||
 		 command == UCSI_CMD_GET_CURRENT_CAM)
@@ -1632,6 +1663,29 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 		if (ret)
 			return ret;
 	}
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_capability(struct qpg *pg)
+{
+	int ret;
+
+	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CAPABILITY, 0, 0, true);
+	if (!ret)
+		qpg_log_ucsi_capability(pg);
+
+	return ret;
+}
+
+static int qpg_send_ucsi_get_connector_capability(struct qpg *pg, u8 port)
+{
+	int ret;
+
+	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CONNECTOR_CAPABILITY,
+				    port, 0, true);
+	if (!ret)
+		qpg_log_ucsi_connector_capability(pg, port);
 
 	return ret;
 }
@@ -1945,6 +1999,16 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	ret = qpg_enable_ucsi_notifications(&qpg_session);
 	if (ret)
 		log_warning("pmic-glink: UCSI notification enable ignored ret=%d\n",
+			    ret);
+
+	ret = qpg_send_ucsi_get_capability(&qpg_session);
+	if (ret)
+		log_warning("pmic-glink: UCSI capability ignored ret=%d\n",
+			    ret);
+
+	ret = qpg_send_ucsi_get_connector_capability(&qpg_session, 0);
+	if (ret)
+		log_warning("pmic-glink: UCSI connector capability ignored ret=%d\n",
 			    ret);
 
 	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
