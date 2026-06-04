@@ -172,7 +172,6 @@ int tachyon_find_partition(const char* name, struct blk_desc** block, struct dis
 	return -ENOENT;
 }
 
-#if 0
 static int tachyon_parse_resolution(const char* value, u32* width, u32* height) {
 	char* end = NULL;
 	ulong parsed_width;
@@ -503,7 +502,6 @@ U_BOOT_CMD(
 	"resolution save\n"
 	"resolution set <width>x<height> [save]"
 );
-#endif // 0
 
 static int tachyon_setup_efs(void) {
 	bool mounted = s_efs_blk.mounted;
@@ -541,9 +539,14 @@ static int efs_read_file(const char* filename, void* buffer, loff_t size) {
 	return r;
 }
 
-int qcom_late_init(void)
+void qcom_late_init(void)
 {
-	return 0;
+	int ret;
+
+	printf("Tachyon: probing video devices\n");
+	ret = uclass_probe_all(UCLASS_VIDEO);
+	if (ret)
+		printf("Tachyon: video probe returned %d\n", ret);
 }
 
 static int parse_overlay_list(char* buf, int (*cb)(const char*, struct fs_context*), struct fs_context* ctx) {
