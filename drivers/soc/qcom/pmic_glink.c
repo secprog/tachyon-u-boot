@@ -86,6 +86,8 @@
 #define UCSI_CCI_NOT_SUPPORTED			BIT(25)
 #define UCSI_CCI_ERROR				BIT(30)
 #define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
+#define UCSI_CCI_CONNECTOR_CHANGE_MASK		GENMASK(7, 1)
+#define UCSI_CCI_CONNECTOR_CHANGE_SHIFT		1
 #define UCSI_CCI_DATA_LENGTH_MASK		GENMASK(15, 8)
 #define UCSI_CCI_DATA_LENGTH_SHIFT		8
 #define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
@@ -1539,6 +1541,12 @@ static u32 qpg_ucsi_cci(struct qpg *pg)
 	return get_unaligned_le32(pg->ucsi_read_buffer + 4);
 }
 
+static u8 qpg_ucsi_connector_change(struct qpg *pg)
+{
+	return (qpg_ucsi_cci(pg) & UCSI_CCI_CONNECTOR_CHANGE_MASK) >>
+	       UCSI_CCI_CONNECTOR_CHANGE_SHIFT;
+}
+
 static int qpg_wait_ucsi_cci(struct qpg *pg, u32 old_cci, u32 timeout_ms)
 {
 	ulong start = get_timer(0);
@@ -1618,7 +1626,9 @@ static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
 		return ret;
 
 	if (ack) {
-		ret = qpg_send_ucsi_ack_cc_ci(pg, false, true);
+		ret = qpg_send_ucsi_ack_cc_ci(pg,
+					      qpg_ucsi_connector_change(pg),
+					      true);
 		if (ret)
 			return ret;
 	}
@@ -1674,7 +1684,7 @@ static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
 	if (ret)
 		return ret;
 
-	ret = qpg_send_ucsi_ack_cc_ci(pg, false, true);
+	ret = qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
 	if (ret)
 		return ret;
 
