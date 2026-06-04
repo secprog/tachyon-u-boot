@@ -10,9 +10,11 @@
 
 #define LOG_CATEGORY UCLASS_MISC
 
+#include <asm/gpio.h>
 #include <dm.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
+#include <env.h>
 #include <errno.h>
 #include <asm/io.h>
 #include <linux/err.h>
@@ -224,6 +226,68 @@ static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
 		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
 
 	return QCOM_PMIC_GLINK_ORIENTATION_NONE;
+}
+
+static bool qpg_env_bool(const char *name)
+{
+	const char *value = env_get(name);
+
+	return value && (!strcmp(value, "1") ||
+			 !strcmp(value, "true") ||
+			 !strcmp(value, "yes") ||
+			 !strcmp(value, "on"));
+}
+
+static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
+				bool dp_active)
+{
+	bool invert_select = qpg_env_bool("tachyon_dp_invert_sbu_select");
+	bool invert_enable = qpg_env_bool("tachyon_dp_invert_sbu_enable");
+	struct gpio_desc sbu_enable = {};
+	struct gpio_desc sbu_select = {};
+	ofnode mux;
+	int select;
+	int enable;
+	int ret;
+
+	mux = ofnode_path("/usb1-sbu-mux");
+	if (!ofnode_valid(mux))
+		return;
+
+	ret = gpio_request_by_name_nodev(mux, "select-gpios", 0,
+					 &sbu_select, GPIOD_IS_OUT);
+	if (ret) {
+		log_warning("pmic-glink: SBU select request ret=%d\n", ret);
+		return;
+	}
+
+	ret = gpio_request_by_name_nodev(mux, "enable-gpios", 0,
+					 &sbu_enable, GPIOD_IS_OUT);
+	if (ret) {
+		log_warning("pmic-glink: SBU enable request ret=%d\n", ret);
+		dm_gpio_free(NULL, &sbu_select);
+		return;
+	}
+
+	select = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
+	if (invert_select)
+		select = !select;
+
+	enable = dp_active ? 1 : 0;
+	if (invert_enable)
+		enable = !enable;
+
+	dm_gpio_set_value(&sbu_select, select);
+	udelay(1000);
+	dm_gpio_set_value(&sbu_enable, enable);
+
+	log_warning("pmic-glink: SBU mux %s orientation=%u enable=%d select=%d\n",
+		    dp_active ? "dp" : "safe", orientation,
+		    dm_gpio_get_value(&sbu_enable),
+		    dm_gpio_get_value(&sbu_select));
+
+	dm_gpio_free(NULL, &sbu_enable);
+	dm_gpio_free(NULL, &sbu_select);
 }
 
 static size_t qpg_rx_avail(struct qpg *pg)
@@ -552,6 +616,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
+		qpg_program_sbu_mux(orientation, false);
 		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
 			    notify->payload[2], mode);
 		return true;
@@ -563,6 +628,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
+	qpg_program_sbu_mux(orientation, true);
 
 	return true;
 }
@@ -608,6 +674,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
+		qpg_program_sbu_mux(orientation, false);
 		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
 			    mux, mode);
 		return true;
@@ -619,6 +686,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
+	qpg_program_sbu_mux(orientation, true);
 
 	return true;
 }
