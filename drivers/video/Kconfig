@@ -176,6 +176,7 @@ config VIDEO_QCOM_TACHYON_DP
 	bool "Qualcomm QCM6490 Tachyon DisplayPort bring-up"
 	depends on VIDEO && ARCH_SNAPDRAGON
 	select VIDEO_BPP32
+	select QCOM_MDSS_BUS if DM && OF_REAL
 	help
 	  Enable a minimal Qualcomm MSM DisplayPort bring-up path for the
 	  Particle Tachyon QCM6490 board. The driver consumes the existing
