@@ -58,8 +58,12 @@
 #define GLINK_CMD_READ_NOTIF			13
 #define GLINK_CMD_RX_DONE_W_REUSE		14
 
+#define PMIC_GLINK_OWNER_USB_TYPE_C		32779
 #define PMIC_GLINK_OWNER_USBC_PAN		32780
 #define PMIC_GLINK_REQ_RESP			1
+
+#define UCSI_READ_BUFFER_REQ			0x11
+#define UCSI_NOTIFY_IND			0x13
 
 #define USBC_SC8180X_NOTIFY_IND			0x13
 #define USBC_CMD_WRITE_REQ			0x15
@@ -100,6 +104,12 @@ struct qpg_usbc_write_req {
 	__le32 cmd;
 	__le32 arg;
 	__le32 reserved;
+} __packed;
+
+struct qpg_ucsi_read_buffer_resp {
+	struct qpg_pmic_hdr hdr;
+	u8 read_buffer[48];
+	__le32 return_code;
 } __packed;
 
 struct qpg_usbc_notify {
@@ -146,6 +156,7 @@ struct qpg {
 	bool pan_acked;
 	bool altmode_notify_seen;
 	bool altmode_no_dp;
+	bool ucsi_read_acked;
 };
 
 /**
@@ -529,6 +540,7 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 
 static int qpg_wait_riid(struct qpg *pg);
 static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg);
+static int qpg_send_ucsi_read(struct qpg *pg);
 static int qpg_drain_until(struct qpg *pg,
 			   struct qcom_pmic_glink_altmode *altmode,
 			   bool (*done)(struct qpg *,
@@ -536,6 +548,8 @@ static int qpg_drain_until(struct qpg *pg,
 			   u32 timeout_ms);
 static bool qpg_done_pan_ack(struct qpg *pg,
 			     struct qcom_pmic_glink_altmode *altmode);
+static bool qpg_done_ucsi_read(struct qpg *pg,
+			       struct qcom_pmic_glink_altmode *altmode);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -738,6 +752,44 @@ static void qpg_parse_pmic(struct qpg *pg,
 
 	log_warning("pmic-glink: PMIC msg owner=%u type=%u opcode=%02x raw_opcode=%08x svid=%04x len=%zu\n",
 		    owner, type, opcode, raw_opcode, svid, len);
+
+	if (owner == PMIC_GLINK_OWNER_USB_TYPE_C) {
+		const struct qpg_ucsi_read_buffer_resp *resp = data;
+
+		switch (opcode) {
+		case UCSI_READ_BUFFER_REQ:
+			pg->ucsi_read_acked = true;
+			if (len >= sizeof(*resp)) {
+				const u8 *buf = resp->read_buffer;
+
+				log_warning("pmic-glink: UCSI READ_BUFFER ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					    le32_to_cpu(resp->return_code),
+					    buf[0], buf[1], buf[2], buf[3],
+					    buf[4], buf[5], buf[6], buf[7],
+					    buf[8], buf[9], buf[10], buf[11],
+					    buf[12], buf[13], buf[14], buf[15]);
+			} else {
+				log_warning("pmic-glink: UCSI READ_BUFFER short len=%zu expected=%zu\n",
+					    len, sizeof(*resp));
+			}
+			break;
+		case UCSI_NOTIFY_IND:
+			log_warning("pmic-glink: UCSI notify len=%zu\n", len);
+			break;
+		default:
+			log_warning("pmic-glink: USB Type-C owner opcode=%02x len=%zu\n",
+				    opcode, len);
+			break;
+		}
+
+		return;
+	}
+
+	if (owner != PMIC_GLINK_OWNER_USBC_PAN) {
+		log_warning("pmic-glink: unsupported PMIC owner=%u opcode=%02x len=%zu\n",
+			    owner, opcode, len);
+		return;
+	}
 
 	switch (opcode) {
 	case USBC_CMD_WRITE_REQ:
@@ -1173,6 +1225,12 @@ static bool qpg_done_pan_ack(struct qpg *pg,
 	return pg->pan_acked;
 }
 
+static bool qpg_done_ucsi_read(struct qpg *pg,
+			       struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->ucsi_read_acked;
+}
+
 static bool qpg_done_altmode(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	/*
@@ -1214,6 +1272,33 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME, cmd, arg);
 
 	return qpg_send_data(pg, &req, sizeof(req));
+}
+
+static int qpg_send_ucsi_read(struct qpg *pg)
+{
+	struct qpg_ucsi_read_buffer_resp req = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USB_TYPE_C),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(UCSI_READ_BUFFER_REQ),
+	};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int ret;
+
+	pg->ucsi_read_acked = false;
+
+	log_warning("pmic-glink: owner=%u channel=%s UCSI_READ_BUFFER_REQ\n",
+		    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME);
+
+	ret = qpg_send_data(pg, &req, sizeof(req));
+	log_warning("pmic-glink: send UCSI_READ_BUFFER_REQ ret=%d\n", ret);
+	if (ret)
+		return ret;
+
+	ret = qpg_drain_until(pg, &altmode, qpg_done_ucsi_read, 1000);
+	log_warning("pmic-glink: wait UCSI_READ_BUFFER ret=%d ack=%d\n",
+		    ret, pg->ucsi_read_acked);
+
+	return ret;
 }
 
 static int qpg_init(struct qpg *pg)
@@ -1411,6 +1496,10 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 		    ret, pg.lcid, liid);
 	if (ret)
 		return ret;
+
+	ret = qpg_send_ucsi_read(&pg);
+	if (ret)
+		log_warning("pmic-glink: UCSI read poke ignored ret=%d\n", ret);
 
 	pg.pan_acked = false;
 	ret = qpg_send_altmode_req(&pg, ALTMODE_PAN_EN, 0);
