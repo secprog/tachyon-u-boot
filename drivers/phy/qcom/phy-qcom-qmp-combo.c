@@ -39,6 +39,16 @@
 #define USB3_MODE                               BIT(0) /* enables USB3 mode */
 #define DP_MODE                                 BIT(1) /* enables DP mode */
 
+/*
+ * Linux PMIC-GLINK stores DPAM as TYPEC_MODAL_STATE(dpam - DPAM_HPD_A).
+ * The value passed here is the pre-modal DP pin assignment index:
+ * A=0, B=1, C=2, D=3, E=4, F=5.
+ */
+#define DP_PIN_ASSIGN_C                        2
+#define DP_PIN_ASSIGN_D                        3
+#define DP_PIN_ASSIGN_E                        4
+#define DP_PIN_ASSIGN_F                        5
+
 /* QPHY_V3_DP_COM_TYPEC_CTRL register bits */
 #define SW_PORTSELECT_VAL                       BIT(0)
 #define SW_PORTSELECT_MUX                       BIT(1)
@@ -267,11 +277,11 @@ static u32 qmp_combo_typec_mode(struct qmp_combo *qmp, unsigned long phy_id)
 		return USB3_MODE;
 
 	switch (qmp->typec_pin_assignment) {
-	case 2: /* TYPEC_DP_STATE_C: DP only */
-	case 4: /* TYPEC_DP_STATE_E: DP only */
+	case DP_PIN_ASSIGN_C:
+	case DP_PIN_ASSIGN_E:
 		return DP_MODE;
-	case 3: /* TYPEC_DP_STATE_D: USB3 + DP */
-	case 5: /* TYPEC_DP_STATE_F: USB3 + DP */
+	case DP_PIN_ASSIGN_D:
+	case DP_PIN_ASSIGN_F:
 	default:
 		return USB3_MODE | DP_MODE;
 	}

@@ -121,6 +121,12 @@
 #define SC8280XP_HPD_STATE_MASK			BIT(6)
 #define SC8280XP_HPD_IRQ_MASK			BIT(7)
 
+enum qpg_typec_state {
+	QPG_TYPEC_SAFE,
+	QPG_TYPEC_USB,
+	QPG_TYPEC_DP,
+};
+
 struct qpg_msg {
 	__le16 cmd;
 	__le16 param1;
@@ -339,6 +345,20 @@ static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
 	return QCOM_PMIC_GLINK_ORIENTATION_NONE;
 }
 
+static const char *qpg_typec_state_name(enum qpg_typec_state state)
+{
+	switch (state) {
+	case QPG_TYPEC_SAFE:
+		return "safe";
+	case QPG_TYPEC_USB:
+		return "usb";
+	case QPG_TYPEC_DP:
+		return "dp";
+	default:
+		return "unknown";
+	}
+}
+
 static bool qpg_env_bool(const char *name)
 {
 	const char *value = env_get(name);
@@ -350,12 +370,13 @@ static bool qpg_env_bool(const char *name)
 }
 
 static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
-				bool dp_active)
+				enum qpg_typec_state state)
 {
 	bool invert_select = qpg_env_bool("tachyon_dp_invert_sbu_select");
 	bool invert_enable = qpg_env_bool("tachyon_dp_invert_sbu_enable");
 	struct gpio_desc sbu_enable = {};
 	struct gpio_desc sbu_select = {};
+	bool dp_active = state == QPG_TYPEC_DP;
 	ofnode mux;
 	int select;
 	int enable;
@@ -393,7 +414,7 @@ static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
 	dm_gpio_set_value(&sbu_enable, enable);
 
 	log_warning("pmic-glink: SBU mux %s orientation=%u enable=%d select=%d\n",
-		    dp_active ? "dp" : "safe", orientation,
+		    qpg_typec_state_name(state), orientation,
 		    dm_gpio_get_value(&sbu_enable),
 		    dm_gpio_get_value(&sbu_select));
 
@@ -402,8 +423,10 @@ static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
 }
 
 static void qpg_program_qmp_typec(enum qcom_pmic_glink_orientation orientation,
-				  bool dp_svid, u8 pin_assignment)
+				  enum qpg_typec_state state,
+				  u8 pin_assignment)
 {
+	bool dp_svid = state == QPG_TYPEC_DP;
 	bool reverse;
 	int ret;
 
@@ -412,17 +435,20 @@ static void qpg_program_qmp_typec(enum qcom_pmic_glink_orientation orientation,
 
 	reverse = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
 	ret = qcom_qmp_combo_typec_set(reverse, dp_svid, pin_assignment);
-	log_warning("pmic-glink: QMP Type-C provider ret=%d dp_svid=%d orientation=%u pin=%u\n",
-		    ret, dp_svid, orientation, pin_assignment);
+	log_warning("pmic-glink: QMP Type-C provider ret=%d state=%s dp_svid=%d orientation=%u pin=%u\n",
+		    ret, qpg_typec_state_name(state), dp_svid,
+		    orientation, pin_assignment);
 }
 
 static void qpg_apply_typec_state(enum qcom_pmic_glink_orientation orientation,
-				  bool dp_svid, u8 pin_assignment)
+				  enum qpg_typec_state state,
+				  u8 pin_assignment)
 {
-	bool dp_active = dp_svid && pin_assignment;
+	if (state == QPG_TYPEC_DP && !pin_assignment)
+		state = QPG_TYPEC_SAFE;
 
-	qpg_program_sbu_mux(orientation, dp_active);
-	qpg_program_qmp_typec(orientation, dp_svid, pin_assignment);
+	qpg_program_sbu_mux(orientation, state);
+	qpg_program_qmp_typec(orientation, state, pin_assignment);
 }
 
 static size_t qpg_rx_avail(struct qpg *pg)
@@ -757,8 +783,10 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	pg->notify.hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
 
-	if (svid != USB_TYPEC_DP_SID)
+	if (svid != USB_TYPEC_DP_SID) {
+		qpg_apply_typec_state(orientation, QPG_TYPEC_USB, 0);
 		return true;
+	}
 
 	altmode->port = port;
 	altmode->orientation = orientation;
@@ -772,19 +800,20 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, false, 0);
+		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
 		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
 			    notify->payload[2], mode);
 		return true;
 	}
 
-	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
-		    mode, mode - DPAM_HPD_A);
+	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u pin_assignment=%u\n",
+		    mode, mode - DPAM_HPD_A, mode - DPAM_HPD_A);
 
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, true, altmode->pin_assignment);
+	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
+			      altmode->pin_assignment);
 
 	return true;
 }
@@ -840,19 +869,20 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, false, 0);
+		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
 		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
 			    mux, mode);
 		return true;
 	}
 
-	log_warning("pmic-glink: DPAM raw=%u pin_assignment=%u\n",
-		    mode, mode - DPAM_HPD_A);
+	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u pin_assignment=%u\n",
+		    mode, mode - DPAM_HPD_A, mode - DPAM_HPD_A);
 
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, true, altmode->pin_assignment);
+	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
+			      altmode->pin_assignment);
 
 	return true;
 }
@@ -1545,21 +1575,27 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	pg->altmode_notify_seen = true;
 
 	if (!dp_active) {
+		enum qpg_typec_state state = dp_svid ? QPG_TYPEC_SAFE :
+						    QPG_TYPEC_USB;
+
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, false, 0);
-		log_warning("pmic-glink: %s safe/no-DP mux=%u dpam=%u dp_svid=%u\n",
-			    source, mux, mode, dp_svid);
+		qpg_apply_typec_state(orientation, state, 0);
+		log_warning("pmic-glink: %s %s/no-DP mux=%u dpam=%u dp_svid=%u\n",
+			    source, qpg_typec_state_name(state), mux, mode,
+			    dp_svid);
 		return;
 	}
 
 	altmode->pin_assignment = mode - DPAM_HPD_A;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, dp_svid, altmode->pin_assignment);
-	log_warning("pmic-glink: %s DP active pin_assignment=%u\n",
-		    source, altmode->pin_assignment);
+	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
+			      altmode->pin_assignment);
+	log_warning("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u pin_assignment=%u\n",
+		    source, mode, mode - DPAM_HPD_A,
+		    altmode->pin_assignment);
 }
 
 static void qpg_log_usbc_read(struct qpg *pg,
