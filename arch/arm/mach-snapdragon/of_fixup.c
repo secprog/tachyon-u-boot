@@ -51,8 +51,14 @@ static int fixup_qcom_dwc3(struct device_node *glue_np)
 	/* Find the DWC3 node itself */
 	dwc3 = of_find_compatible_node(glue_np, NULL, "snps,dwc3");
 	if (!dwc3) {
-		log_err("Failed to find dwc3 node\n");
-		return -ENOENT;
+		if (!of_get_property(glue_np, "phys", NULL) ||
+		    !of_get_property(glue_np, "phy-names", NULL)) {
+			log_err("Failed to find dwc3 node\n");
+			return -ENOENT;
+		}
+
+		log_debug("Using flattened DWC3 node %s\n", glue_np->name);
+		dwc3 = glue_np;
 	}
 
 	phandles = of_get_property(dwc3, "phys", &len);
