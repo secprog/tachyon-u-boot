@@ -12,9 +12,12 @@
 #include <asm/gpio.h>
 #include <asm/io.h>
 #include <clk.h>
+#include <command.h>
 #include <dm.h>
+#include <dm/device.h>
 #include <dm/read.h>
 #include <dm/ofnode.h>
+#include <dm/uclass-internal.h>
 #include <edid.h>
 #include <env.h>
 #include <fdtdec.h>
@@ -5396,6 +5399,10 @@ static int tachyon_dpu_program_ctl_multi(struct tachyon_dp_priv *priv)
 }
 #endif /* CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE */
 
+#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
+static bool tachyon_dp_manual_probe_armed;
+#endif
+
 static int tachyon_dp_probe(struct udevice *dev)
 {
 	struct tachyon_dp_priv *priv = dev_get_priv(dev);
@@ -5404,6 +5411,13 @@ static int tachyon_dp_probe(struct udevice *dev)
 	u32 width, height;
 	int ret, altmode_ret;
 	bool has_sbu_mux;
+
+#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
+	if (!tachyon_dp_manual_probe_armed) {
+		log_debug("DP probe skipped until tachyon dp start\n");
+		return -EAGAIN;
+	}
+#endif
 
 	log_warning("DP probe start\n");
 
@@ -5851,6 +5865,128 @@ static int tachyon_dp_bind(struct udevice *dev)
 
 	return 0;
 }
+
+#ifdef CONFIG_CMD_TACHYON_DP
+static void tachyon_dp_arm_manual_probe(void)
+{
+#if !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
+	tachyon_dp_manual_probe_armed = true;
+#endif
+}
+
+static int tachyon_dp_find_device(struct udevice **devp, bool probe)
+{
+	ofnode node;
+	int ret = -ENODEV;
+
+	for (node = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-dp");
+	     ofnode_valid(node);
+	     node = ofnode_by_compatible(node, "qcom,sc7280-dp")) {
+		if (!ofnode_is_enabled(node))
+			continue;
+
+		if (probe)
+			ret = uclass_get_device_by_ofnode(UCLASS_VIDEO, node,
+							  devp);
+		else
+			ret = uclass_find_device_by_ofnode(UCLASS_VIDEO, node,
+							   devp);
+
+		printf("tachyon dp: node=%s probe=%u ret=%d\n",
+		       ofnode_get_name(node), probe ? 1 : 0, ret);
+		if (!ret)
+			return 0;
+	}
+
+	*devp = NULL;
+	return ret;
+}
+
+static void tachyon_dp_print_device_status(struct udevice *dev)
+{
+	struct video_uc_plat *plat;
+	struct video_priv *uc_priv;
+
+	if (!dev) {
+		printf("tachyon dp: video device not bound\n");
+		return;
+	}
+
+	printf("tachyon dp: dev=%s active=%u\n", dev->name,
+	       device_active(dev) ? 1 : 0);
+
+	if (!device_active(dev))
+		return;
+
+	plat = dev_get_uclass_plat(dev);
+	uc_priv = dev_get_uclass_priv(dev);
+
+	printf("tachyon dp: mode=%ux%u bpix=%u format=%u fb=%lx size=%lx line=%u\n",
+	       uc_priv->xsize, uc_priv->ysize, uc_priv->bpix,
+	       uc_priv->format, (ulong)plat->base, (ulong)uc_priv->fb_size,
+	       uc_priv->line_length);
+}
+
+static void tachyon_dp_print_pmic_state(void)
+{
+	const struct qcom_pmic_glink_altmode_state *state;
+
+	state = qcom_pmic_glink_altmode_get_state();
+	if (!state) {
+		printf("tachyon dp: PMIC state unavailable\n");
+		return;
+	}
+
+	printf("tachyon dp: PMIC service=%u pan=%u notify=%u state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+	       state->service_started, state->pan_enabled,
+	       state->notify_seen, state->typec_state, state->svid,
+	       state->orientation_raw, state->mux, state->dpam_raw,
+	       state->linux_mux_mode, state->dp_pin_assignment,
+	       state->hpd, state->hpd_irq);
+}
+
+int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
+		   char *const argv[])
+{
+	struct udevice *dev = NULL;
+	int ret;
+
+	if (argc < 3 || strcmp(argv[1], "dp"))
+		return CMD_RET_USAGE;
+
+	if (!strcmp(argv[2], "start") || !strcmp(argv[2], "init") ||
+	    !strcmp(argv[2], "probe")) {
+		tachyon_dp_arm_manual_probe();
+		ret = tachyon_dp_find_device(&dev, true);
+		tachyon_dp_print_device_status(dev);
+		tachyon_dp_print_pmic_state();
+		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[2], "sync")) {
+		tachyon_dp_arm_manual_probe();
+		ret = tachyon_dp_find_device(&dev, true);
+		if (ret)
+			return CMD_RET_FAILURE;
+
+		ret = video_sync(dev, true);
+		printf("tachyon dp: sync ret=%d\n", ret);
+		tachyon_dp_print_device_status(dev);
+		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (!strcmp(argv[2], "status")) {
+		ret = tachyon_dp_find_device(&dev, false);
+		if (ret && ret != -ENODEV)
+			printf("tachyon dp: status find ret=%d\n", ret);
+		tachyon_dp_print_device_status(dev);
+		tachyon_dp_print_pmic_state();
+		return CMD_RET_SUCCESS;
+	}
+
+	return CMD_RET_USAGE;
+}
+#endif
 
 static const struct udevice_id tachyon_dp_ids[] = {
 	{ .compatible = "qcom,sc7280-dp" },
