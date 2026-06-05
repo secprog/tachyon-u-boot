@@ -84,6 +84,9 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DP_LANE_SYMBOL_LOCKED		BIT(2)
 #define DP_INTERLANE_ALIGN_DONE		BIT(0)
 
+/* DP AUX controller registers. Offsets mirror Linux drm/msm/dp/dp_reg.h
+ * for the SC7280/QCM6490 DP controller where available.
+ */
 #define REG_DP_SW_RESET			0x010
 #define DP_SW_RESET			BIT(0)
 #define REG_DP_INTR_STATUS		0x020
@@ -5098,6 +5101,8 @@ static int tachyon_dp_remove(struct udevice *dev)
 	return 0;
 }
 
+static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv);
+
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 {
 	int ret, i;
@@ -5121,6 +5126,15 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 		if (tachyon_dp_hw_hpd_connected(priv)) {
 			priv->hpd_state = TACHYON_DP_HPD_CONNECTED;
 			priv->aux_xfers_enabled = true;
+		}
+
+		if (priv->phy_dp && !tachyon_dp_qmp_phy_ready(priv)) {
+			u8 qmp_status = tachyon_dp_qmp_status_low(priv);
+
+			log_debug("DP wait sink try %d/%d: QMP PHY not ready (%02x); waiting for PHY_READY before DPCD\n",
+				 i + 1, TACHYON_DP_AUX_DEBOUNCE_TRIES, qmp_status);
+			udelay(20000);
+			continue;
 		}
 
 		if (priv->hpd_state == TACHYON_DP_HPD_DISCONNECTED &&
@@ -6064,10 +6078,75 @@ static int tachyon_dp_find_device(struct udevice **devp, bool probe)
 	return ret;
 }
 
+static const char *tachyon_dp_typec_source_name(enum tachyon_dp_typec_source source)
+{
+	switch (source) {
+	case TACHYON_DP_TYPEC_SOURCE_ALTMODE:
+		return "altmode";
+	case TACHYON_DP_TYPEC_SOURCE_NONE:
+	default:
+		return "none";
+	}
+}
+
+static const char *tachyon_dp_hpd_state_name(enum tachyon_dp_hpd_state state)
+{
+	switch (state) {
+	case TACHYON_DP_HPD_CONNECTED:
+		return "connected";
+	case TACHYON_DP_HPD_DISCONNECTED:
+		return "disconnected";
+	default:
+		return "unknown";
+	}
+}
+
+static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv)
+{
+	u8 status;
+
+	if (!priv->phy_dp)
+		return false;
+
+	status = tachyon_dp_qmp_status_low(priv);
+	return !!(status & QMP_DP_PHY_STATUS_PHY_READY);
+}
+
+static void tachyon_dp_print_qmp_status(struct tachyon_dp_priv *priv)
+{
+	if (!priv->qmp_dp_serdes || !priv->phy_dp) {
+		printf("tachyon dp: QMP state unavailable\n");
+		return;
+	}
+
+	printf("tachyon dp: QMP PHY_STATUS=%02x PD_CTL=%02x C_READY=%02x CMN=%02x TYPEC_CTRL=%02x PHY_MODE_CTRL=%02x\n",
+	       tachyon_dp_qmp_status_low(priv),
+	       tachyon_dp_qmp_pd_low(priv),
+	       readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
+	       readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff,
+	       tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
+	       tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL));
+}
+
+static void tachyon_dp_print_aux_status(struct tachyon_dp_priv *priv)
+{
+	if (!priv->aux) {
+		printf("tachyon dp: AUX state unavailable\n");
+		return;
+	}
+
+	printf("tachyon dp: AUX ctrl=%08x status=%08x trans=%08x hpd_int=%08x\n",
+	       readl(priv->aux + REG_DP_AUX_CTRL),
+	       readl(priv->aux + REG_DP_AUX_STATUS),
+	       readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
+	       readl(priv->aux + REG_DP_DP_HPD_INT_STATUS));
+}
+
 static void tachyon_dp_print_device_status(struct udevice *dev)
 {
 	struct video_uc_plat *plat;
 	struct video_priv *uc_priv;
+	struct tachyon_dp_priv *priv;
 
 	if (!dev) {
 		printf("tachyon dp: video device not bound\n");
@@ -6076,6 +6155,29 @@ static void tachyon_dp_print_device_status(struct udevice *dev)
 
 	printf("tachyon dp: dev=%s active=%u\n", dev->name,
 	       device_active(dev) ? 1 : 0);
+
+	priv = dev_get_priv(dev);
+	printf("tachyon dp: typec_source=%s typec_valid=%u orientation=%u pin=%u hpd_state=%s aux_enabled=%u aux_xfers_enabled=%u force_aux=%u\n",
+	       tachyon_dp_typec_source_name(priv->typec_source),
+	       priv->typec_valid, priv->orientation, priv->pin_assignment,
+	       tachyon_dp_hpd_state_name(priv->hpd_state),
+	       priv->aux_enabled, priv->aux_xfers_enabled,
+	       tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd"));
+	printf("tachyon dp: qmp_dp_touched=%u qmp_dp_serdes_programmed=%u qmp_dp_phy_started=%u\n",
+	       priv->qmp_dp_touched, priv->qmp_dp_serdes_programmed,
+	       priv->qmp_dp_phy_started);
+	printf("tachyon dp: dp_clks valid=%u,%u,%u,%u enabled=%u,%u,%u,%u\n",
+	       priv->dp_clk_valid[0], priv->dp_clk_valid[1],
+	       priv->dp_clk_valid[2], priv->dp_clk_valid[3],
+	       priv->dp_clk_enabled[0], priv->dp_clk_enabled[1],
+	       priv->dp_clk_enabled[2], priv->dp_clk_enabled[3]);
+	printf("tachyon dp: dpu_clks valid=%u,%u,%u,%u,%u,%u enabled=%u,%u,%u,%u,%u,%u\n",
+	       priv->dpu_clk_valid[0], priv->dpu_clk_valid[1],
+	       priv->dpu_clk_valid[2], priv->dpu_clk_valid[3],
+	       priv->dpu_clk_valid[4], priv->dpu_clk_valid[5],
+	       priv->dpu_clk_enabled[0], priv->dpu_clk_enabled[1],
+	       priv->dpu_clk_enabled[2], priv->dpu_clk_enabled[3],
+	       priv->dpu_clk_enabled[4], priv->dpu_clk_enabled[5]);
 
 	if (!device_active(dev))
 		return;
@@ -6087,6 +6189,9 @@ static void tachyon_dp_print_device_status(struct udevice *dev)
 	       uc_priv->xsize, uc_priv->ysize, uc_priv->bpix,
 	       uc_priv->format, (ulong)plat->base, (ulong)uc_priv->fb_size,
 	       uc_priv->line_length);
+
+	tachyon_dp_print_qmp_status(priv);
+	tachyon_dp_print_aux_status(priv);
 }
 
 static void tachyon_dp_print_pmic_state(void)
@@ -6099,12 +6204,13 @@ static void tachyon_dp_print_pmic_state(void)
 		return;
 	}
 
-	printf("tachyon dp: PMIC service=%u pan=%u notify=%u state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+	printf("tachyon dp: PMIC service=%u pan=%u notify=%u state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u force_aux=%u\n",
 	       state->service_started, state->pan_enabled,
 	       state->notify_seen, state->typec_state, state->svid,
 	       state->orientation_raw, state->mux, state->dpam_raw,
 	       state->linux_mux_mode, state->dp_pin_assignment,
-	       state->hpd, state->hpd_irq);
+	       state->hpd, state->hpd_irq,
+	       tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd"));
 }
 
 int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
