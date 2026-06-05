@@ -5463,38 +5463,36 @@ static int tachyon_dp_probe(struct udevice *dev)
 				    ci, priv->dp_clk_valid[ci]);
 	}
 
-	/* Resolve Type-C state strictly from PMIC-GLINK DP Alt Mode. */
-	ret = tachyon_dp_read_altmode(priv);
-	if (!ret) {
-		while (!ret && timeout > 0) {
-			mdelay(100);
-			timeout--;
-			ret = tachyon_dp_read_altmode(priv);
+	/*
+	 * Start the PMIC-GLINK altmode service early, but do not require the
+	 * first notification to be DP-active. Qualcomm policy firmware can
+	 * legitimately report SAFE before later reporting DP.
+	 */
+	ret = qcom_pmic_glink_altmode_start();
+	if (ret) {
+		log_warning("DP PMIC-GLINK altmode service start failed: %d\n",
+			    ret);
+		goto err_quiesce;
+	}
+
+	qcom_pmic_glink_altmode_poll(NULL, 100);
+	altmode_ret = tachyon_dp_read_altmode(priv);
+	if (altmode_ret > 0) {
+		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
+		priv->typec_valid = true;
+		if (!tachyon_dp_typec_state_valid(priv)) {
+			log_warning("DP Type-C Alt Mode invalid: orientation=%u pin=%u\n",
+				    priv->orientation, priv->pin_assignment);
+			priv->typec_valid = false;
+			priv->typec_source = TACHYON_DP_TYPEC_SOURCE_NONE;
+			ret = -EINVAL;
+			goto err_quiesce;
 		}
-	}
-
-	altmode_ret = ret;
-
-	if (altmode_ret <= 0) {
-		log_warning("DP Type-C Alt Mode unavailable: ret=%d; refusing to guess orientation/pin assignment\n",
+		tachyon_dp_log_typec_resolved(priv);
+	} else {
+		log_warning("DP Type-C Alt Mode not active yet: ret=%d; continuing DP init while PMIC service polls\n",
 			    altmode_ret);
-		ret = altmode_ret < 0 ? altmode_ret : -ENODEV;
-		goto err_quiesce;
 	}
-
-	priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
-	priv->typec_valid = true;
-
-	if (!tachyon_dp_typec_state_valid(priv)) {
-		log_warning("DP Type-C Alt Mode invalid: orientation=%u pin=%u\n",
-			    priv->orientation, priv->pin_assignment);
-		priv->typec_valid = false;
-		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_NONE;
-		ret = -EINVAL;
-		goto err_quiesce;
-	}
-
-	tachyon_dp_log_typec_resolved(priv);
 
 	ret = tachyon_dp_request_sbu_mux(priv);
 	if (ret)
@@ -5503,6 +5501,39 @@ static int tachyon_dp_probe(struct udevice *dev)
 	has_sbu_mux = dm_gpio_is_valid(&priv->sbu_enable) &&
 		      dm_gpio_is_valid(&priv->sbu_select);
 	log_warning("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
+
+	if (!priv->typec_valid) {
+		timeout = 50;
+		while (!priv->typec_valid && timeout > 0) {
+			qcom_pmic_glink_altmode_poll(NULL, 100);
+			altmode_ret = tachyon_dp_read_altmode(priv);
+			if (altmode_ret > 0) {
+				priv->typec_source =
+					TACHYON_DP_TYPEC_SOURCE_ALTMODE;
+				priv->typec_valid = true;
+				if (!tachyon_dp_typec_state_valid(priv)) {
+					log_warning("DP Type-C Alt Mode invalid after poll: orientation=%u pin=%u\n",
+						    priv->orientation,
+						    priv->pin_assignment);
+					priv->typec_valid = false;
+					priv->typec_source =
+						TACHYON_DP_TYPEC_SOURCE_NONE;
+					ret = -EINVAL;
+					goto err_quiesce;
+				}
+				tachyon_dp_log_typec_resolved(priv);
+				break;
+			}
+			timeout--;
+		}
+	}
+
+	if (!priv->typec_valid) {
+		log_warning("DP Type-C Alt Mode did not become active before AUX: ret=%d\n",
+			    altmode_ret);
+		ret = altmode_ret < 0 ? altmode_ret : -ENODEV;
+		goto err_quiesce;
+	}
 
 	tachyon_dp_program_sbu_mux(priv);
 
