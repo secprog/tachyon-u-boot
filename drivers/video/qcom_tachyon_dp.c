@@ -2574,6 +2574,10 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	return 0;
 }
 
+static void tachyon_dp_aux_clear_hw_interrupts(struct tachyon_dp_priv *priv);
+static void tachyon_dp_aux_log_first_failure(struct tachyon_dp_priv *priv,
+					     const u8 *hdr, u32 intr);
+
 static u32 tachyon_dp_aux_get_irq(struct tachyon_dp_priv *priv)
 {
 	u32 intr, ack;
@@ -2687,6 +2691,24 @@ static void tachyon_dp_aux_clear_hw_interrupts(struct tachyon_dp_priv *priv)
 	writel(0x1f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
 	writel(0x9f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
 	writel(0x00, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+}
+
+/*
+ * Dump the AUX command header and the relevant DP/PHY register state once, on
+ * the first AUX failure of a session.  Callers gate this on a first_failure
+ * check so the full state is captured without spamming every retry.
+ */
+static void tachyon_dp_aux_log_first_failure(struct tachyon_dp_priv *priv,
+					     const u8 *hdr, u32 intr)
+{
+	log_warning("AUX first-failure: hdr=%02x %02x %02x %02x intr=%08x decoded=%d ctrl=%08x status=%08x trans=%08x phy_intr=%08x dp_intr=%08x\n",
+		    hdr[0], hdr[1], hdr[2], hdr[3], intr,
+		    tachyon_dp_aux_decode_intr(intr),
+		    readl(priv->aux + REG_DP_AUX_CTRL),
+		    readl(priv->aux + REG_DP_AUX_STATUS),
+		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
+		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS),
+		    readl(priv->ctrl + REG_DP_INTR_STATUS));
 }
 
 static void tachyon_dp_aux_reset_linux(struct tachyon_dp_priv *priv)

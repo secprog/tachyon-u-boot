@@ -82,6 +82,7 @@
 #define UCSI_BUFFER_SIZE			48
 #define USBC_READ_BUFFER_SIZE			32
 #define UCSI_CMD_PPM_RESET			1
+#define UCSI_CMD_CONNECTOR_RESET		3
 #define UCSI_CMD_ACK_CC_CI			4
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
 #define UCSI_CMD_GET_CAPABILITY			6
@@ -646,7 +647,7 @@ static int qpg_tx(struct qpg *pg, const void *hdr, size_t hlen,
 	if (next >= pg->tx_len)
 		next %= pg->tx_len;
 
-	log_warning("pmic-glink: TX hlen=%zu dlen=%zu aligned=%zu head=%u next=%u avail=%zu\n",
+	log_debug("pmic-glink: TX hlen=%zu dlen=%zu aligned=%zu head=%u next=%u avail=%zu\n",
 		    hlen, dlen, len, head, next, avail);
 
 	if (len > pg->tx_len || avail < len)
@@ -783,7 +784,7 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 		.liid = cpu_to_le32(liid),
 	};
 
-	log_warning("pmic-glink: send RX_DONE cid=%u liid=%u\n", cid, liid);
+	log_debug("pmic-glink: send RX_DONE cid=%u liid=%u\n", cid, liid);
 
 	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
 }
@@ -824,10 +825,10 @@ static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 	hdr.chunk_size = cpu_to_le32(len);
 	hdr.left_size = 0;
 
-	log_warning("pmic-glink: send data begin lcid=%u len=%zu riid=%u\n",
+	log_debug("pmic-glink: send data begin lcid=%u len=%zu riid=%u\n",
 		    lcid, len, riid);
 	ret = qpg_tx(pg, &hdr, sizeof(hdr), data, len);
-	log_warning("pmic-glink: send data end ret=%d\n", ret);
+	log_debug("pmic-glink: send data end ret=%d\n", ret);
 
 	return ret;
 }
@@ -1079,7 +1080,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 	opcode = raw_opcode & 0xff;
 	svid = raw_opcode >> 16;
 
-	log_warning("pmic-glink: PMIC msg owner=%u type=%u opcode=%02x raw_opcode=%08x svid=%04x len=%zu\n",
+	log_debug("pmic-glink: PMIC msg owner=%u type=%u opcode=%02x raw_opcode=%08x svid=%04x len=%zu\n",
 		    owner, type, opcode, raw_opcode, svid, len);
 
 	if (owner == PMIC_GLINK_OWNER_USB_TYPE_C) {
@@ -1217,7 +1218,7 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 	cid = le16_to_cpu(hdr.msg.param1);
 	chunk_size = le32_to_cpu(hdr.chunk_size);
 	liid = le32_to_cpu(hdr.msg.param2);
-	log_warning("pmic-glink: RX data header cmd=%u lcid=%u liid=%u chunk=%u left=%u avail=%zu payload_len=%u\n",
+	log_debug("pmic-glink: RX data header cmd=%u lcid=%u liid=%u chunk=%u left=%u avail=%zu payload_len=%u\n",
 		    le16_to_cpu(hdr.msg.cmd),
 		    cid,
 		    liid, chunk_size, le32_to_cpu(hdr.left_size),
@@ -1422,12 +1423,12 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	raw_len = min_t(size_t, avail, sizeof(raw));
 	qpg_rx_peek(pg, raw, 0, raw_len);
 	if (avail >= 8)
-		log_warning("pmic-glink: RX raw off=%u avail=%zu h0=%08x h1=%08x\n",
+		log_debug("pmic-glink: RX raw off=%u avail=%zu h0=%08x h1=%08x\n",
 				tail, avail,
 				le32_to_cpu(raw[0]),
 				le32_to_cpu(raw[1]));
 	else
-		log_warning("pmic-glink: RX raw off=%u avail=%zu too short\n",
+		log_debug("pmic-glink: RX raw off=%u avail=%zu too short\n",
 				tail, avail);
 
 	qpg_rx_peek(pg, &msg, 0, sizeof(msg));
@@ -1440,9 +1441,9 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	if (ret)
 		return ret;
 
-	log_warning("pmic-glink: RX cmd=%u param1=%u param2=%u avail=%zu\n",
+	log_debug("pmic-glink: RX cmd=%u param1=%u param2=%u avail=%zu\n",
 		    cmd, param1, param2, avail);
-	log_warning("pmic-glink: RX header cmd=%u param1=%u param2=%u header_len=%zu payload_len=%zu avail=%zu\n",
+	log_debug("pmic-glink: RX header cmd=%u param1=%u param2=%u header_len=%zu payload_len=%zu avail=%zu\n",
 		    cmd, param1, param2, header_len, payload_len, avail);
 
 	switch (cmd) {
@@ -1520,7 +1521,7 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	}
 
 	if (!ret)
-		log_warning("pmic-glink: RX handled cmd=%u rcid=%u done\n",
+		log_debug("pmic-glink: RX handled cmd=%u rcid=%u done\n",
 			    cmd, pg->rcid);
 
 	return ret;
@@ -1638,12 +1639,12 @@ static int qpg_wait_riid(struct qpg *pg)
 	struct qcom_pmic_glink_altmode altmode = {};
 	int ret;
 
-	log_warning("pmic-glink: wait RIID begin riid_avail=%d riid=%u riid_size=%u\n",
+	log_debug("pmic-glink: wait RIID begin riid_avail=%d riid=%u riid_size=%u\n",
 		    pg->riid_avail, pg->riid, pg->riid_size);
 
 	ret = qpg_drain_until(pg, &altmode, qpg_done_riid, 500);
 
-	log_warning("pmic-glink: wait RIID end ret=%d riid_avail=%d riid=%u riid_size=%u\n",
+	log_debug("pmic-glink: wait RIID end ret=%d riid_avail=%d riid=%u riid_size=%u\n",
 		    ret, pg->riid_avail, pg->riid, pg->riid_size);
 
 	return ret;
@@ -2305,6 +2306,63 @@ static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
 	return ret;
 }
 
+/*
+ * UCSI CONNECTOR_RESET (command 0x03).  The control word byte 2 holds the
+ * connector number in bits[0:6] and the Hard Reset flag in bit[7], i.e.
+ * d2 (bits 16-31 of the LE control u64) = (connector | hard<<7).
+ *
+ * On this platform the Type-C/PD policy engine and the DisplayPort Enter_Mode
+ * VDM run autonomously on the ADSP; there is no AP "enter DP" opcode.  A
+ * connector reset is the one AP-driven lever that forces the partner to
+ * re-attach so the ADSP re-runs PD negotiation + alt-mode discovery + DP
+ * Enter_Mode, this time with PAN notifications enabled and ACKed.
+ */
+static int qpg_send_ucsi_connector_reset(struct qpg *pg, u8 port, bool hard)
+{
+	u16 d2 = (u16)((port + 1) & 0x7f) | (hard ? 0x80 : 0);
+	u64 control = UCSI_CTRL_D2(UCSI_CMD_CONNECTOR_RESET, d2);
+	u32 old_cci = qpg_ucsi_cci(pg);
+	int ret;
+
+	log_warning("pmic-glink: UCSI CONNECTOR_RESET connector=%u hard=%d\n",
+		    port + 1, hard);
+
+	pg->ucsi_notify_seen = false;
+	pg->ucsi_notification = 0;
+
+	ret = qpg_ucsi_send_control(pg, control);
+	if (ret)
+		return ret;
+
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
+	log_warning("pmic-glink: UCSI CONNECTOR_RESET cci ret=%d cci=%08x\n",
+		    ret, qpg_ucsi_cci(pg));
+	if (ret)
+		return ret;
+
+	return qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
+}
+
+/*
+ * Service a pending UCSI connector-change notification by reading connector
+ * status (which ACKs the change via ACK_CC_CI).  If the AP never drains and
+ * ACKs connector-changes the PPM stays busy with the change pending and the
+ * ADSP can stop emitting further alt-mode (DP) updates, so this must run
+ * whenever we are waiting for DP to come up.  Returns true if serviced.
+ */
+static bool qpg_service_ucsi_change(struct qpg *pg)
+{
+	if (!pg->ucsi_notify_seen)
+		return false;
+
+	pg->ucsi_notify_seen = false;
+	log_warning("pmic-glink: UCSI connector-change cci=%08x; reading status\n",
+		    pg->ucsi_notification);
+	qpg_send_ucsi_get_connector_status(pg, 0);
+
+	return true;
+}
+
 static int qpg_enable_ucsi_notifications_phase2(struct qpg *pg)
 {
 	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase2 mask=%04x\n",
@@ -2809,6 +2867,9 @@ static int do_qpg_service(struct cmd_tbl *cmdtp, int flag, int argc,
 		if (ret && ret != -ETIMEDOUT)
 			break;
 
+		/* Keep the PPM unstuck so the ADSP keeps emitting updates. */
+		qpg_service_ucsi_change(&qpg_session);
+
 		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
 			last_notify_ms = state.last_notify_ms;
 			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
@@ -2830,6 +2891,85 @@ static int do_qpg_service(struct cmd_tbl *cmdtp, int flag, int argc,
 		printf("qpg: service timeout after %u ms\n", timeout_ms);
 
 	return ret && ret != -ETIMEDOUT ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
+static int do_qpg_reset(struct cmd_tbl *cmdtp, int flag, int argc,
+			char *const argv[])
+{
+	struct qcom_pmic_glink_altmode_state state = {};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	ulong start;
+	ulong last_notify_ms = 0;
+	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
+	bool hard = false;
+	int ret;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2) {
+		if (!strcmp(argv[1], "hard"))
+			hard = true;
+		else
+			return CMD_RET_USAGE;
+	}
+
+	printf("qpg: reset start hard=%d\n", hard);
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	qpg_cached_state.service_started = !ret;
+	qpg_cached_state.pan_enabled = !ret;
+	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
+	printf("qpg: GLINK open ret=%d\n", open_ret);
+	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
+	printf("qpg: PAN_EN ret=%d\n", pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	/* Snapshot connector state before the reset. */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, hard);
+	printf("qpg: CONNECTOR_RESET ret=%d hard=%d\n", ret, hard);
+
+	/*
+	 * After the reset the partner re-attaches and the ADSP re-runs PD
+	 * negotiation + alt-mode discovery + DP Enter_Mode.  Drain and ACK
+	 * altmode notifications while servicing UCSI connector-changes, and
+	 * watch for a DP notify (mux=DP/dpam=pin/hpd=1).
+	 */
+	start = get_timer(0);
+	while (get_timer(start) < timeout_ms) {
+		ret = qcom_pmic_glink_altmode_poll(&state, 20);
+		if (ret && ret != -ETIMEDOUT)
+			break;
+
+		qpg_service_ucsi_change(&qpg_session);
+
+		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
+			last_notify_ms = state.last_notify_ms;
+			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+			       get_timer(start),
+			       qpg_public_typec_state_name(state.typec_state),
+			       state.svid, state.orientation_raw, state.mux,
+			       state.dpam_raw, state.linux_mux_mode,
+			       state.dp_pin_assignment, state.hpd,
+			       state.hpd_irq);
+			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
+			       get_timer(start), state.port, state.orientation,
+			       state.pin_assignment, state.dp_seen);
+		}
+	}
+
+	/* Final connector + alt-mode snapshot. */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+	qpg_send_ucsi_get_current_cam(&qpg_session, 0);
+
+	printf("qpg: reset done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
+	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
+
+	return CMD_RET_SUCCESS;
 }
 
 static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
@@ -2904,6 +3044,8 @@ static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 {
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "service"))
 		return do_qpg_service(cmdtp, flag, argc - 1, argv + 1);
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "reset"))
+		return do_qpg_reset(cmdtp, flag, argc - 1, argv + 1);
 	if (argc == 2 && !strcmp(argv[1], "ucsi"))
 		return do_qpg_ucsi(cmdtp, flag, argc - 1, argv + 1);
 
@@ -2914,5 +3056,6 @@ U_BOOT_CMD(
 	qpg, 3, 1, do_qpg,
 	"Qualcomm PMIC-GLINK diagnostics",
 	"service [timeout_ms] - keep PMIC-GLINK altmode service alive and print notifications\n"
+	"reset [hard] - UCSI connector reset to force re-attach + DP alt-mode re-entry\n"
 	"ucsi - run UCSI reset/discovery diagnostics"
 );
