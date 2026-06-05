@@ -5921,8 +5921,13 @@ static int tachyon_dp_find_device(struct udevice **devp, bool probe)
 			printf("tachyon dp: node=%s bind ret=%d dev=%s\n",
 			       ofnode_get_name(node), ret,
 			       *devp ? (*devp)->name : "(none)");
-			if (!ret && *devp)
+			if (!ret && *devp) {
+				printf("tachyon dp: direct probe dev=%s flags=%lx drv_flags=%lx\n",
+				       (*devp)->name,
+				       (ulong)dev_get_flags(*devp),
+				       (ulong)(*devp)->driver->flags);
 				ret = device_probe(*devp);
+			}
 		}
 
 		printf("tachyon dp: node=%s probe=%u ret=%d dev=%s\n",
@@ -6037,5 +6042,6 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.ops		= &tachyon_dp_ops,
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
-	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE,
+	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE |
+			  DM_FLAG_DEFAULT_PD_CTRL_OFF,
 };
