@@ -10,6 +10,7 @@
 #define LOG_CATEGORY UCLASS_VIDEO
 
 #include <asm/gpio.h>
+#include <asm/global_data.h>
 #include <asm/io.h>
 #include <clk.h>
 #include <command.h>
@@ -34,6 +35,8 @@
 #include <mapmem.h>
 #include <soc/qcom/pmic_glink.h>
 #include <video.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 #define TACHYON_DP_DEFAULT_XRES		1920
 #define TACHYON_DP_DEFAULT_YRES		1080
@@ -5864,6 +5867,24 @@ static int tachyon_dp_bind(struct udevice *dev)
 
 	plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
 	plat->align = TACHYON_DP_FB_ALIGN;
+
+#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
+	if ((gd->flags & GD_FLG_RELOC) && tachyon_dp_manual_probe_armed &&
+	    !plat->base) {
+		void *fb;
+
+		fb = memalign(plat->align, plat->size);
+		if (!fb) {
+			log_warning("DP manual framebuffer alloc failed size=%u align=%u\n",
+				    plat->size, plat->align);
+			return -ENOMEM;
+		}
+
+		plat->base = (ulong)fb;
+		log_warning("DP manual framebuffer base=%lx size=%u align=%u\n",
+			    plat->base, plat->size, plat->align);
+	}
+#endif
 
 	return 0;
 }
