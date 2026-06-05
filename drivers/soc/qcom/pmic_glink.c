@@ -845,6 +845,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 {
 	const struct qpg_usbc_notify *notify = data;
 	enum qcom_pmic_glink_orientation orientation;
+	u8 linux_mode;
 	u8 mode;
 	u8 port;
 	u16 svid;
@@ -899,23 +900,24 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	altmode->hpd_irq = pg->notify.hpd_irq;
 	pg->altmode_notify_seen = true;
 	mode = pg->notify.dpam;
+	linux_mode = mode - DPAM_HPD_A;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    notify->payload[1], orientation);
-	if (mode < DPAM_HPD_A) {
+	if (linux_mode == 0xff) {
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
 		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
 		qpg_update_cached_state(pg, altmode, QPG_TYPEC_SAFE);
-		log_warning("pmic-glink: DP notify safe/no-DP mux=%u dpam=%u\n",
-			    notify->payload[2], mode);
+		log_warning("pmic-glink: DP notify safe/no-DP mux=%u raw_dpam=%u linux_mode=%u\n",
+			    notify->payload[2], mode, linux_mode);
 		return true;
 	}
 
 	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u pin_assignment=%u\n",
-		    mode, mode - DPAM_HPD_A, mode - DPAM_HPD_A);
+		    mode, linux_mode, linux_mode);
 
-	altmode->pin_assignment = mode - DPAM_HPD_A;
+	altmode->pin_assignment = linux_mode;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
@@ -937,6 +939,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	u8 mux;
 	u8 raw_orientation;
 	u8 port;
+	u16 svid;
 
 	log_warning("pmic-glink: SC8180X notify len=%zu expected=%zu\n",
 		    len, sizeof(*msg));
@@ -950,6 +953,7 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	raw_orientation = (notification & SC8180X_ORIENTATION_MASK) >> 8;
 	mux = (notification & SC8180X_MUX_MASK) >> 16;
 	mode = (notification & SC8180X_MODE_MASK) >> 24;
+	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
 	log_warning("pmic-glink: SC8180X notification=%08x port=%u orientation=%u mux=%u mode=%u hpd=%u irq=%u\n",
 		    notification, port, raw_orientation, mux, mode,
 		    !!(notification & SC8180X_HPD_STATE_MASK),
@@ -960,12 +964,12 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	pg->notify.raw_orientation = raw_orientation;
 	pg->notify.orientation = orientation;
 	pg->notify.mux = mux;
-	pg->notify.svid = USB_TYPEC_DP_SID;
+	pg->notify.svid = svid;
 	pg->notify.dpam = mode;
 	pg->notify.hpd = !!(notification & SC8180X_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
 	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x hpd=%u irq=%u\n",
-		    le32_to_cpu(msg->hdr.opcode), USB_TYPEC_DP_SID, port,
+		    le32_to_cpu(msg->hdr.opcode), svid, port,
 		    pg->notify.raw_orientation, orientation, pg->notify.mux,
 		    pg->notify.dpam, pg->notify.hpd, pg->notify.hpd_irq);
 
@@ -976,7 +980,18 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	pg->altmode_notify_seen = true;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    raw_orientation, orientation);
-	if (mux != 2 || mode < DPAM_HPD_A) {
+	if (svid != USB_TYPEC_DP_SID) {
+		altmode->dp = false;
+		altmode->pin_assignment = 0;
+		pg->altmode_no_dp = true;
+		qpg_apply_typec_state(orientation, QPG_TYPEC_USB, 0);
+		qpg_update_cached_state(pg, altmode, QPG_TYPEC_USB);
+		log_warning("pmic-glink: SC8180X notify USB/no-DP mux=%u mode=%u\n",
+			    mux, mode);
+		return true;
+	}
+
+	if (mode == 0xff) {
 		altmode->dp = false;
 		altmode->pin_assignment = 0;
 		pg->altmode_no_dp = true;
@@ -987,10 +1002,10 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		return true;
 	}
 
-	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u pin_assignment=%u\n",
-		    mode, mode - DPAM_HPD_A, mode - DPAM_HPD_A);
+	log_warning("pmic-glink: SC8180X DP active linux_mode=%u pin_assignment=%u\n",
+		    mode, mode);
 
-	altmode->pin_assignment = mode - DPAM_HPD_A;
+	altmode->pin_assignment = mode;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
