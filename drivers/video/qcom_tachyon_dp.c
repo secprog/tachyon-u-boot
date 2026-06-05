@@ -2574,14 +2574,6 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	return 0;
 }
 
-static void tachyon_dp_aux_clear_hw_interrupts(struct tachyon_dp_priv *priv)
-{
-	readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS);
-	writel(0x1f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
-	writel(0x9f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
-	writel(0x00, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
-}
-
 static u32 tachyon_dp_aux_get_irq(struct tachyon_dp_priv *priv)
 {
 	u32 intr, ack;
@@ -2963,6 +2955,12 @@ static int tachyon_dp_aux_retry_mot(struct tachyon_dp_priv *priv, bool i2c,
 			if (++n_defer >= 7)
 				break;
 			udelay(8000);
+		} else if (ret == -ETIMEDOUT || ret == -EIO ||
+			   ret == -EREMOTEIO) {
+			n_defer = 0;
+			tachyon_dp_aux_reset_linux(priv);
+			tachyon_dp_aux_hw_init(priv);
+			udelay(4000);
 		} else {
 			n_defer = 0;
 			udelay(4000);
