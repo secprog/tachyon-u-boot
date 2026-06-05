@@ -230,6 +230,8 @@ struct qpg_notify_debug {
 	u8 mux;
 	u16 svid;
 	u8 dpam;
+	u8 linux_mux_mode;
+	u8 dp_pin_assignment;
 	bool hpd;
 	bool hpd_irq;
 };
@@ -429,17 +431,22 @@ static void qpg_update_cached_state(struct qpg *pg,
 	qpg_cached_state.orientation = altmode->orientation;
 	qpg_cached_state.mux = pg->notify.mux;
 	qpg_cached_state.dpam_raw = pg->notify.dpam;
+	qpg_cached_state.linux_mux_mode = pg->notify.linux_mux_mode;
+	qpg_cached_state.dp_pin_assignment = pg->notify.dp_pin_assignment;
 	qpg_cached_state.pin_assignment = altmode->pin_assignment;
 	qpg_cached_state.svid = pg->notify.svid;
 	qpg_cached_state.typec_state = qpg_public_typec_state(state);
 	qpg_cached_state.last_notify_ms = get_timer(0);
 
-	log_warning("qpg: service started=%u pan=%u notify_seen=%u dp_seen=%u hpd=%u age_ms=%lu\n",
+	log_warning("qpg: service started=%u pan=%u notify_seen=%u dp_seen=%u hpd=%u raw_dpam=%u linux_mode=%u dp_pin=%u age_ms=%lu\n",
 		    qpg_cached_state.service_started,
 		    qpg_cached_state.pan_enabled,
 		    qpg_cached_state.notify_seen,
 		    qpg_cached_state.dp_seen,
 		    qpg_cached_state.hpd,
+		    qpg_cached_state.dpam_raw,
+		    qpg_cached_state.linux_mux_mode,
+		    qpg_cached_state.dp_pin_assignment,
 		    get_timer(qpg_cached_state.last_notify_ms));
 }
 
@@ -874,12 +881,16 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	pg->notify.mux = notify->payload[2];
 	pg->notify.svid = svid;
 	pg->notify.dpam = notify->payload[8] & SC8280XP_DPAM_MASK;
+	pg->notify.linux_mux_mode = pg->notify.dpam - DPAM_HPD_A;
+	pg->notify.dp_pin_assignment = 0;
 	pg->notify.hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x hpd=%u irq=%u\n",
+	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    le32_to_cpu(notify->hdr.opcode), svid, port,
 		    pg->notify.raw_orientation, orientation, pg->notify.mux,
-		    pg->notify.dpam, pg->notify.hpd, pg->notify.hpd_irq);
+		    pg->notify.dpam, pg->notify.linux_mux_mode,
+		    pg->notify.dp_pin_assignment, pg->notify.hpd,
+		    pg->notify.hpd_irq);
 
 	if (svid != USB_TYPEC_DP_SID) {
 		altmode->port = port;
@@ -900,7 +911,7 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	altmode->hpd_irq = pg->notify.hpd_irq;
 	pg->altmode_notify_seen = true;
 	mode = pg->notify.dpam;
-	linux_mode = mode - DPAM_HPD_A;
+	linux_mode = pg->notify.linux_mux_mode;
 	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
 		    notify->payload[1], orientation);
 	if (linux_mode == 0xff) {
@@ -914,10 +925,11 @@ static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		return true;
 	}
 
-	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u pin_assignment=%u\n",
-		    mode, linux_mode, linux_mode);
+	pg->notify.dp_pin_assignment = linux_mode;
+	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u dp_pin_assignment=%u\n",
+		    mode, linux_mode, pg->notify.dp_pin_assignment);
 
-	altmode->pin_assignment = linux_mode;
+	altmode->pin_assignment = pg->notify.dp_pin_assignment;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
@@ -966,12 +978,16 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	pg->notify.mux = mux;
 	pg->notify.svid = svid;
 	pg->notify.dpam = mode;
+	pg->notify.linux_mux_mode = mode;
+	pg->notify.dp_pin_assignment = 0;
 	pg->notify.hpd = !!(notification & SC8180X_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x hpd=%u irq=%u\n",
+	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    le32_to_cpu(msg->hdr.opcode), svid, port,
 		    pg->notify.raw_orientation, orientation, pg->notify.mux,
-		    pg->notify.dpam, pg->notify.hpd, pg->notify.hpd_irq);
+		    pg->notify.dpam, pg->notify.linux_mux_mode,
+		    pg->notify.dp_pin_assignment, pg->notify.hpd,
+		    pg->notify.hpd_irq);
 
 	altmode->port = port;
 	altmode->orientation = orientation;
@@ -1002,10 +1018,11 @@ static bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		return true;
 	}
 
-	log_warning("pmic-glink: SC8180X DP active linux_mode=%u pin_assignment=%u\n",
-		    mode, mode);
+	pg->notify.dp_pin_assignment = mode;
+	log_warning("pmic-glink: SC8180X DP active linux_mode=%u dp_pin_assignment=%u\n",
+		    mode, pg->notify.dp_pin_assignment);
 
-	altmode->pin_assignment = mode;
+	altmode->pin_assignment = pg->notify.dp_pin_assignment;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
@@ -1659,6 +1676,7 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	u16 svid_le = get_unaligned_le16(pin + 6);
 	u16 svid_be = ((u16)pin[6] << 8) | pin[7];
 	u8 mode = pin[8] & SC8280XP_DPAM_MASK;
+	u8 linux_mode = mode - DPAM_HPD_A;
 	bool hpd = !!(pin[8] & SC8280XP_HPD_STATE_MASK);
 	bool hpd_irq = !!(pin[8] & SC8280XP_HPD_IRQ_MASK);
 	bool dp_svid = svid_le == USB_TYPEC_DP_SID ||
@@ -1671,10 +1689,11 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid_le=%04x svid_be=%04x svid_raw=%02x%02x dpam=%02x hpd=%u irq=%u\n",
 		    source, port, raw_orientation, orientation, mux, vid,
 		    svid_le, svid_be, pin[6], pin[7], mode, hpd, hpd_irq);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x hpd=%u irq=%u\n",
+	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    (u32)(dp_svid ? USB_TYPEC_DP_SID : svid_le) << 16,
 		    dp_svid ? USB_TYPEC_DP_SID : svid_le, port,
-		    raw_orientation, orientation, mux, mode, hpd, hpd_irq);
+		    raw_orientation, orientation, mux, mode, linux_mode, 0,
+		    hpd, hpd_irq);
 
 	pg->notify.seen = true;
 	pg->notify.port = port;
@@ -1683,6 +1702,8 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	pg->notify.mux = mux;
 	pg->notify.svid = dp_svid ? USB_TYPEC_DP_SID : svid_le;
 	pg->notify.dpam = mode;
+	pg->notify.linux_mux_mode = linux_mode;
+	pg->notify.dp_pin_assignment = 0;
 	pg->notify.hpd = hpd;
 	pg->notify.hpd_irq = hpd_irq;
 
@@ -1707,15 +1728,15 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 		return;
 	}
 
-	altmode->pin_assignment = mode - DPAM_HPD_A;
+	pg->notify.dp_pin_assignment = linux_mode;
+	altmode->pin_assignment = pg->notify.dp_pin_assignment;
 	altmode->dp = true;
 	pg->altmode_no_dp = false;
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
 			      altmode->pin_assignment);
 	qpg_update_cached_state(pg, altmode, QPG_TYPEC_DP);
-	log_warning("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u pin_assignment=%u\n",
-		    source, mode, mode - DPAM_HPD_A,
-		    altmode->pin_assignment);
+	log_warning("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u dp_pin_assignment=%u\n",
+		    source, mode, linux_mode, altmode->pin_assignment);
 }
 
 static void qpg_log_usbc_read(struct qpg *pg,
@@ -2790,11 +2811,13 @@ static int do_qpg_service(struct cmd_tbl *cmdtp, int flag, int argc,
 
 		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
 			last_notify_ms = state.last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x hpd=%u irq=%u\n",
+			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 			       get_timer(start),
 			       qpg_public_typec_state_name(state.typec_state),
 			       state.svid, state.orientation_raw, state.mux,
-			       state.dpam_raw, state.hpd, state.hpd_irq);
+			       state.dpam_raw, state.linux_mux_mode,
+			       state.dp_pin_assignment, state.hpd,
+			       state.hpd_irq);
 			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
 			       get_timer(start), state.port, state.orientation,
 			       state.pin_assignment, state.dp_seen);

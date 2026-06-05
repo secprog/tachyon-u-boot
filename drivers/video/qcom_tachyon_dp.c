@@ -5402,7 +5402,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
 	u32 width, height;
-	int ret, altmode_ret, timeout = 50;
+	int ret, altmode_ret;
 	bool has_sbu_mux;
 
 	log_warning("DP probe start\n");
@@ -5503,36 +5503,38 @@ static int tachyon_dp_probe(struct udevice *dev)
 	log_warning("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
 
 	if (!priv->typec_valid) {
-		timeout = 50;
-		while (!priv->typec_valid && timeout > 0) {
-			qcom_pmic_glink_altmode_poll(NULL, 100);
-			altmode_ret = tachyon_dp_read_altmode(priv);
-			if (altmode_ret > 0) {
-				priv->typec_source =
-					TACHYON_DP_TYPEC_SOURCE_ALTMODE;
-				priv->typec_valid = true;
-				if (!tachyon_dp_typec_state_valid(priv)) {
-					log_warning("DP Type-C Alt Mode invalid after poll: orientation=%u pin=%u\n",
-						    priv->orientation,
-						    priv->pin_assignment);
-					priv->typec_valid = false;
-					priv->typec_source =
-						TACHYON_DP_TYPEC_SOURCE_NONE;
-					ret = -EINVAL;
-					goto err_quiesce;
-				}
-				tachyon_dp_log_typec_resolved(priv);
-				break;
-			}
-			timeout--;
-		}
-	}
+		const struct qcom_pmic_glink_altmode_state *state;
 
-	if (!priv->typec_valid) {
-		log_warning("DP Type-C Alt Mode did not become active before AUX: ret=%d\n",
-			    altmode_ret);
-		ret = altmode_ret < 0 ? altmode_ret : -ENODEV;
-		goto err_quiesce;
+		state = qcom_pmic_glink_altmode_get_state();
+
+		log_warning("DP Type-C Alt Mode not active before AUX; continuing with PMIC state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x hpd=%u\n",
+			    state ? state->typec_state : 0,
+			    state ? state->svid : 0,
+			    state ? state->orientation_raw : 0xff,
+			    state ? state->mux : 0xff,
+			    state ? state->dpam_raw : 0xff,
+			    state ? state->hpd : 0);
+
+		/*
+		 * Diagnostic fallback:
+		 * Linux proves this connector ultimately works through
+		 * aux_hpd_bridge. Do not abort before AUX. Pick a forced
+		 * orientation for testing.
+		 */
+		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
+		priv->typec_valid = true;
+
+		if (tachyon_dp_env_bool("tachyon_dp_force_reverse"))
+			priv->orientation = TACHYON_DP_ORIENTATION_REVERSE;
+		else
+			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+
+		/*
+		 * Use D = USB3 + DP / 2-lane as first default because Linux
+		 * showed rate=540000 and num_lanes=2.
+		 */
+		priv->pin_assignment = 3;
+		tachyon_dp_log_typec_resolved(priv);
 	}
 
 	tachyon_dp_program_sbu_mux(priv);

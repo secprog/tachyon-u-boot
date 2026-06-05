@@ -44,6 +44,8 @@ struct qcom_pmic_glink_altmode_state {
 	u8 orientation;
 	u8 mux;
 	u8 dpam_raw;
+	u8 linux_mux_mode;
+	u8 dp_pin_assignment;
 	u8 pin_assignment;
 	u16 svid;
 
