@@ -34,26 +34,8 @@
 #include <linux/list.h>
 #include <power-domain.h>
 #include <linux/printk.h>
-#include <linux/string.h>
 
 DECLARE_GLOBAL_DATA_PTR;
-
-static bool device_probe_trace_dp(const struct udevice *dev)
-{
-	return dev && dev->name &&
-	       !strcmp(dev->name, "displayport-controller@ae90000");
-}
-
-static void device_probe_trace(struct udevice *dev, const char *stage, int ret)
-{
-	if (!device_probe_trace_dp(dev))
-		return;
-
-	log_warning("dm-probe: %s %s ret=%d flags=%lx drv_flags=%lx parent=%s\n",
-		    dev->name, stage, ret, (ulong)dev_get_flags(dev),
-		    dev->driver ? (ulong)dev->driver->flags : 0,
-		    dev->parent ? dev->parent->name : "(none)");
-}
 
 static int device_bind_common(struct udevice *parent, const struct driver *drv,
 			      const char *name, void *plat,
@@ -507,30 +489,22 @@ int device_probe(struct udevice *dev)
 	if (dev_get_flags(dev) & DM_FLAG_ACTIVATED)
 		return 0;
 
-	device_probe_trace(dev, "enter", 0);
-
 	ret = device_notify(dev, EVT_DM_PRE_PROBE);
-	if (ret) {
-		device_probe_trace(dev, "pre-notify", ret);
+	if (ret)
 		return ret;
-	}
 
 	drv = dev->driver;
 	assert(drv);
 
 	ret = device_of_to_plat(dev);
-	if (ret) {
-		device_probe_trace(dev, "of-to-plat", ret);
+	if (ret)
 		goto fail;
-	}
 
 	/* Ensure all parents are probed */
 	if (dev->parent) {
 		ret = device_probe(dev->parent);
-		if (ret) {
-			device_probe_trace(dev, "parent-probe", ret);
+		if (ret)
 			goto fail;
-		}
 
 		/*
 		 * The device might have already been probed during
@@ -548,12 +522,8 @@ int device_probe(struct udevice *dev)
 	    (device_get_uclass_id(dev) != UCLASS_POWER_DOMAIN) &&
 	    !(drv->flags & DM_FLAG_DEFAULT_PD_CTRL_OFF)) {
 		ret = dev_power_domain_on(dev);
-		if (ret) {
-			device_probe_trace(dev, "power-domain", ret);
+		if (ret)
 			goto fail;
-		}
-	} else {
-		device_probe_trace(dev, "power-domain-skip", 0);
 	}
 
 	/*
@@ -581,59 +551,44 @@ int device_probe(struct udevice *dev)
 	if (CONFIG_IS_ENABLED(IOMMU) && dev->parent &&
 	    (device_get_uclass_id(dev) != UCLASS_IOMMU)) {
 		ret = dev_iommu_enable(dev);
-		if (ret) {
-			device_probe_trace(dev, "iommu", ret);
+		if (ret)
 			goto fail;
-		}
 	}
 
 	ret = device_get_dma_constraints(dev);
-	if (ret) {
-		device_probe_trace(dev, "dma-constraints", ret);
+	if (ret)
 		goto fail;
-	}
 
 	ret = uclass_pre_probe_device(dev);
-	if (ret) {
-		device_probe_trace(dev, "uclass-pre-probe", ret);
+	if (ret)
 		goto fail;
-	}
 
 	if (dev->parent && dev->parent->driver->child_pre_probe) {
 		ret = dev->parent->driver->child_pre_probe(dev);
-		if (ret) {
-			device_probe_trace(dev, "parent-child-pre-probe", ret);
+		if (ret)
 			goto fail;
-		}
 	}
 
 	/* Only handle devices that have a valid ofnode */
-	if (dev_has_ofnode(dev)) {
+	if (dev_has_ofnode(dev) && !(drv->flags & DM_FLAG_DEFAULT_CLKS_OFF)) {
 		/*
 		 * Process 'assigned-{clocks/clock-parents/clock-rates}'
 		 * properties
 		 */
 		ret = clk_set_defaults(dev, CLK_DEFAULTS_PRE);
-		if (ret) {
-			device_probe_trace(dev, "clk-defaults-pre", ret);
+		if (ret)
 			goto fail;
-		}
 	}
 
 	if (drv->probe) {
-		device_probe_trace(dev, "driver-probe-enter", 0);
 		ret = drv->probe(dev);
-		if (ret) {
-			device_probe_trace(dev, "driver-probe", ret);
+		if (ret)
 			goto fail;
-		}
 	}
 
 	ret = uclass_post_probe_device(dev);
-	if (ret) {
-		device_probe_trace(dev, "uclass-post-probe", ret);
+	if (ret)
 		goto fail_uclass;
-	}
 
 	if (dev->parent && device_get_uclass_id(dev) == UCLASS_PINCTRL) {
 		ret = pinctrl_select_state(dev, "default");

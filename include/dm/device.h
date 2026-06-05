@@ -84,6 +84,9 @@ struct driver_info;
 /* Device must be probed after it was bound */
 #define DM_FLAG_PROBE_AFTER_BIND	(1 << 15)
 
+/* DM does not apply assigned-clock defaults corresponding to this device */
+#define DM_FLAG_DEFAULT_CLKS_OFF	(1 << 16)
+
 /*
  * One or multiple of these flags are passed to device_remove() so that
  * a selective device removal as specified by the remove-stage and the

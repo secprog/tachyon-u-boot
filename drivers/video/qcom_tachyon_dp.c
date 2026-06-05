@@ -6043,5 +6043,6 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
 	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE |
-			  DM_FLAG_DEFAULT_PD_CTRL_OFF,
+			  DM_FLAG_DEFAULT_PD_CTRL_OFF |
+			  DM_FLAG_DEFAULT_CLKS_OFF,
 };
