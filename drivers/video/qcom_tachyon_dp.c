@@ -16,6 +16,7 @@
 #include <command.h>
 #include <dm.h>
 #include <dm/device.h>
+#include <dm/device-internal.h>
 #include <dm/lists.h>
 #include <dm/read.h>
 #include <dm/ofnode.h>
@@ -5920,9 +5921,8 @@ static int tachyon_dp_find_device(struct udevice **devp, bool probe)
 			printf("tachyon dp: node=%s bind ret=%d dev=%s\n",
 			       ofnode_get_name(node), ret,
 			       *devp ? (*devp)->name : "(none)");
-			if (!ret)
-				ret = uclass_get_device_by_ofnode(UCLASS_VIDEO,
-								  node, devp);
+			if (!ret && *devp)
+				ret = device_probe(*devp);
 		}
 
 		printf("tachyon dp: node=%s probe=%u ret=%d dev=%s\n",
