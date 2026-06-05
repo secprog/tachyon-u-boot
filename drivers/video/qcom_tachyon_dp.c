@@ -90,6 +90,10 @@ DECLARE_GLOBAL_DATA_PTR;
 #define REG_DP_AUX_CTRL			0x030
 #define DP_AUX_CTRL_ENABLE		BIT(0)
 #define DP_AUX_CTRL_RESET		BIT(1)
+#define REG_DP_DP_HPD_INT_STATUS	0x04
+#define DP_DP_HPD_STATE_STATUS_MASK	0xe0000000
+#define DP_DP_HPD_STATE_STATUS_SHIFT	29
+#define DP_DP_HPD_STATE_STATUS_CONNECTED	(2 << DP_DP_HPD_STATE_STATUS_SHIFT)
 #define REG_DP_AUX_DATA			0x034
 #define DP_AUX_DATA_READ		BIT(0)
 #define DP_AUX_DATA_OFFSET		8
@@ -428,6 +432,12 @@ enum tachyon_dp_typec_source {
 	TACHYON_DP_TYPEC_SOURCE_ALTMODE,
 };
 
+enum tachyon_dp_hpd_state {
+	TACHYON_DP_HPD_UNKNOWN,
+	TACHYON_DP_HPD_DISCONNECTED,
+	TACHYON_DP_HPD_CONNECTED,
+};
+
 struct tachyon_dp_caps {
 	u8 dpcd_rev;
 	u32 max_rate;
@@ -536,6 +546,10 @@ struct tachyon_dp_priv {
 	u32 aux_defers;
 	u32 aux_errors;
 	u32 aux_retries;
+	bool aux_enabled;
+	bool aux_xfers_enabled;
+	enum tachyon_dp_hpd_state hpd_state;
+	ulong last_pmic_poll_ms;
 	struct tachyon_dp_audio_caps audio;
 	u8 last_sink_count;
 	u32 last_hpd_poll_ms;
@@ -2578,38 +2592,122 @@ static u32 tachyon_dp_aux_get_irq(struct tachyon_dp_priv *priv)
 	return intr;
 }
 
-static void tachyon_dp_aux_log_first_failure(struct tachyon_dp_priv *priv,
-					     const u8 hdr[4], u32 intr)
-{
-	log_warning("AUX first-failure detail: hdr=%02x %02x %02x %02x intr=%08x intr_raw=%08x phy_intr=%08x status=%08x trans=%08x data=%08x timeout=%08x limits=%08x PD=%02x DP_STATUS=%02x TYPEC=%02x SBU_EN=%d SBU_SEL=%d\n",
-		    hdr[0], hdr[1], hdr[2], hdr[3],
-		    intr,
-		    readl(priv->ctrl + REG_DP_INTR_STATUS),
-		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS),
-		    readl(priv->aux + REG_DP_AUX_STATUS),
-		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
-		    readl(priv->aux + REG_DP_AUX_DATA),
-		    readl(priv->aux + REG_DP_TIMEOUT_COUNT),
-		    readl(priv->aux + REG_DP_AUX_LIMITS),
-		    tachyon_dp_qmp_pd_low(priv),
-		    tachyon_dp_qmp_status_low(priv),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
-		    dm_gpio_is_valid(&priv->sbu_enable) ?
-			    dm_gpio_get_value(&priv->sbu_enable) : -1,
-		    dm_gpio_is_valid(&priv->sbu_select) ?
-			    dm_gpio_get_value(&priv->sbu_select) : -1);
-}
-
 static void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv)
 {
 	writel(DP_AUX_CTRL_RESET, priv->aux + REG_DP_AUX_CTRL);
 	udelay(1000);
 	writel(DP_AUX_CTRL_ENABLE, priv->aux + REG_DP_AUX_CTRL);
 	writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
-	tachyon_dp_aux_clear_hw_interrupts(priv);
-	tachyon_dp_aux_get_irq(priv);
 	writel(0xffff, priv->aux + REG_DP_TIMEOUT_COUNT);
 	writel(0xffff, priv->aux + REG_DP_AUX_LIMITS);
+	tachyon_dp_aux_clear_hw_interrupts(priv);
+	udelay(100);
+}
+
+static int tachyon_dp_aux_decode_intr(u32 intr)
+{
+	if (intr & DP_INTR_AUX_ERROR)
+		return -EIO;
+	if (intr & DP_INTR_WRONG_ADDR)
+		return -EREMOTEIO;
+	if (intr & DP_INTR_TIMEOUT)
+		return -ETIMEDOUT;
+	if (intr & DP_INTR_NACK_DEFER)
+		return -EAGAIN;
+	if (intr & DP_INTR_I2C_NACK)
+		return -EREMOTEIO;
+	if (intr & DP_INTR_I2C_DEFER)
+		return -EAGAIN;
+	if (intr & DP_INTR_AUX_XFER_DONE)
+		return 0;
+
+	return -EIO;
+}
+
+static bool tachyon_dp_hw_hpd_connected(struct tachyon_dp_priv *priv)
+{
+	u32 status;
+
+	status = readl(priv->aux + REG_DP_DP_HPD_INT_STATUS);
+	log_debug("DP HPD status=%08x connected=%u\n",
+		  status,
+		  !!(status & DP_DP_HPD_STATE_STATUS_CONNECTED));
+
+	return !!(status & DP_DP_HPD_STATE_STATUS_CONNECTED);
+}
+
+static int tachyon_dp_apply_pmic_typec_state(struct tachyon_dp_priv *priv,
+		                 const struct qcom_pmic_glink_altmode_state *state)
+{
+	bool force_aux = tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd");
+
+	if (!state || !state->notify_seen)
+		return -EAGAIN;
+
+	log_info("DP PMIC state: typec=%u hpd=%u hpd_irq=%u orientation=%u pin=%u mux=%u dpam=%02x\n",
+		state->typec_state, state->hpd, state->hpd_irq,
+		state->orientation, state->pin_assignment,
+		state->mux, state->dpam_raw);
+
+	switch (state->typec_state) {
+	case QPG_TYPEC_STATE_SAFE:
+		priv->hpd_state = TACHYON_DP_HPD_DISCONNECTED;
+		priv->aux_xfers_enabled = false;
+		break;
+	case QPG_TYPEC_STATE_DP:
+		if (state->orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE)
+			priv->orientation = TACHYON_DP_ORIENTATION_REVERSE;
+		else
+			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
+
+		if (tachyon_dp_valid_pin_assignment(state->pin_assignment))
+			priv->pin_assignment = state->pin_assignment;
+
+		tachyon_dp_qmp_com_orientation_update(priv);
+		tachyon_dp_program_sbu_mux(priv);
+		tachyon_dp_qmp_force_aux_on(priv);
+
+		if (state->hpd)
+			priv->hpd_state = TACHYON_DP_HPD_CONNECTED;
+		else if (priv->hpd_state == TACHYON_DP_HPD_UNKNOWN)
+			priv->hpd_state = TACHYON_DP_HPD_DISCONNECTED;
+
+		priv->aux_xfers_enabled = state->hpd || force_aux;
+		break;
+	case QPG_TYPEC_STATE_USB:
+		priv->hpd_state = TACHYON_DP_HPD_DISCONNECTED;
+		priv->aux_xfers_enabled = false;
+		break;
+	default:
+		priv->aux_xfers_enabled = force_aux;
+		break;
+	}
+
+	return 0;
+}
+
+static void tachyon_dp_aux_clear_hw_interrupts(struct tachyon_dp_priv *priv)
+{
+	readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS);
+	writel(0x1f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+	writel(0x9f, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+	writel(0x00, priv->aux + REG_DP_PHY_AUX_INTERRUPT_CLEAR);
+}
+
+static void tachyon_dp_aux_reset_linux(struct tachyon_dp_priv *priv)
+{
+	u32 ctrl = readl(priv->aux + REG_DP_AUX_CTRL);
+
+	log_warning("DP AUX reset: ctrl_before=%08x\n", ctrl);
+
+	ctrl |= DP_AUX_CTRL_RESET;
+	writel(ctrl, priv->aux + REG_DP_AUX_CTRL);
+	mdelay(1);
+
+	ctrl &= ~DP_AUX_CTRL_RESET;
+	writel(ctrl, priv->aux + REG_DP_AUX_CTRL);
+	mdelay(1);
+	log_warning("DP AUX reset: ctrl_after=%08x\n", ctrl);
 }
 
 static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
@@ -2617,7 +2715,8 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 			       size_t len)
 {
 	u8 hdr[4];
-	u32 ctrl, intr, reg, stale_intr;
+	u32 ctrl, intr, reg, stale_intr, phy_intr;
+	int decoded;
 	size_t i;
 
 	if (!len || len > 16)
@@ -2680,22 +2779,27 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 		    readl(priv->aux + REG_DP_AUX_STATUS),
 		    readl(priv->ctrl + REG_DP_INTR_STATUS));
 
-	intr = 0;
+	intr = 0;	phy_intr = 0;
 	for (i = 0; i < 250; i++) {
 		intr = tachyon_dp_aux_get_irq(priv);
+		phy_intr = readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS);
 		if (intr & DP_INTERRUPT_STATUS1)
 			break;
 		udelay(1000);
 	}
+
+	decoded = tachyon_dp_aux_decode_intr(intr);
 
 	if (i == 250) {
 		bool first_failure = !priv->aux_timeouts && !priv->aux_nacks &&
 				     !priv->aux_defers && !priv->aux_errors;
 
 		priv->aux_timeouts++;
-		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu intr=%08x ctrl=%08x status=%08x trans=%08x\n",
+		log_warning("AUX timeout: addr=%x i2c=%d read=%d len=%zu intr=%08x phy_intr=%08x decoded=%d ctrl=%08x status=%08x trans=%08x\n",
 			    addr, i2c, read, len,
 			    intr,
+			    phy_intr,
+			    decoded,
 			    readl(priv->aux + REG_DP_AUX_CTRL),
 			    readl(priv->aux + REG_DP_AUX_STATUS),
 			    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
@@ -4997,24 +5101,43 @@ static int tachyon_dp_remove(struct udevice *dev)
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 {
 	int ret, i;
+	struct qcom_pmic_glink_altmode_state altmode_state;
+	int altmode_ret;
 
 	log_warning("DP wait sink: %d tries, %d us interval\n",
 		    TACHYON_DP_AUX_DEBOUNCE_TRIES, 20000);
 
 	for (i = 0; i < TACHYON_DP_AUX_DEBOUNCE_TRIES; i++) {
 		/*
+		 * Keep the PMIC altmode state machine polling while we wait for
+		 * HPD and the sink's DPCD registers to become available.
+		 */
+		altmode_ret = qcom_pmic_glink_altmode_poll(&altmode_state, 100);
+		if (!altmode_ret)
+			tachyon_dp_apply_pmic_typec_state(priv, &altmode_state);
+		else if (altmode_ret != -ENOSYS && altmode_ret != -ETIMEDOUT)
+			log_debug("DP PMIC altmode poll failed: %d\n", altmode_ret);
+
+		if (tachyon_dp_hw_hpd_connected(priv)) {
+			priv->hpd_state = TACHYON_DP_HPD_CONNECTED;
+			priv->aux_xfers_enabled = true;
+		}
+
+		if (priv->hpd_state == TACHYON_DP_HPD_DISCONNECTED &&
+		    !tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd")) {
+			log_debug("DP wait sink try %d/%d: no HPD yet, skipping DPCD read\n",
+				 i + 1, TACHYON_DP_AUX_DEBOUNCE_TRIES);
+			udelay(20000);
+			continue;
+		}
+
+		/*
 		 * Hard-reset the AUX controller before every DPCD retry.
 		 * The GO bit was observed stuck at 0x200 after timeouts;
 		 * a full AUX reset ensures a clean transaction state each
 		 * attempt.
 		 */
-		writel(DP_AUX_CTRL_RESET, priv->aux + REG_DP_AUX_CTRL);
-		udelay(1000);
-		writel(DP_AUX_CTRL_ENABLE, priv->aux + REG_DP_AUX_CTRL);
-		writel(0, priv->aux + REG_DP_AUX_TRANS_CTRL);
-		writel(0xffff, priv->aux + REG_DP_TIMEOUT_COUNT);
-		writel(0xffff, priv->aux + REG_DP_AUX_LIMITS);
-		udelay(100);
+		tachyon_dp_aux_hw_init(priv);
 
 		/*
 		 * Try a 1-byte native DPCD_REV read first.  If a 1-byte
