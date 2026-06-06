@@ -1821,7 +1821,8 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	int ret = 0;
 
 	/* Progress the IPCRTR (qrtr/servreg) channel handshake opportunistically. */
-	qpg_service_ipcrtr(pg);
+	if (qpg_env_bool("qpg_enable_ipcrtr_servreg"))
+		qpg_service_ipcrtr(pg);
 
 	avail = qpg_rx_avail(pg);
 	if (avail < sizeof(msg))
@@ -3292,7 +3293,8 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	 * sees the full set of host clients Linux brings up. Experiment to
 	 * see whether this unblocks DP alt-mode entry.
 	 */
-	qpg_register_battmgr(&qpg_session);
+	if (qpg_env_bool("qpg_enable_battmgr"))
+		qpg_register_battmgr(&qpg_session);
 
 	qpg_session_ready = true;
 	qpg_cached_state.service_started = true;
