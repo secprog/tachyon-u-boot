@@ -46,6 +46,75 @@
 #define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
 #define QPG_ALTMODE_TIMEOUT_MS			5000
 
+/*
+ * IPCRTR is the qrtr/QMI transport GLINK channel the ADSP opens at boot; the
+ * SERVREG_LOC protection-domain service runs over it. The ADSP's charger_pd
+ * appears to need this transport (servreg registration) up before it will run
+ * the DisplayPort alt-mode VDM. We bring the channel up as a second GLINK
+ * channel and (Step 1) log the qrtr packets the ADSP sends so we can implement
+ * a minimal qrtr/servreg responder.
+ */
+#define QPG_IPCRTR_NAME				"IPCRTR"
+#define QPG_IPCRTR_LCID				2
+#define QPG_IPCRTR_INTENT_SIZE			4096
+
+/* qrtr (QIPCRTR) protocol — see Linux include/uapi/linux/qrtr.h */
+#define QRTR_PROTO_VER_1			1
+#define QRTR_TYPE_DATA				1
+#define QRTR_TYPE_HELLO				2
+#define QRTR_TYPE_BYE				3
+#define QRTR_TYPE_NEW_SERVER			4
+#define QRTR_TYPE_DEL_SERVER			5
+#define QRTR_TYPE_NEW_LOOKUP			10
+#define QRTR_TYPE_DEL_LOOKUP			11
+#define QRTR_NODE_BCAST				0xffffffffu
+#define QRTR_PORT_CTRL				0xfffffffeu
+/* Local (apps) qrtr node id we present to the ADSP. */
+#define QPG_QRTR_LOCAL_NODE			1
+
+struct qpg_qrtr_hdr {
+	__le32 version;
+	__le32 type;
+	__le32 src_node;
+	__le32 src_port;
+	__le32 confirm_rx;
+	__le32 size;
+	__le32 dst_node;
+	__le32 dst_port;
+} __packed;
+
+struct qpg_qrtr_ctrl {
+	__le32 cmd;
+	__le32 service;
+	__le32 instance;
+	__le32 node;
+	__le32 port;
+} __packed;
+
+/*
+ * servreg (protection-domain) over QMI — see Linux drivers/soc/qcom/pdr*.
+ * The ADSP charger_pd hosts a NOTIFIER service (QMI service 0x42). To bring it
+ * fully up (and let it run the DP alt-mode VDM) the AP must REGISTER_LISTENER
+ * for "msm/adsp/charger_pd" with that notifier, then SET_ACK its state
+ * indication — exactly what the Linux kernel pdr client does.
+ */
+#define QMI_TYPE_REQUEST			0
+#define QMI_TYPE_RESPONSE			2
+#define QMI_TYPE_INDICATION			4
+#define SERVREG_NOTIFIER_QMI_SVC		0x42
+#define SERVREG_REGISTER_LISTENER_REQ		0x20
+#define SERVREG_STATE_UPDATED_IND		0x22
+#define SERVREG_SET_ACK_REQ			0x23
+#define QPG_SERVREG_PORT			0x14
+#define QPG_CHARGER_PD_PATH			"msm/adsp/charger_pd"
+
+struct qpg_qmi_hdr {
+	u8 type;
+	__le16 txn;
+	__le16 msg_id;
+	__le16 msg_len;
+} __packed;
+
 #define GLINK_VERSION_1				1
 #define GLINK_FEATURE_INTENT_REUSE		BIT(0)
 
@@ -62,9 +131,16 @@
 #define GLINK_CMD_READ_NOTIF			13
 #define GLINK_CMD_RX_DONE_W_REUSE		14
 
+#define PMIC_GLINK_OWNER_CHARGER		32778
 #define PMIC_GLINK_OWNER_USB_TYPE_C		32779
 #define PMIC_GLINK_OWNER_USBC_PAN		32780
 #define PMIC_GLINK_REQ_RESP			1
+
+/* PMIC_GLINK_OWNER_CHARGER (battmgr) opcodes */
+#define BATT_MNGR_GET_CHARGER_STATUS_REQ	0x0001
+#define BATT_MNGR_SET_OPERATIONAL_MODE_REQ	0x0003
+#define BATT_MNGR_SET_NOTIFICATION_CRITERIA_REQ	0x0004
+#define BATT_MNGR_NOTIFY_IND			0x0007
 
 #define UCSI_READ_BUFFER_REQ			0x11
 #define UCSI_WRITE_BUFFER_REQ			0x12
@@ -84,6 +160,7 @@
 #define UCSI_CMD_PPM_RESET			1
 #define UCSI_CMD_CONNECTOR_RESET		3
 #define UCSI_CMD_ACK_CC_CI			4
+#define UCSI_CMD_SET_UOR			9
 #define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
 #define UCSI_CMD_GET_CAPABILITY			6
 #define UCSI_CMD_GET_CONNECTOR_CAPABILITY	7
@@ -165,6 +242,19 @@ struct qpg_usbc_write_req {
 	__le32 cmd;
 	__le32 arg;
 	__le32 reserved;
+} __packed;
+
+struct qpg_battmgr_opmode_req {
+	struct qpg_pmic_hdr hdr;
+	__le32 operational_mode;
+} __packed;
+
+struct qpg_battmgr_notify_crit_req {
+	struct qpg_pmic_hdr hdr;
+	__le32 battery_id;
+	__le32 power_state;
+	__le32 low_capacity;
+	__le32 high_capacity;
 } __packed;
 
 struct qpg_ucsi_read_buffer_req {
@@ -262,6 +352,32 @@ struct qpg {
 	bool remote_open_ack_pending;
 	bool remote_open_acked;
 	bool pan_acked;
+	bool battmgr_acked;
+	/* IPCRTR (qrtr/servreg) second GLINK channel state */
+	u16 ipcrtr_rcid;
+	u32 ipcrtr_liid;
+	bool ipcrtr_seen;
+	bool ipcrtr_open_ack_pending;
+	bool ipcrtr_local_open_sent;
+	bool ipcrtr_open_acked;
+	bool ipcrtr_intent_posted;
+	/* queue of remote (ADSP) RX intents for sending qrtr packets back */
+	u32 ipcrtr_riid_q[32];
+	u8 ipcrtr_riid_head;
+	u8 ipcrtr_riid_tail;
+	bool ipcrtr_hello_pending;
+	bool ipcrtr_hello_sent;
+	u32 ipcrtr_node;
+	/* servreg listener-client state for the ADSP charger_pd notifier */
+	u32 servreg_node;
+	u32 servreg_port;
+	bool servreg_notifier_seen;
+	bool servreg_register_pending;
+	bool servreg_registered;
+	bool servreg_ack_pending;
+	u16 servreg_txn;
+	u16 servreg_ack_txn;
+	u32 servreg_last_state;
 	bool altmode_notify_seen;
 	bool altmode_no_dp;
 	bool ucsi_read_acked;
@@ -808,6 +924,7 @@ static bool qpg_done_ucsi_write(struct qpg *pg,
 				struct qcom_pmic_glink_altmode *altmode);
 static bool qpg_done_usbc_read(struct qpg *pg,
 			       struct qcom_pmic_glink_altmode *altmode);
+static int qpg_service_ipcrtr(struct qpg *pg);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 			     const void *data, size_t len)
@@ -844,6 +961,246 @@ static int qpg_send_data(struct qpg *pg, const void *data, size_t len)
 	pg->riid_avail = false;
 
 	return qpg_send_data_for(pg, pg->lcid, pg->riid, data, len);
+}
+
+/*
+ * Send a qrtr packet (header + body) into the ADSP's IPCRTR RX intent.
+ * type is a QRTR_TYPE_*; for control packets src/dst port = QRTR_PORT_CTRL.
+ */
+static bool qpg_ipcrtr_riid_ready(struct qpg *pg)
+{
+	return pg->ipcrtr_riid_head != pg->ipcrtr_riid_tail;
+}
+
+static bool qpg_ipcrtr_pop_riid(struct qpg *pg, u32 *riid)
+{
+	if (pg->ipcrtr_riid_head == pg->ipcrtr_riid_tail)
+		return false;
+	*riid = pg->ipcrtr_riid_q[pg->ipcrtr_riid_tail];
+	pg->ipcrtr_riid_tail = (pg->ipcrtr_riid_tail + 1) % 32;
+	return true;
+}
+
+static int qpg_qrtr_send(struct qpg *pg, u32 type, u32 src_port,
+			 u32 dst_node, u32 dst_port,
+			 const void *body, size_t body_len)
+{
+	u8 buf[256];
+	struct qpg_qrtr_hdr *hdr = (void *)buf;
+	u32 riid;
+
+	if (sizeof(*hdr) + body_len > sizeof(buf))
+		return -EINVAL;
+	if (!qpg_ipcrtr_pop_riid(pg, &riid))
+		return -EAGAIN;
+
+	memset(hdr, 0, sizeof(*hdr));
+	hdr->version = cpu_to_le32(QRTR_PROTO_VER_1);
+	hdr->type = cpu_to_le32(type);
+	hdr->src_node = cpu_to_le32(QPG_QRTR_LOCAL_NODE);
+	hdr->src_port = cpu_to_le32(src_port);
+	hdr->size = cpu_to_le32(body_len);
+	hdr->dst_node = cpu_to_le32(dst_node);
+	hdr->dst_port = cpu_to_le32(dst_port);
+	if (body_len)
+		memcpy(buf + sizeof(*hdr), body, body_len);
+
+	return qpg_send_data_for(pg, QPG_IPCRTR_LCID, riid,
+				 buf, sizeof(*hdr) + body_len);
+}
+
+/* Reply to the ADSP's qrtr HELLO so its qrtr/servreg stack proceeds. */
+static int qpg_qrtr_send_hello(struct qpg *pg)
+{
+	struct qpg_qrtr_ctrl ctrl = {};
+	int ret;
+
+	ctrl.cmd = cpu_to_le32(QRTR_TYPE_HELLO);
+	ret = qpg_qrtr_send(pg, QRTR_TYPE_HELLO, QRTR_PORT_CTRL,
+			    pg->ipcrtr_node, QRTR_PORT_CTRL, &ctrl, sizeof(ctrl));
+	log_warning("pmic-glink: IPCRTR sent HELLO -> node=%u ret=%d\n",
+		    pg->ipcrtr_node, ret);
+	return ret;
+}
+
+/* servreg REGISTER_LISTENER(enable=1, "msm/adsp/charger_pd") to the ADSP notifier. */
+static int qpg_servreg_register(struct qpg *pg)
+{
+	u8 msg[96];
+	struct qpg_qmi_hdr *qh = (void *)msg;
+	u8 *p = msg + sizeof(*qh);
+	size_t pathlen = strlen(QPG_CHARGER_PD_PATH);
+	u16 msg_len;
+	int ret;
+
+	/* TLV 0x01: enable (u8) = 1 */
+	*p++ = 0x01; *p++ = 0x01; *p++ = 0x00; *p++ = 0x01;
+	/* TLV 0x02: service_path (string, no NUL on wire) */
+	*p++ = 0x02; *p++ = pathlen & 0xff; *p++ = (pathlen >> 8) & 0xff;
+	memcpy(p, QPG_CHARGER_PD_PATH, pathlen);
+	p += pathlen;
+
+	msg_len = (u16)(p - msg - sizeof(*qh));
+	qh->type = QMI_TYPE_REQUEST;
+	qh->txn = cpu_to_le16(++pg->servreg_txn);
+	qh->msg_id = cpu_to_le16(SERVREG_REGISTER_LISTENER_REQ);
+	qh->msg_len = cpu_to_le16(msg_len);
+
+	ret = qpg_qrtr_send(pg, QRTR_TYPE_DATA, QPG_SERVREG_PORT,
+			    pg->servreg_node, pg->servreg_port, msg, p - msg);
+	log_warning("pmic-glink: servreg REGISTER_LISTENER -> %u:%u path=%s ret=%d\n",
+		    pg->servreg_node, pg->servreg_port, QPG_CHARGER_PD_PATH, ret);
+	return ret;
+}
+
+/* servreg SET_ACK(service_path, transaction_id) acking a state indication. */
+static int qpg_servreg_send_ack(struct qpg *pg, u16 ind_txn)
+{
+	u8 msg[96];
+	struct qpg_qmi_hdr *qh = (void *)msg;
+	u8 *p = msg + sizeof(*qh);
+	size_t pathlen = strlen(QPG_CHARGER_PD_PATH);
+	u16 msg_len;
+	int ret;
+
+	/* TLV 0x01: service_path (string) */
+	*p++ = 0x01; *p++ = pathlen & 0xff; *p++ = (pathlen >> 8) & 0xff;
+	memcpy(p, QPG_CHARGER_PD_PATH, pathlen);
+	p += pathlen;
+	/* TLV 0x02: transaction_id (u16) */
+	*p++ = 0x02; *p++ = 0x02; *p++ = 0x00;
+	*p++ = ind_txn & 0xff; *p++ = (ind_txn >> 8) & 0xff;
+
+	msg_len = (u16)(p - msg - sizeof(*qh));
+	qh->type = QMI_TYPE_REQUEST;
+	qh->txn = cpu_to_le16(++pg->servreg_txn);
+	qh->msg_id = cpu_to_le16(SERVREG_SET_ACK_REQ);
+	qh->msg_len = cpu_to_le16(msg_len);
+
+	ret = qpg_qrtr_send(pg, QRTR_TYPE_DATA, QPG_SERVREG_PORT,
+			    pg->servreg_node, pg->servreg_port, msg, p - msg);
+	log_warning("pmic-glink: servreg SET_ACK ind_txn=%u ret=%d\n",
+		    ind_txn, ret);
+	return ret;
+}
+
+/* Find TLV @id in a QMI payload [p,len); return value ptr + length, or NULL. */
+static const u8 *qpg_qmi_find_tlv(const u8 *p, size_t len, u8 id, u16 *vlen)
+{
+	size_t i = 0;
+
+	while (i + 3 <= len) {
+		u8 t = p[i];
+		u16 l = p[i + 1] | (p[i + 2] << 8);
+
+		if (i + 3 + l > len)
+			break;
+		if (t == id) {
+			*vlen = l;
+			return p + i + 3;
+		}
+		i += 3 + l;
+	}
+	return NULL;
+}
+
+/*
+ * Handle a qrtr packet from the ADSP on IPCRTR: reply to HELLO, latch the
+ * charger_pd servreg notifier from NEW_SERVER, and ack servreg state
+ * indications. This is the AP/servreg-client behaviour the ADSP needs to bring
+ * charger_pd fully up so it will run the DisplayPort alt-mode VDM.
+ */
+static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
+{
+	const struct qpg_qrtr_hdr *hdr = (const void *)data;
+	char hex[3 * 64 + 1];
+	size_t n, i;
+	u32 type, src_node, src_port, dst_port, size;
+
+	n = min_t(size_t, len, 64);
+	for (i = 0; i < n; i++)
+		snprintf(hex + i * 3, 4, "%02x ", data[i]);
+	hex[n ? n * 3 - 1 : 0] = '\0';
+
+	if (len < sizeof(*hdr)) {
+		log_warning("pmic-glink: IPCRTR qrtr SHORT len=%zu bytes=[%s]\n",
+			    len, hex);
+		return;
+	}
+
+	type = le32_to_cpu(hdr->type);
+	src_node = le32_to_cpu(hdr->src_node);
+	src_port = le32_to_cpu(hdr->src_port);
+	dst_port = le32_to_cpu(hdr->dst_port);
+	size = le32_to_cpu(hdr->size);
+
+	log_warning("pmic-glink: IPCRTR qrtr type=%u src=%u:%08x dst=%u:%08x size=%u len=%zu bytes=[%s]\n",
+		    type, src_node, src_port,
+		    le32_to_cpu(hdr->dst_node), dst_port, size, len, hex);
+
+	if (type == QRTR_TYPE_HELLO) {
+		pg->ipcrtr_node = src_node;
+		pg->ipcrtr_hello_pending = true;
+		return;
+	}
+
+	if (type == QRTR_TYPE_NEW_SERVER && len >= sizeof(*hdr) + sizeof(struct qpg_qrtr_ctrl)) {
+		const struct qpg_qrtr_ctrl *c = (const void *)(data + sizeof(*hdr));
+		u32 svc = le32_to_cpu(c->service);
+
+		if (svc == SERVREG_NOTIFIER_QMI_SVC && !pg->servreg_notifier_seen) {
+			pg->servreg_node = le32_to_cpu(c->node);
+			pg->servreg_port = le32_to_cpu(c->port);
+			pg->servreg_notifier_seen = true;
+			pg->servreg_register_pending = true;
+			log_warning("pmic-glink: servreg NOTIFIER found svc=0x%x inst=0x%x @ %u:%u\n",
+				    svc, le32_to_cpu(c->instance),
+				    pg->servreg_node, pg->servreg_port);
+		}
+		return;
+	}
+
+	/* QMI DATA addressed to our servreg client port */
+	if (type == QRTR_TYPE_DATA && dst_port == QPG_SERVREG_PORT &&
+	    len >= sizeof(*hdr) + sizeof(struct qpg_qmi_hdr)) {
+		const struct qpg_qmi_hdr *qh = (const void *)(data + sizeof(*hdr));
+		const u8 *tlv = data + sizeof(*hdr) + sizeof(*qh);
+		size_t tlv_len = len - sizeof(*hdr) - sizeof(*qh);
+		u16 msg_id = le16_to_cpu(qh->msg_id);
+		u16 vlen = 0;
+		const u8 *v;
+
+		log_warning("pmic-glink: servreg QMI type=%u msg_id=0x%x len=%u\n",
+			    qh->type, msg_id, le16_to_cpu(qh->msg_len));
+
+		if (qh->type == QMI_TYPE_RESPONSE &&
+		    msg_id == SERVREG_REGISTER_LISTENER_REQ) {
+			pg->servreg_registered = true;
+			/* current state may be in TLV 0x10 (curr_state) */
+			v = qpg_qmi_find_tlv(tlv, tlv_len, 0x10, &vlen);
+			if (v && vlen >= 4)
+				pg->servreg_last_state = v[0] | (v[1] << 8) |
+					(v[2] << 16) | (v[3] << 24);
+			log_warning("pmic-glink: servreg REGISTER ack state=%u\n",
+				    pg->servreg_last_state);
+		} else if (qh->type == QMI_TYPE_INDICATION &&
+			   msg_id == SERVREG_STATE_UPDATED_IND) {
+			u16 itxn = 0;
+
+			v = qpg_qmi_find_tlv(tlv, tlv_len, 0x01, &vlen);
+			if (v && vlen >= 4)
+				pg->servreg_last_state = v[0] | (v[1] << 8) |
+					(v[2] << 16) | (v[3] << 24);
+			v = qpg_qmi_find_tlv(tlv, tlv_len, 0x03, &vlen);
+			if (v && vlen >= 2)
+				itxn = v[0] | (v[1] << 8);
+			pg->servreg_ack_txn = itxn;
+			pg->servreg_ack_pending = true;
+			log_warning("pmic-glink: servreg STATE_UPDATED state=%u txn=%u -> ack\n",
+				    pg->servreg_last_state, itxn);
+		}
+		return;
+	}
 }
 
 static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
@@ -1143,6 +1500,13 @@ static bool qpg_parse_pmic(struct qpg *pg,
 		return false;
 	}
 
+	if (owner == PMIC_GLINK_OWNER_CHARGER) {
+		pg->battmgr_acked = true;
+		log_warning("pmic-glink: BATTMGR msg type=%u opcode=%02x len=%zu\n",
+			    type, opcode, len);
+		return false;
+	}
+
 	if (owner != PMIC_GLINK_OWNER_USBC_PAN) {
 		log_warning("pmic-glink: unsupported PMIC owner=%u opcode=%02x len=%zu\n",
 			    owner, opcode, len);
@@ -1238,6 +1602,12 @@ static int qpg_rx_data(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode,
 		pan_ack_pending = qpg_parse_pmic(pg, altmode, payload,
 						 chunk_size, &pan_ack_port);
 		rx_done_cid = pg->lcid;
+	} else if (pg->ipcrtr_seen && cid == pg->ipcrtr_rcid) {
+		/* qrtr/QMI packet from the ADSP (servreg etc.) */
+		qpg_qrtr_rx(pg, payload, chunk_size);
+		rx_done_cid = QPG_IPCRTR_LCID;
+		/* consume the intent; service re-posts a fresh one */
+		pg->ipcrtr_intent_posted = false;
 	} else {
 		log_warning("pmic-glink: RX data on unknown cid=%u liid=%u len=%u\n",
 			    cid, liid, chunk_size);
@@ -1266,6 +1636,24 @@ static int qpg_handle_intent_req(struct qpg *pg, u16 cid, u32 size)
 	int ret = 0;
 
 	log_warning("pmic-glink: RX_INTENT_REQ rcid=%u size=%u\n", cid, size);
+
+	/* IPCRTR (qrtr) channel: grant an intent on our IPCRTR lcid so the
+	 * ADSP can push qrtr/servreg packets to us. */
+	if (pg->ipcrtr_seen && cid == pg->ipcrtr_rcid) {
+		if (size) {
+			liid = qpg_alloc_liid(pg);
+			ret = qpg_send_rx_intent_for_size(pg, QPG_IPCRTR_LCID,
+							  liid, size);
+			if (!ret) {
+				pg->ipcrtr_liid = liid;
+				pg->ipcrtr_intent_posted = true;
+				granted = true;
+			}
+		}
+		ack_ret = qpg_send_rx_intent_req_ack_for(pg, QPG_IPCRTR_LCID,
+							 granted);
+		return ret ? ret : ack_ret;
+	}
 
 	if (!pg->remote_opened || cid != pg->rcid) {
 		log_warning("pmic-glink: RX_INTENT_REQ unknown rcid=%u expected=%u\n",
@@ -1311,6 +1699,17 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 		pg->riid_avail = pg->riid_size > 0;
 		log_warning("pmic-glink: RIID channel=raw rcid=%u riid=%u size=%u avail=%d\n",
 			    cid, pg->riid, pg->riid_size, pg->riid_avail);
+	} else if (pg->ipcrtr_seen && cid == pg->ipcrtr_rcid) {
+		/* remote intent on IPCRTR: queue it so we can send qrtr packets */
+		u8 nh = (pg->ipcrtr_riid_head + 1) % 32;
+
+		if (le32_to_cpu(intent->size) && nh != pg->ipcrtr_riid_tail) {
+			pg->ipcrtr_riid_q[pg->ipcrtr_riid_head] =
+				le32_to_cpu(intent->iid);
+			pg->ipcrtr_riid_head = nh;
+		}
+		log_debug("pmic-glink: IPCRTR RIID riid=%u size=%u\n",
+			  le32_to_cpu(intent->iid), le32_to_cpu(intent->size));
 	} else {
 		log_warning("pmic-glink: RIID unknown cid=%u size=%u iid=%u count=%u\n",
 			    cid, le32_to_cpu(intent->size),
@@ -1333,6 +1732,12 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 		pg->remote_open_ack_pending = !pg->remote_open_acked;
 		log_warning("pmic-glink: PMIC remote OPEN recorded rcid=%u lcid=%u\n",
 			    pg->rcid, pg->lcid);
+	} else if (!strcmp(name, QPG_IPCRTR_NAME)) {
+		pg->ipcrtr_rcid = rcid;
+		pg->ipcrtr_seen = true;
+		pg->ipcrtr_open_ack_pending = true;
+		log_warning("pmic-glink: IPCRTR remote OPEN recorded rcid=%u lcid=%u\n",
+			    rcid, QPG_IPCRTR_LCID);
 	}
 
 	return 0;
@@ -1415,6 +1820,9 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 	u32 param2;
 	int ret = 0;
 
+	/* Progress the IPCRTR (qrtr/servreg) channel handshake opportunistically. */
+	qpg_service_ipcrtr(pg);
+
 	avail = qpg_rx_avail(pg);
 	if (avail < sizeof(msg))
 		return -EAGAIN;
@@ -1473,6 +1881,10 @@ static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 			pg->open_acked = true;
 			log_warning("pmic-glink: raw OPEN_ACK complete lcid=%u\n",
 				    pg->lcid);
+		} else if (param1 == QPG_IPCRTR_LCID) {
+			pg->ipcrtr_open_acked = true;
+			log_warning("pmic-glink: IPCRTR OPEN_ACK complete lcid=%u\n",
+				    QPG_IPCRTR_LCID);
 		}
 		break;
 	case GLINK_CMD_INTENT:
@@ -1557,6 +1969,77 @@ static int qpg_service_pmic_open(struct qpg *pg)
 			return ret;
 
 		pg->local_open_sent = true;
+	}
+
+	return 0;
+}
+
+/*
+ * Progress the IPCRTR (qrtr/servreg) channel handshake: OPEN_ACK the ADSP's
+ * open, send our local OPEN, and once the ADSP ACKs it post an RX intent so the
+ * ADSP can push qrtr packets to us. Called every poll cycle; cheap no-op until
+ * the ADSP advertises IPCRTR.
+ */
+static int qpg_service_ipcrtr(struct qpg *pg)
+{
+	int ret;
+
+	if (!pg->ipcrtr_seen)
+		return 0;
+
+	if (pg->ipcrtr_open_ack_pending) {
+		ret = qpg_send_open_ack(pg, pg->ipcrtr_rcid, QPG_IPCRTR_NAME);
+		log_warning("pmic-glink: IPCRTR OPEN_ACK sent rcid=%u ret=%d\n",
+			    pg->ipcrtr_rcid, ret);
+		if (ret)
+			return ret;
+		pg->ipcrtr_open_ack_pending = false;
+	}
+
+	if (!pg->ipcrtr_local_open_sent) {
+		ret = qpg_send_open_for(pg, QPG_IPCRTR_LCID, QPG_IPCRTR_NAME);
+		log_warning("pmic-glink: IPCRTR local OPEN sent lcid=%u ret=%d\n",
+			    QPG_IPCRTR_LCID, ret);
+		if (ret)
+			return ret;
+		pg->ipcrtr_local_open_sent = true;
+	}
+
+	if (pg->ipcrtr_open_acked && !pg->ipcrtr_intent_posted) {
+		pg->ipcrtr_liid = qpg_alloc_liid(pg);
+		ret = qpg_send_rx_intent_for_size(pg, QPG_IPCRTR_LCID,
+						  pg->ipcrtr_liid,
+						  QPG_IPCRTR_INTENT_SIZE);
+		log_warning("pmic-glink: IPCRTR post RX intent lcid=%u liid=%u ret=%d\n",
+			    QPG_IPCRTR_LCID, pg->ipcrtr_liid, ret);
+		if (ret)
+			return ret;
+		pg->ipcrtr_intent_posted = true;
+	}
+
+	/* Reply to the ADSP's qrtr HELLO once we have a remote intent to send into. */
+	if (pg->ipcrtr_hello_pending && !pg->ipcrtr_hello_sent &&
+	    qpg_ipcrtr_riid_ready(pg)) {
+		ret = qpg_qrtr_send_hello(pg);
+		if (!ret) {
+			pg->ipcrtr_hello_sent = true;
+			pg->ipcrtr_hello_pending = false;
+		}
+	}
+
+	/* Register as a servreg listener for charger_pd (kernel-pdr behaviour). */
+	if (pg->servreg_register_pending && !pg->servreg_registered &&
+	    pg->ipcrtr_hello_sent && qpg_ipcrtr_riid_ready(pg)) {
+		ret = qpg_servreg_register(pg);
+		if (!ret)
+			pg->servreg_register_pending = false;
+	}
+
+	/* Ack any servreg state indication. */
+	if (pg->servreg_ack_pending && qpg_ipcrtr_riid_ready(pg)) {
+		ret = qpg_servreg_send_ack(pg, pg->servreg_ack_txn);
+		if (!ret)
+			pg->servreg_ack_pending = false;
 	}
 
 	return 0;
@@ -1648,6 +2131,64 @@ static int qpg_wait_riid(struct qpg *pg)
 		    ret, pg->riid_avail, pg->riid, pg->riid_size);
 
 	return ret;
+}
+
+static bool qpg_done_battmgr(struct qpg *pg,
+			     struct qcom_pmic_glink_altmode *altmode)
+{
+	return pg->battmgr_acked;
+}
+
+/*
+ * Register the battery-manager (CHARGER, owner 32778) client over the same
+ * GLINK channel: SET_OPERATIONAL_MODE(normal) then SET_NOTIFICATION_CRITERIA.
+ * On this platform the ADSP "battman" firmware hosts both the charger AND the
+ * USB Type-C/PD/alt-mode stack; this mirrors what Linux's qcom_battmgr does on
+ * glink-up. Best-effort: failures here must not break the altmode session.
+ */
+static int qpg_register_battmgr(struct qpg *pg)
+{
+	struct qcom_pmic_glink_altmode altmode = {};
+	struct qpg_battmgr_opmode_req opmode = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_CHARGER),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(BATT_MNGR_SET_OPERATIONAL_MODE_REQ),
+		.operational_mode = cpu_to_le32(1), /* normal mode */
+	};
+	struct qpg_battmgr_notify_crit_req crit = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_CHARGER),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(BATT_MNGR_SET_NOTIFICATION_CRITERIA_REQ),
+		.battery_id = 0,
+		.power_state = cpu_to_le32(0xf),
+		.low_capacity = 0,
+		.high_capacity = cpu_to_le32(100),
+	};
+	int ret;
+
+	log_warning("pmic-glink: BATTMGR register: SET_OPERATIONAL_MODE\n");
+	pg->battmgr_acked = false;
+	ret = qpg_send_data(pg, &opmode, sizeof(opmode));
+	if (ret) {
+		log_warning("pmic-glink: BATTMGR opmode send ret=%d\n", ret);
+		return ret;
+	}
+	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
+	log_warning("pmic-glink: BATTMGR opmode ack ret=%d acked=%d\n",
+		    ret, pg->battmgr_acked);
+
+	log_warning("pmic-glink: BATTMGR register: SET_NOTIFICATION_CRITERIA\n");
+	pg->battmgr_acked = false;
+	ret = qpg_send_data(pg, &crit, sizeof(crit));
+	if (ret) {
+		log_warning("pmic-glink: BATTMGR crit send ret=%d\n", ret);
+		return ret;
+	}
+	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
+	log_warning("pmic-glink: BATTMGR crit ack ret=%d acked=%d\n",
+		    ret, pg->battmgr_acked);
+
+	return 0;
 }
 
 static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
@@ -2344,6 +2885,43 @@ static int qpg_send_ucsi_connector_reset(struct qpg *pg, u8 port, bool hard)
 }
 
 /*
+ * UCSI SET_UOR (command 0x09) — set USB Operation Role.  Control byte layout
+ * (per the ADSP ucsi.h): ConnectorNumber bits[22:16], USBOpRoleDFP bit[23],
+ * USBOpRoleUFP bit[24], USBOpRoleDualRole bit[25].  So d2 (bits 16-31 of the
+ * LE control u64) = connector | (DFP?0x80:UFP?0x100).
+ *
+ * Why: the connector status reports partner_type=1 (a DFP is attached), i.e.
+ * the Tachyon is operating as the UFP/device.  A UFP never initiates the
+ * DisplayPort Enter_Mode VDM — only a DFP (host) drives DP to a sink.  This
+ * requests a data-role swap to DFP so the ADSP DPM will run DP alt-mode.
+ */
+static int qpg_send_ucsi_set_uor(struct qpg *pg, u8 port, bool dfp)
+{
+	u16 d2 = (u16)((port + 1) & 0x7f) | (dfp ? 0x80 : 0x100);
+	u64 control = UCSI_CTRL_D2(UCSI_CMD_SET_UOR, d2);
+	u32 old_cci = qpg_ucsi_cci(pg);
+	int ret;
+
+	log_warning("pmic-glink: UCSI SET_UOR connector=%u role=%s\n",
+		    port + 1, dfp ? "DFP" : "UFP");
+
+	pg->ucsi_notify_seen = false;
+	pg->ucsi_notification = 0;
+
+	ret = qpg_ucsi_send_control(pg, control);
+	if (ret)
+		return ret;
+
+	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
+	log_warning("pmic-glink: UCSI SET_UOR cci ret=%d cci=%08x\n",
+		    ret, qpg_ucsi_cci(pg));
+	if (ret)
+		return ret;
+
+	return qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
+}
+
+/*
  * Service a pending UCSI connector-change notification by reading connector
  * status (which ACKs the change via ACK_CC_CI).  If the AP never drains and
  * ACKs connector-changes the PPM stays busy with the change pending and the
@@ -2708,6 +3286,14 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	if (ret)
 		return ret;
 
+	/*
+	 * Best-effort: register the battmgr/charger client so the ADSP
+	 * "battman" firmware (which also hosts the Type-C/PD/alt-mode stack)
+	 * sees the full set of host clients Linux brings up. Experiment to
+	 * see whether this unblocks DP alt-mode entry.
+	 */
+	qpg_register_battmgr(&qpg_session);
+
 	qpg_session_ready = true;
 	qpg_cached_state.service_started = true;
 	qpg_cached_state.pan_enabled = true;
@@ -2972,6 +3558,89 @@ static int do_qpg_reset(struct cmd_tbl *cmdtp, int flag, int argc,
 	return CMD_RET_SUCCESS;
 }
 
+static int do_qpg_dfp(struct cmd_tbl *cmdtp, int flag, int argc,
+		      char *const argv[])
+{
+	struct qcom_pmic_glink_altmode_state state = {};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	ulong start;
+	ulong last_notify_ms = 0;
+	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
+	int ret;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2)
+		timeout_ms = simple_strtoul(argv[1], NULL, 0);
+	if (!timeout_ms)
+		timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
+
+	printf("qpg: dfp start (request data-role swap to DFP/host)\n");
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	qpg_cached_state.service_started = !ret;
+	qpg_cached_state.pan_enabled = !ret;
+	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
+	printf("qpg: GLINK open ret=%d\n", open_ret);
+	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
+	printf("qpg: PAN_EN ret=%d\n", pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	/* Snapshot connector role before the swap. */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
+	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
+
+	/* Confirm the swap took effect (partner should now read as UFP). */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	/*
+	 * The DPM runs DisplayPort VDM discovery at attach-as-DFP, not after a
+	 * mid-session role swap.  With the DFP preference now set, force a
+	 * fresh re-attach so the ADSP re-runs PD + alt-mode discovery as the
+	 * DFP/host and (hopefully) enters DP.
+	 */
+	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, false);
+	printf("qpg: CONNECTOR_RESET-after-DFP ret=%d\n", ret);
+	/* Re-assert DFP preference in case the re-attach reverted it. */
+	qpg_send_ucsi_set_uor(&qpg_session, 0, true);
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	start = get_timer(0);
+	while (get_timer(start) < timeout_ms) {
+		ret = qcom_pmic_glink_altmode_poll(&state, 20);
+		if (ret && ret != -ETIMEDOUT)
+			break;
+
+		qpg_service_ucsi_change(&qpg_session);
+
+		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
+			last_notify_ms = state.last_notify_ms;
+			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+			       get_timer(start),
+			       qpg_public_typec_state_name(state.typec_state),
+			       state.svid, state.orientation_raw, state.mux,
+			       state.dpam_raw, state.linux_mux_mode,
+			       state.dp_pin_assignment, state.hpd,
+			       state.hpd_irq);
+			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
+			       get_timer(start), state.port, state.orientation,
+			       state.pin_assignment, state.dp_seen);
+		}
+	}
+
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	printf("qpg: dfp done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
+	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
+
+	return CMD_RET_SUCCESS;
+}
+
 static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
 		       char *const argv[])
 {
@@ -3039,6 +3708,104 @@ static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
 	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
+/*
+ * Settle helper: drain + ACK altmode notifications (and keep the UCSI PPM
+ * unstuck) for ms milliseconds, printing any new notify.  Mirrors the passive
+ * "sleep" windows in the userspace dp-renegotiate script.
+ */
+static void qpg_bounce_settle(struct qcom_pmic_glink_altmode_state *state,
+			      ulong *last_notify_ms, u32 ms)
+{
+	ulong start = get_timer(0);
+
+	while (get_timer(start) < ms) {
+		int ret = qcom_pmic_glink_altmode_poll(state, 20);
+
+		if (ret && ret != -ETIMEDOUT)
+			break;
+
+		qpg_service_ucsi_change(&qpg_session);
+
+		if (state->notify_seen && state->last_notify_ms != *last_notify_ms) {
+			*last_notify_ms = state->last_notify_ms;
+			printf("t=%05lu notify %s svid=%04x mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u dp_seen=%u\n",
+			       get_timer(start),
+			       qpg_public_typec_state_name(state->typec_state),
+			       state->svid, state->mux, state->dpam_raw,
+			       state->linux_mux_mode, state->dp_pin_assignment,
+			       state->hpd, state->dp_seen);
+		}
+	}
+}
+
+/*
+ * do_qpg_bounce: faithful replica of the working Linux userspace
+ * dp-renegotiate "data-role bounce".  Empirically (journal + kprobe trace) this
+ * is what makes the ADSP actually enter DisplayPort alt mode: the ADSP does NOT
+ * enter DP autonomously even under Linux; a UCSI SET_UOR bounce UFP -> (settle)
+ * -> DFP kicks the DPM into running the DP VDM.  Unlike "qpg dfp" this does NOT
+ * issue a CONNECTOR_RESET (which reverts the role to UFP and defeats the bounce).
+ */
+static int do_qpg_bounce(struct cmd_tbl *cmdtp, int flag, int argc,
+			 char *const argv[])
+{
+	struct qcom_pmic_glink_altmode_state state = {};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	ulong last_notify_ms = 0;
+	u32 settle_ms = 6000;
+	int ret;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2)
+		settle_ms = simple_strtoul(argv[1], NULL, 0);
+	if (!settle_ms)
+		settle_ms = 6000;
+
+	printf("qpg: bounce start (data-role UFP->DFP, mirrors dp-renegotiate)\n");
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	qpg_cached_state.service_started = !ret;
+	qpg_cached_state.pan_enabled = !ret;
+	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
+	printf("qpg: GLINK open ret=%d\n", open_ret);
+	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
+	printf("qpg: PAN_EN ret=%d\n", pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	/*
+	 * Let the IPCRTR/qrtr HELLO + servreg REGISTER_LISTENER handshake for
+	 * charger_pd complete BEFORE the data-role bounce (mirrors Linux: servreg
+	 * is up at boot, dp-renegotiate bounces later).
+	 */
+	qpg_bounce_settle(&state, &last_notify_ms, 4000);
+	printf("qpg: servreg notifier_seen=%d registered=%d state=%u\n",
+	       qpg_session.servreg_notifier_seen, qpg_session.servreg_registered,
+	       qpg_session.servreg_last_state);
+
+	/* Snapshot connector role before the bounce. */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	/* echo device > data_role  : SET_UOR(UFP) */
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, false);
+	printf("qpg: SET_UOR(UFP) ret=%d\n", ret);
+	qpg_bounce_settle(&state, &last_notify_ms, 1200);
+
+	/* echo host > data_role  : SET_UOR(DFP), then wait for DP to come up */
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
+	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
+	qpg_bounce_settle(&state, &last_notify_ms, settle_ms);
+
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+	printf("qpg: bounce done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
+	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
+
+	return CMD_RET_SUCCESS;
+}
+
 static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		  char *const argv[])
 {
@@ -3046,6 +3813,10 @@ static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_qpg_service(cmdtp, flag, argc - 1, argv + 1);
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "reset"))
 		return do_qpg_reset(cmdtp, flag, argc - 1, argv + 1);
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "dfp"))
+		return do_qpg_dfp(cmdtp, flag, argc - 1, argv + 1);
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "bounce"))
+		return do_qpg_bounce(cmdtp, flag, argc - 1, argv + 1);
 	if (argc == 2 && !strcmp(argv[1], "ucsi"))
 		return do_qpg_ucsi(cmdtp, flag, argc - 1, argv + 1);
 
@@ -3057,5 +3828,7 @@ U_BOOT_CMD(
 	"Qualcomm PMIC-GLINK diagnostics",
 	"service [timeout_ms] - keep PMIC-GLINK altmode service alive and print notifications\n"
 	"reset [hard] - UCSI connector reset to force re-attach + DP alt-mode re-entry\n"
+	"dfp [timeout_ms] - UCSI SET_UOR data-role swap to DFP/host, then watch for DP\n"
+	"bounce [settle_ms] - data-role bounce UFP->DFP (mirrors dp-renegotiate) to enter DP\n"
 	"ucsi - run UCSI reset/discovery diagnostics"
 );

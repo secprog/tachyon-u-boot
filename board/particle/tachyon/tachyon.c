@@ -717,6 +717,24 @@ int tachyon_pmic_configure(void) {
 	return -ENOENT;
 }
 
+/*
+ * Board late-init hook (overrides the __weak qcom_late_init in
+ * arch/arm/mach-snapdragon/board.c).  Set the PMIC SDAM "OS type" bit to HLOS
+ * at U-Boot start, not only on the OS-boot DT-fixup path (ft_system_setup).
+ *
+ * The ADSP USB Type-C firmware reads this bit at LPM init: when it reads
+ * "bootloader" it forces bPANEn=0 and runs a charging-only Type-C stack that
+ * never reports DisplayPort alt-mode pin assignment / HPD.  Setting it to HLOS
+ * before the DP path boots the ADSP lets the ADSP run the full alt-mode/DP
+ * notification path the way it does under Linux.
+ */
+void qcom_late_init(void)
+{
+	int r = tachyon_pmic_configure();
+	if (r < 0)
+		printf("Failed to set OS type to HLOS at init: %d\n", r);
+}
+
 int tachyon_system_setup(void *fdt) {
 	CHECK(tachyon_setup_efs());
 

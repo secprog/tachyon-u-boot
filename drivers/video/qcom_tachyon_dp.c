@@ -526,6 +526,10 @@ struct tachyon_dp_priv {
 	bool qmp_dp_touched;
 	bool qmp_dp_serdes_programmed;
 	bool qmp_dp_phy_started;
+	/* true only once the DP link/mainlink has actually been set up; gates the
+	 * link-register teardown in quiesce (touching link regs on a never-trained
+	 * link faults the DP controller -> hard reset). */
+	bool dp_link_up;
 	struct gpio_desc sbu_enable;
 	struct gpio_desc sbu_select;
 	struct tachyon_dp_caps caps;
@@ -2281,17 +2285,24 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 		    priv->rate, vco_div);
 	writel(vco_div, priv->phy_dp + QMP_V4_DP_PHY_VCO_DIV);
 
+	/*
+	 * Power up all lanes (PD_CTL=0x7d) BEFORE the DP_PHY_CFG strobe, matching
+	 * the edk2 HALDPLib reference (hal_dp_alt_mode_phy_1_3_0.c: PD_CTL set at
+	 * :165-179, before the CFG strobe at :224-227). The old order strobed
+	 * DP_PHY_CFG while the PHY was still powered down (PD_CTL=0x02), so the
+	 * PLL state machine never reached C_READY/PHY_READY (DP_STATUS=00).
+	 */
+	log_warning("QMP DP PHY start: powering up all lanes (before CFG strobe)\n");
+	tachyon_dp_qmp_power_up_all_lanes(priv);
+	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=7d");
+
 	/* DP_PHY_CFG start sequence */
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x05, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x01, priv->phy_dp + QMP_DP_PHY_CFG);
 	writel(0x09, priv->phy_dp + QMP_DP_PHY_CFG);
 
-	/* Power up all lanes and start RESETSM */
-	log_warning("QMP DP PHY start: powering up all lanes\n");
-	tachyon_dp_qmp_power_up_all_lanes(priv);
-	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=7d");
-
+	/* Start the reset state machine */
 	writel(0x20, serdes + QMP_V4_COM_RESETSM_CNTRL);
 	udelay(10);
 	priv->qmp_dp_phy_started = true;
@@ -4486,6 +4497,17 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 		    tachyon_dp_pin_assignment_lanes(priv), policy_lanes,
 		    priv->max_rate, priv->lane_map & 0xff);
 
+	/*
+	 * Guard: without valid sink DPCD (lane count / link rate) there is no
+	 * reachable DP sink — refuse to train rather than program the link/DPU
+	 * with zero lanes (which previously hard-crashed the device).
+	 */
+	if (!priv->caps.lanes || !priv->max_rate) {
+		log_warning("DP: no valid sink (lanes=%u max_rate=%u) - skipping link training\n",
+			    priv->caps.lanes, priv->max_rate);
+		return -ENODEV;
+	}
+
 #if TACHYON_DP_FORCE_TRAIN_RBR_X4
 	/*
 	 * Phase 10: Known-good retune test.
@@ -5022,7 +5044,13 @@ static void tachyon_dp_controller_quiesce(struct tachyon_dp_priv *priv)
 
 	log_warning("DP controller quiesce before OS handoff\n");
 
-	if (priv->link) {
+	/*
+	 * Only tear down the link/mainlink if it was actually brought up.
+	 * Touching the link registers (STATE_CTRL / MAINLINK_CTRL) when the DP
+	 * link was never trained (e.g. AUX/EDID failed) faults the DP controller
+	 * and hard-resets the SoC.
+	 */
+	if (priv->link && priv->dp_link_up) {
 		writel(0, priv->link + REG_DP_STATE_CTRL);
 		tachyon_dp_mainlink_disable(priv);
 #ifdef CONFIG_VIDEO_TACHYON_DP_AUDIO
@@ -5088,20 +5116,26 @@ static void tachyon_dp_quiesce(struct tachyon_dp_priv *priv)
 	int ret;
 
 	tachyon_dpu_quiesce(priv);
+	log_warning("DP quiesce: step dpu done\n");
 	tachyon_dp_controller_quiesce(priv);
+	log_warning("DP quiesce: step controller done\n");
 
 	if (priv->phy_dp && (priv->qmp_dp_touched ||
 			     priv->qmp_dp_serdes_programmed ||
-			     priv->qmp_dp_phy_started))
+			     priv->qmp_dp_phy_started)) {
 		tachyon_dp_qmp_power_down(priv);
+		log_warning("DP quiesce: step qmp_power_down done\n");
+	}
 
 	if (priv->has_qmp_phy) {
 		ret = generic_phy_power_off(&priv->qmp_phy);
 		if (ret && ret != -ENOSYS)
 			log_warning("QMP PHY power_off failed: %d\n", ret);
+		log_warning("DP quiesce: step phy_power_off done\n");
 		ret = generic_phy_exit(&priv->qmp_phy);
 		if (ret && ret != -ENOSYS)
 			log_warning("QMP PHY exit failed: %d\n", ret);
+		log_warning("DP quiesce: step phy_exit done\n");
 		priv->has_qmp_phy = false;
 	}
 
@@ -5729,8 +5763,17 @@ static int tachyon_dp_probe(struct udevice *dev)
 		goto err_quiesce;
 
 	ret = tachyon_dp_read_edid_modes(priv);
-	if (ret)
-		log_warning("Failed to read DP EDID modes: %d\n", ret);
+	if (ret) {
+		/*
+		 * No EDID => no reachable DP sink (e.g. a USB-C hub that hasn't
+		 * entered DP Alt Mode, so its mux never routed DP/AUX to the
+		 * panel). Abort gracefully and cleanly release the PHY/SBU/clocks
+		 * rather than crashing into link-training with zero lanes.
+		 */
+		log_warning("DP: no EDID / no DP sink reachable (%d) - aborting cleanly\n",
+			    ret);
+		goto err_quiesce;
+	}
 
 #ifdef CONFIG_VIDEO_TACHYON_DP_AUDIO
 	/*
@@ -5764,6 +5807,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	ret = tachyon_dp_link_train(priv);
 	if (ret)
 		goto err_quiesce;
+	priv->dp_link_up = true;
 
 	/*
 	 * Re-filter EDID modes against actual trained rate/lanes, which may
