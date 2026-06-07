@@ -3808,9 +3808,83 @@ static int do_qpg_bounce(struct cmd_tbl *cmdtp, int flag, int argc,
 	return CMD_RET_SUCCESS;
 }
 
+/*
+ * do_qpg_vdm: replicate the EXACT Linux UCSI "echo host" sequence that a live
+ * kprobe trace showed actually re-enters DP, which our plain SET_UOR bounce does
+ * NOT reproduce.  The ADSP only runs the DP Enter/Configure VDM when its policy
+ * engine reaches DFP, and that field resets
+ * ONLY on a fresh Type-C attach.  Linux's data-role swap to host triggers
+ * PPM_RESET -> SET_NOTIFICATION_ENABLE (via the UCSI reinit) -> a HARD
+ * CONNECTOR_RESET, which forces a full re-attach (the dock re-enumerates on USB)
+ * discovery re-runs -> DP.  Crucially the PPM_RESET here
+ * is MID-SESSION (after SET_UOR(UFP), before the connector reset) - prior tests
+ * only ran PPM_RESET in the session prewarm.  PAN must be re-armed after the
+ * reset (PPM_RESET clears bPANEn).
+ */
+static int do_qpg_vdm(struct cmd_tbl *cmdtp, int flag, int argc,
+		      char *const argv[])
+{
+	struct qcom_pmic_glink_altmode_state state = {};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0, open_ret = 0, pan_ret = 0;
+	ulong last_notify_ms = 0;
+	u32 settle_ms = 6000;
+	int ret;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2)
+		settle_ms = simple_strtoul(argv[1], NULL, 0);
+	if (!settle_ms)
+		settle_ms = 6000;
+
+	printf("qpg: vdm start (Linux echo-host: UFP -> PPM_RESET -> reinit -> CONNECTOR_RESET hard -> DFP)\n");
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	qpg_cached_state.service_started = !ret;
+	qpg_cached_state.pan_enabled = !ret;
+	printf("qpg: ADSP boot ret=%d GLINK ret=%d prewarm ret=%d PAN_EN ret=%d\n",
+	       adsp_ret, open_ret, qpg_last_ucsi_prewarm_ret, pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	/* servreg handshake (mirrors Linux: servreg up before the swap) */
+	qpg_bounce_settle(&state, &last_notify_ms, 4000);
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+
+	/* echo device > data_role : SET_UOR(UFP) */
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, false);
+	printf("qpg: SET_UOR(UFP) ret=%d\n", ret);
+	qpg_bounce_settle(&state, &last_notify_ms, 1200);
+
+	/* echo host > data_role, as the Linux UCSI core actually does it: */
+	ret = qpg_ucsi_prewarm(&qpg_session);	/* PPM_RESET + SET_NOTIFICATION + reinit */
+	printf("qpg: mid-session PPM_RESET/reinit ret=%d\n", ret);
+
+	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
+	printf("qpg: re-arm PAN_EN ret=%d\n", ret);
+	qpg_cached_state.pan_enabled = !ret;
+
+	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, true);
+	printf("qpg: CONNECTOR_RESET(hard) ret=%d\n", ret);
+	qpg_bounce_settle(&state, &last_notify_ms, 2000);
+
+	/* swap to DFP/host on the freshly re-attached connector, then wait for DP */
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
+	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
+	qpg_bounce_settle(&state, &last_notify_ms, settle_ms);
+
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+	printf("qpg: vdm done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
+	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
+
+	return CMD_RET_SUCCESS;
+}
+
 static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		  char *const argv[])
 {
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "vdm"))
+		return do_qpg_vdm(cmdtp, flag, argc - 1, argv + 1);
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "service"))
 		return do_qpg_service(cmdtp, flag, argc - 1, argv + 1);
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "reset"))
@@ -3832,5 +3906,6 @@ U_BOOT_CMD(
 	"reset [hard] - UCSI connector reset to force re-attach + DP alt-mode re-entry\n"
 	"dfp [timeout_ms] - UCSI SET_UOR data-role swap to DFP/host, then watch for DP\n"
 	"bounce [settle_ms] - data-role bounce UFP->DFP (mirrors dp-renegotiate) to enter DP\n"
+	"vdm [settle_ms] - full Linux echo-host seq (PPM_RESET+CONNECTOR_RESET hard) to force DP re-entry\n"
 	"ucsi - run UCSI reset/discovery diagnostics"
 );

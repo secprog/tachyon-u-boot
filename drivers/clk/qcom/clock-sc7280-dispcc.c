@@ -34,6 +34,23 @@ static const struct gate_clk sc7280_dispcc_clks[] = {
 	GATE_CLK(DISP_CC_XO_CLK, 0x5008, 0x00000001),
 };
 
+/*
+ * The DP pixel clock (DISP_CC_MDSS_DP_PIXEL_CLK_SRC at 0x1140) is sourced from
+ * the DP PHY PLL VCO_DIV output and must be divided down to the mode's pixel
+ * clock by an M/N divider.  The required M/N depends on the link rate AND the
+ * pixel rate, which only the DP driver knows, so it computes them and stashes
+ * them here before enabling the clock.  If unset (0), we fall back to the old
+ * pass-through (M=0/N=0), which runs the pixel clock far too fast.
+ */
+static u32 sc7280_dp_pixel_m;
+static u32 sc7280_dp_pixel_n;
+
+void sc7280_dispcc_set_dp_pixel_mn(u32 m, u32 n)
+{
+	sc7280_dp_pixel_m = m;
+	sc7280_dp_pixel_n = n;
+}
+
 static int sc7280_dispcc_enable(struct clk *clk)
 {
 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
@@ -52,7 +69,14 @@ static int sc7280_dispcc_enable(struct clk *clk)
 		clk_rcg_set_rate_mnd(priv->base, 0x110c, 1, 0, 0, 1 << 8, 8);
 		break;
 	case DISP_CC_MDSS_DP_PIXEL_CLK:
-		clk_rcg_set_rate_mnd(priv->base, 0x1140, 1, 0, 0, 2 << 8, 8);
+		/*
+		 * DP pixel RCG has 16-bit M/N/D registers (Linux mnd_width=16).
+		 * Passing 8 here truncates ~(N-M) to 8 bits, yielding a wildly
+		 * wrong divider (clock ~227 kHz) that starves the p0 region's
+		 * clock and faults the bus.  Must be 16.
+		 */
+		clk_rcg_set_rate_mnd(priv->base, 0x1140, 1, sc7280_dp_pixel_m,
+				     sc7280_dp_pixel_n, 2 << 8, 16);
 		break;
 	case DISP_CC_MDSS_MDP_CLK:
 		clk_rcg_set_rate_mnd(priv->base, 0x1090, 1, 0, 0, 0, 8);

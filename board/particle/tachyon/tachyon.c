@@ -707,7 +707,12 @@ int tachyon_pmic_configure(void) {
 					u32 value = CHECK(pmic_reg_read(dev, reg));
 					value |= TACHYON_OS_TYPE_HLOS;
 					CHECK(pmic_reg_write(dev, reg, value));
-					printf("Set OS type to HLOS in reg 0x%04x\n", reg);
+					/* Read back so we KNOW the HLOS bit actually stuck in
+					 * the PMIC the ADSP reads at its DPM init (the gate for
+					 * USB-C DP alt-mode / bPANEn). */
+					u32 verify = CHECK(pmic_reg_read(dev, reg));
+					printf("Set OS type to HLOS in reg 0x%04x (wrote=0x%02x readback=0x%02x bit0=%d)\n",
+					       reg, value, verify, verify & TACHYON_OS_TYPE_HLOS);
 
 					return 0;
 				}

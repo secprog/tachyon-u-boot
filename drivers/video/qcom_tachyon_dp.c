@@ -22,6 +22,7 @@
 #include <dm/ofnode.h>
 #include <dm/root.h>
 #include <dm/uclass-internal.h>
+#include <cpu_func.h>
 #include <edid.h>
 #include <env.h>
 #include <fdtdec.h>
@@ -31,6 +32,7 @@
 #include <linux/kernel.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
+#include <lmb.h>
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
@@ -165,6 +167,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DP_MISC0_SYNCHRONOUS_CLK	BIT(0)
 #define DP_MISC0_TEST_BITS_DEPTH_SHIFT	5
 #define REG_DP_VALID_BOUNDARY		0x030
+#define REG_DP_DELAY_START_LINK_SHIFT	16
 #define REG_DP_VALID_BOUNDARY_2		0x034
 #define REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING 0x038
 #define REG_DP_MAINLINK_READY		0x040
@@ -194,6 +197,13 @@ DECLARE_GLOBAL_DATA_PTR;
 /* DPCD registers for hotplug IRQ / Event Status Indicator */
 #define DPCD_SINK_COUNT			0x00200
 #define DPCD_DEVICE_SERVICE_IRQ		0x00201
+#define DPCD_DOWNSTREAMPORT_PRESENT	0x00005
+#define DPCD_DOWN_STREAM_PORT_COUNT	0x00007
+#define DPCD_LANE0_1_STATUS		0x00202
+#define DPCD_LANE2_3_STATUS		0x00203
+#define DPCD_LANE_ALIGN_STATUS		0x00204
+#define DPCD_SET_POWER			0x00600
+#define DP_SET_POWER_D0			0x01
 #define DPCD_SINK_COUNT_ESI		0x02002
 #define DPCD_DEV_SERVICE_IRQ_VECTOR_ESI0 0x02003
 #define DPCD_LANE0_1_STATUS_ESI		0x0200C
@@ -248,6 +258,21 @@ DECLARE_GLOBAL_DATA_PTR;
 #define MMSS_DP_INTF_DISPLAY_HCTL	0x04c
 #define MMSS_DP_INTF_ACTIVE_HCTL	0x050
 #define MMSS_DP_INTF_POLARITY_CTL	0x058
+/*
+ * DP_P0CLK_DSC_DTO (p0 region, abs 0xae9107c = p0 + 0x07c).  Controls MDP->DP
+ * backpressure: OVERRIDE_ACK (bit1) = 0 enables backpressure so the DP TX pulls
+ * pixel data from the MDP; = 1 stops the data flow.  OVERRIDE_ACK_VALUE (bit2).
+ * Without this the DP controller stays in SEND_IDLE_PATTERN and never emits real
+ * video, so the sink sees "No Signal".
+ */
+#define MMSS_DP_P0CLK_DSC_DTO		0x07c
+#define DP_P0CLK_DSC_DTO_OVERRIDE_ACK	BIT(1)
+#define DP_P0CLK_DSC_DTO_OVERRIDE_ACK_VALUE BIT(2)
+
+/* DP_STATE_CTRL link commands */
+#define DP_STATE_CTRL_PUSH_IDLE		BIT(8)
+/* DP_MAINLINK_READY status bits */
+#define DP_MAINLINK_READY_IDLE_PATTERNS_SENT BIT(1)
 
 #define DPU_TOP_BASE			0x00000
 #define DPU_CTL_0_BASE			0x15000
@@ -324,7 +349,10 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DPU_INTF_ACTIVE_DATA_HCTL	0x068
 #define DPU_INTF_PANEL_FORMAT		0x090
 #define DPU_INTF_FRAME_LINE_COUNT_EN	0x0a8
+#define DPU_INTF_FRAME_COUNT		0x0ac
+#define DPU_INTF_LINE_COUNT		0x0b0
 #define DPU_INTF_MUX			0x25c
+#define DPU_INTF_STATUS			0x26c
 #define DPU_INTF_CONFIG2_DATA_HCTL_EN	BIT(4)
 #define DPU_INTF_FORMAT_XRGB8888	0x000021a8
 
@@ -860,6 +888,19 @@ static void tachyon_dp_env_mode(u32 *width, u32 *height)
 	} else {
 		*width = pref_width;
 		*height = pref_height;
+	}
+
+	/*
+	 * Allow forcing a resolution the EDID parse didn't surface (e.g. a CEA
+	 * 720p/1080p mode carried in an extension block we don't fully decode).
+	 * With tachyon_dp_force_mode=1 we honor tachyon_dp_xres/yres as long as
+	 * it's a sane resolution and fall back to a built-in timing for it.
+	 */
+	if (have_saved && tachyon_dp_env_bool("tachyon_dp_force_mode") &&
+	    tachyon_dp_valid_resolution(*width, *height)) {
+		log_warning("Forcing DP resolution %ux%u (tachyon_dp_force_mode)\n",
+			    *width, *height);
+		return;
 	}
 
 	if (!tachyon_dp_valid_resolution(*width, *height) ||
@@ -1605,6 +1646,21 @@ static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
  * Do NOT toggle COM power/reset registers from here — repeated COM reset
  * from the DP driver can clobber the provider's state and cause C_READY=0.
  */
+/*
+ * QMP combo PHY_MODE_CTRL is a bitfield: bit0=USB3, bit1=DP (matches Linux
+ * phy-qcom-qmp-combo).  A pin-D/F sink is 2-lane DP + USB3 and needs USB3+DP
+ * mode (0x03) so the combo routes the 2 DP lanes onto the correct physical
+ * pins; a pin-C/E sink is 4-lane DP-only (0x02).  Driving a 2-lane sink in
+ * DP-only mode lands DP on the wrong lanes -> sink never sees the main link
+ * (clock-recovery fails, lane status 00) even though AUX (on the SBU mux) works.
+ */
+static u8 tachyon_dp_qmp_phy_mode(struct tachyon_dp_priv *priv)
+{
+	if (tachyon_dp_pin_assignment_lanes(priv) >= 4)
+		return QMP_DP_COM_DP_MODE;
+	return QMP_DP_COM_DP_MODE | QMP_DP_COM_USB3_MODE;
+}
+
 static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 {
 	u32 typec;
@@ -1614,7 +1670,7 @@ static void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
 	writel(typec, priv->qmp_com + QMP_V3_DP_COM_TYPEC_CTRL);
-	writel(QMP_DP_COM_DP_MODE,
+	writel(tachyon_dp_qmp_phy_mode(priv),
 	       priv->qmp_com + QMP_V3_DP_COM_PHY_MODE_CTRL);
 
 	log_warning("QMP COM orientation update: TYPEC=%02x MODE=%02x\n",
@@ -2539,7 +2595,7 @@ static int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	if (priv->orientation == TACHYON_DP_ORIENTATION_REVERSE)
 		typec |= QMP_DP_COM_SW_PORTSELECT_VAL;
 
-	writel(QMP_DP_COM_DP_MODE,
+	writel(tachyon_dp_qmp_phy_mode(priv),
 	       priv->qmp_com + QMP_V3_DP_COM_PHY_MODE_CTRL);
 	writel(typec,
 	       priv->qmp_com + QMP_V3_DP_COM_TYPEC_CTRL);
@@ -3717,7 +3773,7 @@ static void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 
 		if (!priv->modes[in].has_timing ||
 		    !tachyon_dp_mode_fits_link(priv, &priv->modes[in].timing)) {
-			log_info("Dropping DP EDID mode %ux%u: %s\n",
+			log_warning("Dropping DP EDID mode %ux%u: %s\n",
 				 priv->modes[in].width, priv->modes[in].height,
 				 !priv->modes[in].has_timing ?
 				 "no timing available" :
@@ -3818,6 +3874,15 @@ static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 		tachyon_dp_publish_edid_modes(priv);
 		return ret;
 	}
+	log_warning("DP EDID blk0: %02x %02x %02x %02x %02x %02x %02x %02x | ext_flag=%u csum_ok=%u hdr_ok=%u\n",
+		    edid_buf[0], edid_buf[1], edid_buf[2], edid_buf[3],
+		    edid_buf[4], edid_buf[5], edid_buf[6], edid_buf[7],
+		    edid_buf[126], tachyon_dp_edid_checksum_ok(edid_buf),
+		    tachyon_dp_edid_header_ok(edid_buf));
+	log_warning("DP EDID estab: %02x %02x %02x  ver=%u.%u\n",
+		    edid_buf[35], edid_buf[36], edid_buf[37],
+		    edid_buf[18], edid_buf[19]);
+
 	if (!tachyon_dp_edid_header_ok(edid_buf) ||
 	    !tachyon_dp_edid_checksum_ok(edid_buf)) {
 		priv->mode_count = 0;
@@ -3844,8 +3909,17 @@ static int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 						   edid_buf + EDID_SIZE);
 	}
 
+	log_warning("DP EDID pre-filter: %d modes, rate=%u lanes=%u\n",
+		    priv->mode_count, priv->rate, priv->lanes);
+	for (i = 0; i < priv->mode_count; i++)
+		log_warning("DP EDID mode[%d] %ux%u has_timing=%u\n", i,
+			    priv->modes[i].width, priv->modes[i].height,
+			    priv->modes[i].has_timing);
+
 	tachyon_dp_filter_edid_modes(priv);
 	tachyon_dp_publish_edid_modes(priv);
+
+	log_warning("DP EDID post-filter: %d modes\n", priv->mode_count);
 
 	return priv->mode_count ? 0 : -ENOENT;
 }
@@ -3863,12 +3937,51 @@ static void tachyon_dp_publish_selected_timing(struct tachyon_dp_priv *priv)
 	env_set("tachyon_dp_selected_timing", timing);
 }
 
+/*
+ * SC7280/QCM6490 DP timing-engine quirk: the MDP INTF + DP controller require
+ * the active region in the bottom-right corner of the frame for correct DP
+ * packet/audio transfer.  does this by
+ * folding the front porch into the back porch and zeroing the front porch.
+ * HTOTAL/VTOTAL and the pixel clock are unchanged, so refresh rate and sync
+ * widths are preserved; only the porch distribution shifts.  Apply it once to
+ * priv->timing so the MSA, the DPU INTF, and the DP p0 timing all agree.
+ */
+static void tachyon_dp_apply_dp_porch_adjust(struct tachyon_dp_priv *priv)
+{
+	struct display_timing *t = &priv->timing;
+
+	tachyon_dp_timing_entry(&t->hback_porch,
+				t->hback_porch.typ + t->hfront_porch.typ);
+	tachyon_dp_timing_entry(&t->hfront_porch, 0);
+	tachyon_dp_timing_entry(&t->vback_porch,
+				t->vback_porch.typ + t->vfront_porch.typ);
+	tachyon_dp_timing_entry(&t->vfront_porch, 0);
+}
+
 static void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 				   u32 *width, u32 *height)
 {
 	int i, selected = -1;
 
+	bool force_mode = tachyon_dp_env_has_u32("tachyon_dp_xres") &&
+			  tachyon_dp_env_has_u32("tachyon_dp_yres") &&
+			  tachyon_dp_env_bool("tachyon_dp_force_mode");
+
 	tachyon_dp_env_mode(width, height);
+
+	/*
+	 * TESTING: the dock's DP->HDMI converter rejects the sink's native
+	 * 1360x768 (a non-CEA VESA PC mode), showing "No Signal" even with a
+	 * valid trained link.  The board env that would pick a mode does not
+	 * persist across reboot, so force a clean CEA 1920x1080 here unless the
+	 * user has explicitly forced a different mode via tachyon_dp_force_mode.
+	 */
+	if (!force_mode) {
+		*width = 1920;
+		*height = 1080;
+		force_mode = true;
+		log_warning("DP TEST: forcing 1920x1080 (ignoring non-CEA native mode)\n");
+	}
 
 	for (i = 0; i < priv->mode_count; i++) {
 		if (priv->modes[i].width == *width &&
@@ -3878,7 +3991,12 @@ static void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 		}
 	}
 
-	if (selected < 0 && priv->mode_count) {
+	/*
+	 * Only fall back to the sink's first EDID mode when we are NOT being told
+	 * to force a specific resolution.  Otherwise honor the forced width/height
+	 * and let the known/fallback timing path below resolve its timing.
+	 */
+	if (selected < 0 && priv->mode_count && !force_mode) {
 		selected = 0;
 		*width = priv->modes[0].width;
 		*height = priv->modes[0].height;
@@ -3897,8 +4015,9 @@ static void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 		tachyon_dp_timing_entry(&priv->timing.vactive, *height);
 	}
 
+	tachyon_dp_apply_dp_porch_adjust(priv);
 	tachyon_dp_publish_selected_timing(priv);
-	log_info("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u\n",
+	log_warning("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u (DP bottom-right adjusted)\n",
 		 *width, *height, priv->timing.pixelclock.typ,
 		 priv->timing.hfront_porch.typ, priv->timing.hsync_len.typ,
 		 priv->timing.hback_porch.typ, priv->timing.vfront_porch.typ,
@@ -3925,12 +4044,14 @@ static bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 
 	if (priv->modes[mode_index].has_timing) {
 		priv->timing = priv->modes[mode_index].timing;
+		tachyon_dp_apply_dp_porch_adjust(priv);
 		return true;
 	}
 
 	if (tachyon_dp_known_timing(width, height, &priv->timing)) {
 		log_warning("Using built-in timing for DP mode %ux%u\n",
 			    width, height);
+		tachyon_dp_apply_dp_porch_adjust(priv);
 		return true;
 	}
 
@@ -3939,10 +4060,41 @@ static bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 	tachyon_dp_default_timing(&priv->timing);
 	tachyon_dp_timing_entry(&priv->timing.hactive, width);
 	tachyon_dp_timing_entry(&priv->timing.vactive, height);
+	tachyon_dp_apply_dp_porch_adjust(priv);
 	return true;
 }
 
 static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
+
+/*
+ * Wake the sink/branch device into full-power D0 and report its downstream
+ * (HDMI) port state.  A DP->HDMI branch device left in D3 (or that never had
+ * its display path enabled) keeps its HDMI TX off, so the TV shows "No Signal"
+ * even though our DP link to the branch is trained and we're sending video.
+ * DPCD_DOWNSTREAMPORT_PRESENT bit0 tells us whether a branch device is present;
+ * SINK_COUNT tells us whether it sees a downstream display.
+ */
+static void tachyon_dp_sink_power_on(struct tachyon_dp_priv *priv)
+{
+	u8 dfp = 0, dfp_count = 0, sink_count = 0, power = 0;
+	int ret;
+
+	tachyon_dp_aux_retry(priv, false, true, DPCD_DOWNSTREAMPORT_PRESENT,
+			     &dfp, 1);
+	tachyon_dp_aux_retry(priv, false, true, DPCD_DOWN_STREAM_PORT_COUNT,
+			     &dfp_count, 1);
+	tachyon_dp_aux_retry(priv, false, true, DPCD_SINK_COUNT, &sink_count, 1);
+
+	/* Set sink power state to D0 (normal operation). */
+	power = DP_SET_POWER_D0;
+	ret = tachyon_dp_aux_retry(priv, false, false, DPCD_SET_POWER,
+				   &power, 1);
+	power = 0;
+	tachyon_dp_aux_retry(priv, false, true, DPCD_SET_POWER, &power, 1);
+
+	log_warning("DP sink: DFP_present=0x%02x DFP_count=0x%02x SINK_COUNT=0x%02x set_D0_ret=%d power_readback=0x%02x\n",
+		    dfp, dfp_count, sink_count, ret, power);
+}
 
 static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
 {
@@ -3975,6 +4127,9 @@ static int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv)
 
 	tachyon_dp_reset_link_policy(priv);
 	tachyon_dp_log_typec_resolved(priv);
+
+	/* Wake the sink/branch to D0 before training so its display path is on. */
+	tachyon_dp_sink_power_on(priv);
 
 	log_info("DP sink DPCD rev=%02x max_rate=%u lanes=%u enhanced=%d policy_rate=%u policy_lanes=%u\n",
 		 priv->caps.dpcd_rev, priv->caps.max_rate, priv->caps.lanes,
@@ -4016,13 +4171,22 @@ static u8 tachyon_dp_bw_code(u32 rate)
 
 static u32 tachyon_dp_configuration_ctrl(struct tachyon_dp_priv *priv)
 {
-	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
-		  DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
-		  DP_CONFIGURATION_CTRL_P_INTERLACED |
+	/*
+	 *  - STATIC_DYNAMIC_COUNTER = 1 for our synchronous-clock stream.
+	 *  - BPC = 1 (8bpc).  Previously 2 (10bpc), which made the controller
+	 *    packetize 30bpp over our 24bpp XRGB8888 pixels -> the DP->HDMI dock
+	 *    couldn't lock the stream (post-video lane status collapsed to 0) and
+	 *    the TV showed "No Signal".
+	 *  - PROGRESSIVE_INTERLACED (bit2) = 0: our modes are progressive.  This
+	 *    was wrongly forced to 1 (interlaced).
+	 *  - SYNC_ASYNC_CLOCK (bit0) = 0: leaves it clear; sync vs async is
+	 *    expressed via STATIC_DYNAMIC_COUNTER, not this bit.
+	 */
+	u32 cfg = DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
 		  (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT) |
 		  ((priv->lanes - 1) <<
 		   DP_CONFIGURATION_CTRL_NUM_OF_LANES_SHIFT) |
-		  (2 << DP_CONFIGURATION_CTRL_BPC_SHIFT);
+		  (1 << DP_CONFIGURATION_CTRL_BPC_SHIFT);
 
 	if (priv->caps.enhanced)
 		cfg |= DP_CONFIGURATION_CTRL_ENHANCED_FRAMING;
@@ -4392,8 +4556,15 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		tachyon_dp_dump_link_state(priv, "before CR status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
-		if (ret)
+		if (ret) {
+			log_warning("DP CR lane-status read FAILED ret=%d (try %d)\n",
+				    ret, tries);
 			return ret;
+		}
+		log_warning("DP CR try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x cr_done=%d\n",
+			    tries, status[0], status[1], status[2],
+			    status[4], status[5],
+			    tachyon_dp_cr_done(status, lanes));
 		if (tachyon_dp_cr_done(status, lanes))
 			break;
 		memcpy(adj, &status[4], sizeof(adj));
@@ -4441,8 +4612,15 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		tachyon_dp_dump_link_state(priv, "before EQ status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
-		if (ret)
+		if (ret) {
+			log_warning("DP EQ lane-status read FAILED ret=%d (try %d)\n",
+				    ret, tries);
 			return ret;
+		}
+		log_warning("DP EQ try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x eq_done=%d\n",
+			    tries, status[0], status[1], status[2],
+			    status[4], status[5],
+			    tachyon_dp_eq_done(status, lanes));
 		if (tachyon_dp_eq_done(status, lanes))
 			break;
 		memcpy(adj, &status[4], sizeof(adj));
@@ -4550,8 +4728,12 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 		for (l = 0; l < ARRAY_SIZE(lane_counts); l++) {
 			if (lane_counts[l] > policy_lanes)
 				continue;
+			log_warning("DP link train attempt: rate=%u lanes=%u\n",
+				    rates[r], lane_counts[l]);
 			ret = tachyon_dp_link_train_at(priv, rates[r],
 						       lane_counts[l]);
+			log_warning("DP link train attempt rate=%u lanes=%u ret=%d\n",
+				    rates[r], lane_counts[l], ret);
 			if (!ret) {
 				log_info("DP link trained at %u kHz x %u lanes\n",
 					 rates[r], lane_counts[l]);
@@ -4577,29 +4759,86 @@ static u32 tachyon_dp_vtotal(const struct display_timing *t)
 	       t->vback_porch.typ;
 }
 
+/* Implemented in drivers/clk/qcom/clock-sc7280-dispcc.c */
+void sc7280_dispcc_set_dp_pixel_mn(u32 m, u32 n);
+
+/*
+ * Compute the DP pixel-clock M/N divider: pixel_clk = input_clk * M / N, so
+ * M/N = pixel_khz / input_khz reduced by their GCD and scaled into 16 bits.
+ * (Self-contained; avoids a dependency on CONFIG_RATIONAL.)
+ */
+static void tachyon_dp_pixel_mn(unsigned long input_khz, unsigned long pixel_khz,
+				u32 *m, u32 *n)
+{
+	unsigned long a = pixel_khz, b = input_khz, x = a, y = b, g;
+
+	while (y) {
+		unsigned long t = x % y;
+
+		x = y;
+		y = t;
+	}
+	g = x ? x : 1;
+	a /= g;
+	b /= g;
+	while (a > 0xffff || b > 0xffff) {
+		a >>= 1;
+		b >>= 1;
+	}
+	*m = a ? a : 1;
+	*n = b ? b : 1;
+}
+
+/*
+ * Program the DP pixel clock.  The dispcc DP pixel RCG is sourced from the DP
+ * PHY PLL VCO_DIV output (= link_rate*10/pixel_div) and must be divided down to
+ * the mode pixel clock by an M/N divider.  Compute M/N here (we know both the
+ * link rate and the pixel rate) and hand them to the dispcc driver before
+ * enabling — otherwise the pixel clock runs at the full VCO_DIV rate (~1.35 GHz
+ * for HBR2), ~9x too fast, and the sink cannot lock the video (No Signal).
+ * Mirrors Linux msm dp_ctrl msm_dp_ctrl_config_msa().
+ */
 static void tachyon_dp_program_pixel_clock(struct tachyon_dp_priv *priv)
 {
 	u32 rate = priv->timing.pixelclock.typ;
+	unsigned long pixel_div, dispcc_input_khz;
+	u32 pixel_khz, m = 0, n = 0;
 	long ret;
 
-	if (!rate)
+	if (!rate || !priv->has_pixel_clk) {
+		log_warning("DP pixel clock SKIPPED: rate=%u has_pixel_clk=%d\n",
+			    rate, priv->has_pixel_clk);
 		return;
+	}
 
-	if (!priv->has_pixel_clk)
-		return;
+	switch (priv->rate) {
+	case DP_LINK_RATE_HBR3:
+		pixel_div = 6;
+		break;
+	case DP_LINK_RATE_HBR2:
+		pixel_div = 4;
+		break;
+	default:		/* RBR, HBR */
+		pixel_div = 2;
+		break;
+	}
+
+	pixel_khz = rate / 1000;
+	dispcc_input_khz = ((unsigned long)priv->rate * 10) / pixel_div;
+	tachyon_dp_pixel_mn(dispcc_input_khz, pixel_khz, &m, &n);
+	sc7280_dispcc_set_dp_pixel_mn(m, n);
+	log_warning("DP pixel clk M/N: link=%u input_khz=%lu pixel_khz=%u -> M=%u N=%u\n",
+		    priv->rate, dispcc_input_khz, pixel_khz, m, n);
 
 	ret = clk_set_rate(&priv->pixel_clk, rate);
-	if (ret < 0)
-		log_warning("Failed to set DP pixel clock %u Hz: %d\n", rate,
-			    (int)ret);
+	log_warning("DP pixel clock set_rate %u Hz -> ret=%ld\n", rate, ret);
 
 	if (priv->pixel_clk_enabled)
 		return;
 
 	ret = clk_enable(&priv->pixel_clk);
-	if (ret < 0)
-		log_warning("Failed to enable DP pixel clock: %d\n", (int)ret);
-	else
+	log_warning("DP pixel clock enable ret=%ld\n", ret);
+	if (ret >= 0)
 		priv->pixel_clk_enabled = true;
 }
 
@@ -4649,26 +4888,103 @@ static void tachyon_dp_program_msa_clock(struct tachyon_dp_priv *priv)
 
 	writel(mvid, priv->link + REG_DP_SOFTWARE_MVID);
 	writel(nvid, priv->link + REG_DP_SOFTWARE_NVID);
-	writel(DP_MISC0_SYNCHRONOUS_CLK | (2 << DP_MISC0_TEST_BITS_DEPTH_SHIFT),
+	/*
+	 * MISC0[7:5] = component bit depth: 0=6bpc, 1=8bpc, 2=10bpc.  We scan out
+	 * 8bpc XRGB8888 pixels, so this MUST declare 8bpc (1).  A previous value
+	 * of 2 (10bpc) made the MSA disagree with the actual pixel data, which a
+	 * DP->HDMI dock converter rejects -> sink shows "No Signal" even though
+	 * the link is trained and MAINLINK_READY_FOR_VIDEO is asserted.
+	 * Matches Linux msm dp_ctrl (DP_TEST_BIT_DEPTH_8 = 1 << 5).
+	 */
+	writel(DP_MISC0_SYNCHRONOUS_CLK | (1 << DP_MISC0_TEST_BITS_DEPTH_SHIFT),
 	       priv->link + REG_DP_MISC1_MISC0);
+	log_warning("DP MSA: mvid=%u nvid=%u misc0=%08x pclk_khz=%llu rate=%u\n",
+		    mvid, nvid, readl(priv->link + REG_DP_MISC1_MISC0),
+		    pclk_khz, priv->rate);
 }
 
+static u64 tachyon_ceil_div(u64 n, u64 d)
+{
+	return d ? (n + d - 1) / d : 0;
+}
+
+/*
+ * Program the DP transfer-unit (TU_SIZE / VALID_BOUNDARY_LINK / DELAY_START_LINK)
+ * following simple, non-boundary-
+ * moderated path, synchronous clock.  The old code hardcoded TU=64 with a
+ * truncated valid_boundary and left DELAY_START_LINK=0 — a malformed transfer
+ * unit the DP->HDMI converter can't extract video from.
+ *
+ *   ratio   = (pclk_khz * bpp) / (link_khz * lanes * 8)
+ *   TU      = the value in [32,64] minimising ceil(ratio*TU) - ratio*TU
+ *   valid   = ceil(ratio * TU)
+ *   delay   = extra_pixclk_in_linkclk + (TU - valid) + extra_buffer_margin
+ * with bpp = 24 (8bpc RGB).  All in fixed-point integer math.
+ */
 static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
 {
-	u64 pclk_khz = priv->timing.pixelclock.typ / 1000;
-	u32 tu_size = 64;
-	u32 valid;
+	const struct display_timing *t = &priv->timing;
+	u64 pclk_khz = t->pixelclock.typ / 1000;
+	u64 link_khz = priv->rate;
+	u32 lanes = priv->lanes;
+	u32 vis = t->hactive.typ;
+	const u32 bpp = 24;			/* 8bpc RGB */
+	const u32 extra_pixclk_cycle_delay = 4;	/* EXTRA_PIXCLK_CYCLE_DELAY */
+	u64 rn, rd, rn_o, rd_o, best_err = ~0ULL;
+	u32 tu, best_tu = 64, valid = 1;
+	u32 extra_margin, num_tus, extra_bytes, extra_pclk, extra_linkclk;
+	u32 filler, delay_start, vb_reg;
 
-	if (!pclk_khz || !priv->lanes || !priv->rate)
+	if (!pclk_khz || !lanes || !link_khz || !vis)
 		return;
 
-	valid = (u32)((pclk_khz * 24 * tu_size) /
-		      (8ULL * priv->lanes * priv->rate));
-	valid = clamp_t(u32, valid, 1, tu_size - 1);
+	rd = link_khz * lanes * 8;
+	rn = pclk_khz * bpp;
+	rd_o = rd;
+	rn_o = rn;
 
-	writel(tu_size - 1, priv->link + REG_DP_TU);
-	writel(valid, priv->link + REG_DP_VALID_BOUNDARY);
-	writel(valid, priv->link + REG_DP_VALID_BOUNDARY_2);
+	/* RATIO_SCALE (~1.001) when the visible width isn't lane-aligned, ratio<1 */
+	if ((vis % lanes) != 0 && rn < rd) {
+		rn *= 1001;
+		rd *= 1000;
+		if (rn > rd)			/* clamp to 1.0 */
+			rn = rd;
+	}
+
+	/* Pick TU in [32,64] minimising ceil(ratio*TU) - ratio*TU. */
+	for (tu = 32; tu <= 64; tu++) {
+		u64 prod = rn * tu;
+		u32 vb = (u32)tachyon_ceil_div(prod, rd);
+		u64 err = (u64)vb * rd - prod;	/* (ceil - exact) * rd, >= 0 */
+
+		if (err < best_err) {
+			best_err = err;
+			best_tu = tu;
+			valid = vb ? vb : 1;
+		}
+	}
+
+	/* DELAY_START_LINK (synchronous clock, no boundary moderation). */
+	extra_margin = (u32)tachyon_ceil_div(link_khz * extra_pixclk_cycle_delay,
+					     pclk_khz);
+	num_tus = (vis * bpp / 8) / valid;
+	extra_bytes = (u32)tachyon_ceil_div((u64)(num_tus + 1) *
+				((u64)valid * rd_o - rn_o * best_tu), rd_o);
+	extra_pclk = (u32)tachyon_ceil_div((u64)extra_bytes * 8, bpp);
+	extra_linkclk = (u32)tachyon_ceil_div((u64)extra_pclk * link_khz, pclk_khz);
+	filler = best_tu - valid;
+	delay_start = extra_linkclk + filler + extra_margin;
+	if (delay_start > 0x3ff)
+		delay_start = 0x3ff;
+
+	vb_reg = (valid & 0x7f) |
+		 ((delay_start & 0x3ff) << REG_DP_DELAY_START_LINK_SHIFT);
+
+	writel(best_tu - 1, priv->link + REG_DP_TU);
+	writel(vb_reg, priv->link + REG_DP_VALID_BOUNDARY);
+	writel(0, priv->link + REG_DP_VALID_BOUNDARY_2);
+	log_warning("DP TU: tu=%u valid=%u delay_start=%u VB=%08x num_tus=%u\n",
+		    best_tu, valid, delay_start, vb_reg, num_tus);
 }
 
 static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
@@ -4727,18 +5043,159 @@ static void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
 	tachyon_dp_program_p0_timing(priv);
 }
 
+/* Fill the framebuffer with vertical colour bars (XRGB8888). */
+static void tachyon_dp_fill_test_pattern(struct video_uc_plat *plat,
+					 struct video_priv *uc_priv)
+{
+	static const u32 bars[8] = {
+		0x00ffffff, 0x00ffff00, 0x0000ffff, 0x0000ff00,
+		0x00ff00ff, 0x00ff0000, 0x000000ff, 0x00303030,
+	};
+	u32 *fb = (u32 *)plat->base;
+	u32 w = uc_priv->xsize, h = uc_priv->ysize;
+	u32 stride = uc_priv->line_length / 4;
+	u32 x, y;
+
+	if (!fb || !w || !h)
+		return;
+
+	for (y = 0; y < h; y++) {
+		u32 *line = fb + (u64)y * stride;
+
+		for (x = 0; x < w; x++)
+			line[x] = bars[(x * 8) / w];
+	}
+	flush_dcache_range((ulong)plat->base,
+			   (ulong)plat->base + (ulong)stride * 4 * h);
+}
+
+/* Dump the DPU pixel-fetch path (CTL/SSPP/LM/INTF) to see if real pixels flow. */
+static void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv)
+{
+	void __iomem *ctl, *sspp, *lm, *intf;
+
+	if (!priv->dpu)
+		return;
+
+	ctl = priv->dpu + DPU_CTL_0_BASE;
+	sspp = priv->dpu + DPU_SSPP_DMA0_BASE;
+	lm = priv->dpu + DPU_LM_0_BASE;
+	intf = priv->dpu + DPU_INTF_0_BASE;
+
+	log_warning("DPU CTL: FLUSH=%08x INTF_ACTIVE=%08x FETCH_PIPE=%08x LAYER0=%08x TOP=%08x\n",
+		    readl(ctl + DPU_CTL_FLUSH), readl(ctl + DPU_CTL_INTF_ACTIVE),
+		    readl(ctl + DPU_CTL_FETCH_PIPE_ACTIVE),
+		    readl(ctl + DPU_CTL_LAYER_0), readl(ctl + DPU_CTL_TOP));
+	log_warning("DPU SSPP: SRC0_ADDR=%08x SRC_SIZE=%08x OUT_SIZE=%08x FORMAT=%08x YSTRIDE=%08x CLK=%08x\n",
+		    readl(sspp + DPU_SSPP_SRC0_ADDR),
+		    readl(sspp + DPU_SSPP_SRC_SIZE),
+		    readl(sspp + DPU_SSPP_OUT_SIZE),
+		    readl(sspp + DPU_SSPP_SRC_FORMAT),
+		    readl(sspp + DPU_SSPP_SRC_YSTRIDE0),
+		    readl(sspp + DPU_SSPP_CLK_CTRL));
+	log_warning("DPU LM_OUT=%08x INTF_STATUS=%08x INTF_MUX=%08x INTF_UNDERFLOW_COLOR=%08x\n",
+		    readl(lm + DPU_LM_OUT_SIZE), readl(intf + DPU_INTF_STATUS),
+		    readl(intf + DPU_INTF_MUX),
+		    readl(intf + DPU_INTF_UNDERFLOW_COLOR));
+}
+
+/*
+ * Dump the DP controller MSA/video registers and the DPU INTF timing-engine
+ * state so we can tell, when the sink shows "No Signal" despite a trained link,
+ * whether the DPU is actually clocking real framebuffer pixels into the DP
+ * interface (frame/line counters advancing) and whether the MSA timing the DP
+ * controller is sending matches the selected mode.
+ */
+static void tachyon_dp_dump_video_state(struct tachyon_dp_priv *priv)
+{
+	const struct display_timing *t = &priv->timing;
+	void __iomem *intf;
+	u32 frame0 = 0, line0 = 0, frame1 = 0, line1 = 0;
+
+	log_warning("DP MSA regs: TOTAL=%08x ACTIVE=%08x SYNC_START=%08x WIDTH_POL=%08x MISC0=%08x MVID=%08x NVID=%08x\n",
+		    readl(priv->link + REG_DP_TOTAL_HOR_VER),
+		    readl(priv->link + REG_DP_ACTIVE_HOR_VER),
+		    readl(priv->link + REG_DP_START_HOR_VER_FROM_SYNC),
+		    readl(priv->link + REG_DP_HSYNC_VSYNC_WIDTH_POLARITY),
+		    readl(priv->link + REG_DP_MISC1_MISC0),
+		    readl(priv->link + REG_DP_SOFTWARE_MVID),
+		    readl(priv->link + REG_DP_SOFTWARE_NVID));
+	log_warning("DP mode expect: %ux%u htotal=%u vtotal=%u pclk=%u STATE_CTRL=%08x READY=%08x\n",
+		    t->hactive.typ, t->vactive.typ, tachyon_dp_htotal(t),
+		    tachyon_dp_vtotal(t), t->pixelclock.typ,
+		    readl(priv->link + REG_DP_STATE_CTRL),
+		    readl(priv->link + REG_DP_MAINLINK_READY));
+
+	if (priv->dpu) {
+		intf = priv->dpu + DPU_INTF_0_BASE;
+		frame0 = readl(intf + DPU_INTF_FRAME_COUNT);
+		line0 = readl(intf + DPU_INTF_LINE_COUNT);
+		mdelay(50);
+		frame1 = readl(intf + DPU_INTF_FRAME_COUNT);
+		line1 = readl(intf + DPU_INTF_LINE_COUNT);
+		log_warning("DPU INTF: TE_EN=%08x frame %u->%u line %u->%u (advancing=%d)\n",
+			    readl(intf + DPU_INTF_TIMING_ENGINE_EN),
+			    frame0, frame1, line0, line1,
+			    (frame1 != frame0) || (line1 != line0));
+	}
+
+	tachyon_dp_dump_dpu_state(priv);
+
+	/*
+	 * Re-assert D0 and read the sink/branch link status AFTER video has been
+	 * sent.  If the branch dropped symbol lock once real video started (TU /
+	 * MVID/NVID mismatch) the lane-status bytes here will show it; if the
+	 * branch sees no downstream HDMI display, SINK_COUNT will be 0.
+	 */
+	{
+		u8 l01 = 0, l23 = 0, align = 0;
+
+		tachyon_dp_sink_power_on(priv);
+		tachyon_dp_aux_retry(priv, false, true, DPCD_LANE0_1_STATUS,
+				     &l01, 1);
+		tachyon_dp_aux_retry(priv, false, true, DPCD_LANE2_3_STATUS,
+				     &l23, 1);
+		tachyon_dp_aux_retry(priv, false, true, DPCD_LANE_ALIGN_STATUS,
+				     &align, 1);
+		log_warning("DP post-video link status: LANE0_1=0x%02x LANE2_3=0x%02x ALIGN=0x%02x\n",
+			    l01, l23, align);
+	}
+}
+
+/* Read + log the sink/branch DPCD lane status, to bracket where the link drops. */
+static void tachyon_dp_log_lanes(struct tachyon_dp_priv *priv, const char *when)
+{
+	u8 l01 = 0, l23 = 0, align = 0;
+
+	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE0_1_STATUS, &l01, 1);
+	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE2_3_STATUS, &l23, 1);
+	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE_ALIGN_STATUS, &align, 1);
+	log_warning("DP lanes @ %s: L01=%02x L23=%02x ALIGN=%02x\n",
+		    when, l01, l23, align);
+}
+
 static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 {
+	tachyon_dp_log_lanes(priv, "mainlink-entry (post-train)");
+
 	writel(DP_SW_RESET, priv->ctrl + REG_DP_SW_RESET);
 	udelay(1000);
 	writel(0, priv->ctrl + REG_DP_SW_RESET);
+	tachyon_dp_log_lanes(priv, "after SW_RESET");
 
 	tachyon_dp_program_video_timing(priv);
 	tachyon_dp_configure_source_link(priv);
-	writel(DP_MAINLINK_CTRL_RESET, priv->link + REG_DP_MAINLINK_CTRL);
-	udelay(1000);
+	/*
+	 * Do NOT pulse DP_MAINLINK_CTRL_RESET here: the link is already trained
+	 * at this point (we run after link training, not before like msm),
+	 * and asserting the mainlink reset — especially holding it for 1ms —
+	 * resets the mainlink and makes the sink lose clock-recovery (lane status
+	 * collapses 0x77 -> 0x00 right here, which was the "No Signal" cause).
+	 * Just (re)enable the mainlink so the freshly programmed MSA is latched.
+	 */
 	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
 	       priv->link + REG_DP_MAINLINK_CTRL);
+	tachyon_dp_log_lanes(priv, "after MAINLINK enable");
 
 	if (tachyon_dp_audio_present(priv)) {
 		tachyon_dp_program_audio_clock(priv);
@@ -4746,9 +5203,47 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 		tachyon_dp_program_audio_enable(priv);
 	}
 
-	return tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
-				    DP_MAINLINK_READY_FOR_VIDEO,
-				    DP_MAINLINK_READY_FOR_VIDEO, 5000);
+	/*
+	 * Start the video stream with this sequence of DP_STATE_CTRL commands to avoid a "No Signal" sink state:
+	 *   1. PUSH_IDLE  — emit idle patterns first to avoid an underflow when
+	 *      the stream switches on (STATE_CTRL must be cleared before each
+	 *      command), then wait for IDLE_PATTERNS_SENT.
+	 *   2. SEND_VIDEO — switch the mainlink to the active video stream.
+	 *   3. Enable MDP->DP backpressure (OVERRIDE_ACK=0) so the DP TX actually
+	 *      pulls pixel data from the MDP.  Without this the controller reports
+	 *      READY_FOR_VIDEO but stays in SEND_IDLE_PATTERN (MAINLINK_READY had
+	 *      bit10 set) and the sink shows "No Signal".
+	 */
+	writel(0, priv->link + REG_DP_STATE_CTRL);
+	writel(DP_STATE_CTRL_PUSH_IDLE, priv->link + REG_DP_STATE_CTRL);
+	tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
+			     DP_MAINLINK_READY_IDLE_PATTERNS_SENT,
+			     DP_MAINLINK_READY_IDLE_PATTERNS_SENT, 2000);
+
+	writel(0, priv->link + REG_DP_STATE_CTRL);
+	writel(DP_STATE_CTRL_SEND_VIDEO, priv->link + REG_DP_STATE_CTRL);
+
+	/* Enable MDP->DP backpressure so pixel data flows (clears OVERRIDE_ACK). */
+	if (priv->p0) {
+		u32 dto = readl(priv->p0 + MMSS_DP_P0CLK_DSC_DTO);
+
+		dto &= ~(DP_P0CLK_DSC_DTO_OVERRIDE_ACK |
+			 DP_P0CLK_DSC_DTO_OVERRIDE_ACK_VALUE);
+		writel(dto, priv->p0 + MMSS_DP_P0CLK_DSC_DTO);
+		log_warning("DP backpressure enabled: DSC_DTO=%08x\n",
+			    readl(priv->p0 + MMSS_DP_P0CLK_DSC_DTO));
+	}
+
+	{
+		int rdy = tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
+					       DP_MAINLINK_READY_FOR_VIDEO,
+					       DP_MAINLINK_READY_FOR_VIDEO, 5000);
+		log_warning("DP mainlink ready-for-video ret=%d MAINLINK_READY=%08x MAINLINK_CTRL=%08x\n",
+			    rdy, readl(priv->link + REG_DP_MAINLINK_READY),
+			    readl(priv->link + REG_DP_MAINLINK_CTRL));
+		tachyon_dp_dump_video_state(priv);
+		return rdy;
+	}
 }
 
 static int tachyon_dpu_init(struct tachyon_dp_priv *priv)
@@ -5750,6 +6245,54 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	tachyon_dp_program_sbu_mux(priv);
 
+	/*
+	 * Bring the DP PHY up to PHY_READY (DP_STATUS) BEFORE AUX.  The ADSP has
+	 * entered DP alt-mode (mux=DP, HPD=1) but AUX still times out unless the
+	 * QMP DP PHY PLL is locked (C_READY/PHY_READY) — otherwise DP_STATUS=00
+	 * and every AUX read fails with DP_INTR_TIMEOUT.  The full rate-specific
+	 * PHY config re-runs later in link training; here we bring it up at a
+	 * safe default (HBR / 2-lane, matching pin-assignment D) purely so
+	 * AUX/EDID can reach the sink.
+	 */
+	if (!priv->rate)
+		priv->rate = DP_LINK_RATE_HBR;
+	if (!priv->lanes)
+		priv->lanes = 2;
+	ret = tachyon_dp_qmp_program_dp_phy(priv);
+	log_warning("DP pre-AUX PHY bring-up ret=%d rate=%u lanes=%u DP_STATUS=%02x\n",
+		    ret, priv->rate, priv->lanes,
+		    tachyon_dp_qmp_status_low(priv));
+
+	/*
+	 * Read the sink's DPCD link caps now that the PHY is ready and AUX is
+	 * up.  The wait_sink HPD-gated DPCD read gets skipped when the cached
+	 * Type-C state is stale (notify reported safe/hpd=0 even though DP is
+	 * actually active), leaving max_rate/max_lanes=0 — which makes the EDID
+	 * mode filter drop *every* mode and the link-train guard bail.  Read
+	 * caps here directly; if it fails or yields nothing, fall back to a
+	 * safe HBR / 2-lane budget so mode selection + link training proceed.
+	 */
+	ret = tachyon_dp_read_dpcd_caps(priv);
+	log_warning("DP pre-AUX DPCD caps ret=%d caps.lanes=%u caps.max_rate=%u max_rate=%u max_lanes=%u\n",
+		    ret, priv->caps.lanes, priv->caps.max_rate,
+		    priv->max_rate, priv->max_lanes);
+	if (ret || !priv->caps.lanes || !priv->caps.max_rate) {
+		priv->caps.lanes = priv->caps.lanes ? priv->caps.lanes : 2;
+		priv->caps.max_rate = priv->caps.max_rate ?
+				      priv->caps.max_rate : DP_LINK_RATE_HBR;
+	}
+	if (!priv->max_rate)
+		priv->max_rate = priv->caps.max_rate;
+	if (!priv->max_lanes)
+		priv->max_lanes = priv->caps.lanes;
+	if (!priv->rate)
+		priv->rate = priv->max_rate;
+	if (!priv->lanes)
+		priv->lanes = priv->max_lanes;
+	log_warning("DP link budget: max_rate=%u max_lanes=%u rate=%u lanes=%u caps.lanes=%u\n",
+		    priv->max_rate, priv->max_lanes, priv->rate, priv->lanes,
+		    priv->caps.lanes);
+
 	log_warning("DP wait sink start with derived Type-C orientation=%u\n",
 		    priv->orientation);
 
@@ -5826,8 +6369,43 @@ static int tachyon_dp_probe(struct udevice *dev)
 	uc_priv->line_length = width * 4;
 	uc_priv->fb_size = uc_priv->line_length * height;
 
+	/*
+	 * bind() leaves plat->size = 0 in manual mode (no boot-time FB
+	 * reservation -> clean Linux handoff).  Set it now that we're actually
+	 * bringing DP up.
+	 */
+	if (!plat->size)
+		plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
+
+	/*
+	 * Allocate the framebuffer below 4 GB.  The DPU SSPP source-address
+	 * register is 32-bit and there's no IOMMU in U-Boot, so a >4 GB buffer
+	 * (the video uclass would reserve it at the top of this 8 GB+ board's RAM)
+	 * has its high bits dropped by the SSPP -> DPU fetches the wrong memory ->
+	 * "No Signal".  Reserve a region below 4 GB via lmb the DPU can address.
+	 */
+	if (!plat->base || (u64)plat->base + plat->size > 0x100000000ULL) {
+		phys_addr_t low = lmb_alloc_base(plat->size, plat->align,
+						 0x100000000ULL, LMB_NOOVERWRITE);
+
+		if (low) {
+			log_warning("DP relocating FB %lx -> %llx (<4GB for DPU SSPP)\n",
+				    (ulong)plat->base, (u64)low);
+			plat->base = (ulong)low;
+		} else {
+			log_warning("DP: lmb <4GB FB alloc failed; DPU may fetch wrong address\n");
+		}
+	}
+
 	video_set_flush_dcache(dev, true);
-	memset((void *)plat->base, 0, plat->size);
+	/*
+	 * Fill the framebuffer with vertical colour bars instead of clearing it
+	 * to black.  If the DPU is genuinely fetching the framebuffer and the DP
+	 * link + dock are working, the TV shows bars; if it still shows "No
+	 * Signal", the dock isn't producing HDMI at all (and a black FB would
+	 * have looked identical, hiding that distinction).
+	 */
+	tachyon_dp_fill_test_pattern(plat, uc_priv);
 
 	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
 	if (ret)
@@ -5861,6 +6439,16 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	bool alt_changed = false;
 	bool mode_changed;
 	int ret;
+
+	/*
+	 * Once the DP link is trained and scanning out, do NOT keep re-poking
+	 * the ADSP altmode service or re-training on every video_sync.  Doing so
+	 * knocks the live DP link back to "safe" (the TV loses signal) and floods
+	 * the console with altmode polls.  Keep the link stable and just let the
+	 * video uclass flush the framebuffer.
+	 */
+	if (priv->dp_link_up)
+		return 0;
 
 	ret = tachyon_dp_refresh_altmode(priv, &alt_changed);
 	if (ret)
@@ -6067,25 +6655,21 @@ static int tachyon_dp_bind(struct udevice *dev)
 {
 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
 
-	plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
 	plat->align = TACHYON_DP_FB_ALIGN;
 
 #if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
-	if ((gd->flags & GD_FLG_RELOC) && tachyon_dp_manual_probe_armed &&
-	    !plat->base) {
-		void *fb;
-
-		fb = memalign(plat->align, plat->size);
-		if (!fb) {
-			log_warning("DP manual framebuffer alloc failed size=%u align=%u\n",
-				    plat->size, plat->align);
-			return -ENOMEM;
-		}
-
-		plat->base = (ulong)fb;
-		log_warning("DP manual framebuffer base=%lx size=%u align=%u\n",
-			    plat->base, plat->size, plat->align);
-	}
+	/*
+	 * Manual (opt-in) mode: reserve NO framebuffer at boot.  A bound video
+	 * device with a non-zero plat->size makes the video uclass reserve FB
+	 * memory and advertise a framebuffer at OS handoff, which wedges Linux's
+	 * DP/GPU IOMMU bring-up (msm-mdss -EINVAL / adreno get_pages -28) even
+	 * though our probe bails -EAGAIN and never touches HW.  Keeping size 0
+	 * makes a normal boot a clean handoff (Linux DP works); the framebuffer
+	 * is allocated below 4 GB in probe() only when "tachyon dp start" runs.
+	 */
+	plat->size = 0;
+#else
+	plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
 #endif
 
 	return 0;

@@ -20,5 +20,17 @@ U_BOOT_DRIVER(qcom_mdss_bus) = {
 	.name		= "qcom_mdss_bus",
 	.id		= UCLASS_SIMPLE_BUS,
 	.of_match	= qcom_mdss_bus_ids,
+	/*
+	 * Probing a child (e.g. the DP controller) probes this parent bus too,
+	 * and the DM core then auto-enables the MDSS node's power-domain + clocks.
+	 * The DP controller (aux/link/ahb @ 0xae90000) lives UNDER the MDSS power
+	 * domain, so this auto-power MUST happen or its AUX block reads back all
+	 * zeros (writes don't stick) and AUX never works.
+	 *
+	 * NOTE: this powers MDSS at boot, which wedges Linux's MDSS/GPU IOMMU
+	 * bring-up at OS handoff (msm-mdss -EINVAL, adreno get_pages -28).  That
+	 * is the documented trade for a U-Boot-DP build; for a clean Linux-DP
+	 * handoff, disable the DP path entirely in the defconfig instead.
+	 */
 	.flags		= DM_FLAG_PRE_RELOC,
 };
