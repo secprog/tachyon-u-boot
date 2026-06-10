@@ -7015,8 +7015,30 @@ static int tachyon_dp_remove(struct udevice *dev)
 {
 	struct tachyon_dp_priv *priv = dev_get_priv(dev);
 
-	tachyon_dp_quiesce(priv);
+	/*
+	 * Seamless handoff (DEFAULT): leave the DPU, DP controller and QMP PHY
+	 * running, still scanning the U-Boot framebuffer (0xfe000000 = the EFI
+	 * GOP fb_base), instead of tearing DP down at OS handoff.  The OS's
+	 * earlycon=efifb renders onto that same live buffer, so the EARLY kernel
+	 * log is visible on the dock through boot, until the native display
+	 * driver (msm_dpu) takes over.  Without this the dock is dark until
+	 * msm_dpu probes (~23s) and only the late log (console=tty0) shows.
+	 *
+	 * Cost: the dispcc DP branch clocks stay enabled, so Linux's
+	 * clk_disable_unused() WARNs "disp_cc_mdss_dp_*_clk stuck at 'on'".  That
+	 * is harmless (everything works) and is silenced by marking those branch
+	 * clocks CLK_IGNORE_UNUSED in the kernel's dispcc-sc7280.c.
+	 *
+	 * Set env "tachyon_dp_clean_handoff" to instead fully tear DP down for a
+	 * cold, quiesced handoff (no early dock log) -- a fallback if msm_dpu
+	 * cannot cleanly take over a live link.
+	 */
+	if (tachyon_dp_env_bool("tachyon_dp_clean_handoff")) {
+		tachyon_dp_quiesce(priv);
+		return 0;
+	}
 
+	log_warning("DP seamless handoff: leaving DP live for OS earlycon=efifb\n");
 	return 0;
 }
 
