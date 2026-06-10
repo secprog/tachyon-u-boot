@@ -2898,7 +2898,21 @@ static int qpg_send_ucsi_connector_reset(struct qpg *pg, u8 port, bool hard)
  */
 static int qpg_send_ucsi_set_uor(struct qpg *pg, u8 port, bool dfp)
 {
-	u16 d2 = (u16)((port + 1) & 0x7f) | (dfp ? 0x80 : 0x100);
+	/*
+	 * SET_UOR command word (the >>16 D2 half): bit[0:6]=connector,
+	 * bit7=DFP role, bit8=UFP role, bit9=ACCEPT_ROLE_SWAPS.
+	 *
+	 * Linux ALWAYS ORs in ACCEPT_ROLE_SWAPS (ucsi.c
+	 * UCSI_SET_UOR_ACCEPT_ROLE_SWAPS = BIT(25) = bit9 of this word).  That
+	 * is the crux of Linux's sink-side data-role path: as a power sink we
+	 * attach UFP, and the dock (a downstream hub = UFP partner) drives the
+	 * DR_Swap to make us DFP — but the PD engine only completes it if we've
+	 * said we accept role swaps.  Our old SET_UOR set the target role but
+	 * NOT the accept bit, so the swap never stuck, DataRole stayed UFP, and
+	 * the ADSP DP-discovery gate (pe_snk.c: PD SUCCESS && DataRole==DFP &&
+	 * ContractState==TBD) never fired.  Match Linux: always accept swaps.
+	 */
+	u16 d2 = (u16)((port + 1) & 0x7f) | (dfp ? 0x80 : 0x100) | 0x200;
 	u64 control = UCSI_CTRL_D2(UCSI_CMD_SET_UOR, d2);
 	u32 old_cci = qpg_ucsi_cci(pg);
 	int ret;
@@ -3264,11 +3278,27 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	if (glink_open_retp)
 		*glink_open_retp = 0;
 
-	ret = qpg_ucsi_prewarm(&qpg_session);
-	qpg_last_ucsi_prewarm_ret = ret;
-	if (ret)
-		log_warning("pmic-glink: UCSI prewarm failed ret=%d; continuing PAN\n",
-			    ret);
+	/*
+	 * Run the UCSI prewarm (PPM_RESET + SET_NOTIFICATION_ENABLE) by default.
+	 * This is the UCSI *initialisation* Linux also performs (ucsi_init); the
+	 * SET_UOR data-role swap and GET_CONNECTOR_STATUS that drive DP entry
+	 * REQUIRE it — without it SET_UOR returns -110 (cci=0) and connector
+	 * status reads connected=0, so the dock never reaches mux=3.  (Confirmed
+	 * on HW: skipping it broke entry; running it then bounce reached mux=3.)
+	 * The "passive" lesson from the Linux altmode driver is to avoid REPEATED
+	 * reset/bounce churn, not to skip the one-time UCSI init.  Escape hatch:
+	 * qpg_no_prewarm=1 skips it for experiments.
+	 */
+	if (!qpg_env_bool("qpg_no_prewarm")) {
+		ret = qpg_ucsi_prewarm(&qpg_session);
+		qpg_last_ucsi_prewarm_ret = ret;
+		if (ret)
+			log_warning("pmic-glink: UCSI prewarm failed ret=%d; continuing PAN\n",
+				    ret);
+	} else {
+		qpg_last_ucsi_prewarm_ret = -ENOENT;
+		log_warning("pmic-glink: UCSI prewarm SKIPPED (qpg_no_prewarm set)\n");
+	}
 
 	qpg_session.pan_acked = false;
 	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
@@ -3415,6 +3445,74 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 		    qpg_public_typec_state_name(qpg_cached_state.typec_state));
 
 	return qpg_cached_altmode_valid ? 0 : -EAGAIN;
+}
+
+/*
+ * E1 (audit): autonomous data-role swap to DFP for the cold DP path.
+ *
+ * Linux's sink path reaches DFP because the dock (a UFP/hub partner) drives the
+ * DR_Swap and we accept it (now that SET_UOR carries ACCEPT_ROLE_SWAPS); if the
+ * dock does NOT self-initiate, the host must request DFP itself.  The ADSP only
+ * starts DP VDM discovery once DataRole==DFP.  So: if a DFP
+ * partner is attached (we are UFP), issue ONE SET_UOR(DFP) and watch for the DP
+ * notify — no PPM_RESET / connector-reset churn.  Returns 1 if DP entered.
+ *
+ * Called from the autonomous DP probe so `tachyon dp start` no longer requires a
+ * manual `qpg bounce`.  Gate with tachyon_dp_auto_dfp=0 to keep it pure-passive.
+ */
+int qcom_pmic_glink_request_dfp(u32 settle_ms)
+{
+	struct qcom_pmic_glink_altmode altmode = {};
+	struct qcom_pmic_glink_altmode_state state = {};
+	ulong start, last_notify_ms = 0;
+	u32 status;
+	u8 partner_type;
+	bool connected;
+	int ret;
+
+	ret = qpg_open_session(&altmode, NULL, NULL, NULL);
+	if (ret)
+		return ret;
+
+	/* Read the current connector role (partner_type bits [31:29]). */
+	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
+	status = get_unaligned_le32(qpg_session.ucsi_read_buffer + 16);
+	connected = status & BIT(19);
+	partner_type = (status >> 29) & 0x7;
+	log_warning("qpg: auto-DFP connected=%u partner_type=%u (1=DFP attached, we are UFP)\n",
+		    connected, partner_type);
+
+	if (!connected || partner_type != 1) {
+		log_warning("qpg: auto-DFP skipped (no DFP partner to swap against)\n");
+		return 0;
+	}
+
+	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
+	log_warning("qpg: auto-DFP SET_UOR(DFP) ret=%d\n", ret);
+
+	if (!settle_ms)
+		settle_ms = 4000;
+	start = get_timer(0);
+	while (get_timer(start) < settle_ms) {
+		ret = qcom_pmic_glink_altmode_poll(&state, 20);
+		if (ret && ret != -ETIMEDOUT)
+			break;
+		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
+			last_notify_ms = state.last_notify_ms;
+			log_warning("qpg: auto-DFP notify mux=%u dpam=%02x hpd=%u dp_seen=%u\n",
+				    state.mux, state.dpam_raw, state.hpd,
+				    state.dp_seen);
+		}
+		if (state.dp_seen || state.mux == 3) {
+			log_warning("qpg: auto-DFP entered DP (mux=%u hpd=%u)\n",
+				    state.mux, state.hpd);
+			return 1;
+		}
+	}
+
+	log_warning("qpg: auto-DFP done dp_seen=%u mux=%u\n",
+		    state.dp_seen, state.mux);
+	return 0;
 }
 
 static int do_qpg_service(struct cmd_tbl *cmdtp, int flag, int argc,
@@ -3880,9 +3978,85 @@ static int do_qpg_vdm(struct cmd_tbl *cmdtp, int flag, int argc,
 	return CMD_RET_SUCCESS;
 }
 
+/*
+ * do_qpg_listen: PASSIVE DP-entry listener, faithful to Linux's
+ * pmic_glink_altmode — which ONLY subscribes (PAN_EN) and receives
+ * USBC_NOTIFY_IND, never issuing UCSI / PPM_RESET / SET_UOR / CONNECTOR_RESET
+ * on the DP path.  Opens the GLINK session (prewarm auto-skipped unless
+ * qpg_prewarm=1), sends PAN_EN, then ONLY receives + auto-acks notifications
+ * for the window — zero UCSI churn.  Attach the
+ * dock FRESH during the window so the ADSP + dock complete the
+ * data-role-swap-to-DFP + DP Enter-Mode VDM autonomously 
+ * (PD SUCCESS && DataRole==DFP && ContractState==TBD).
+ */
+static int do_qpg_listen(struct cmd_tbl *cmdtp, int flag, int argc,
+			 char *const argv[])
+{
+	struct qcom_pmic_glink_altmode_state state = {};
+	struct qcom_pmic_glink_altmode altmode = {};
+	int adsp_ret = 0;
+	int open_ret = 0;
+	int pan_ret = 0;
+	ulong start;
+	ulong last_notify_ms = 0;
+	u32 window_ms = 30000;
+	int ret;
+
+	if (argc > 2)
+		return CMD_RET_USAGE;
+	if (argc == 2)
+		window_ms = simple_strtoul(argv[1], NULL, 0);
+	if (!window_ms)
+		window_ms = 30000;
+
+	printf("qpg: listen PASSIVE (PAN_EN + receive only, like Linux pmic_glink_altmode)\n");
+
+	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
+	qpg_cached_state.service_started = !ret;
+	qpg_cached_state.pan_enabled = !ret;
+	printf("qpg: ADSP boot ret=%d GLINK ret=%d prewarm ret=%d PAN_EN ret=%d\n",
+	       adsp_ret, open_ret, qpg_last_ucsi_prewarm_ret, pan_ret);
+	if (ret)
+		return CMD_RET_FAILURE;
+
+	printf("qpg: >>> ATTACH THE DOCK NOW (fresh USB-C plug); waiting %u ms for mux=3 <<<\n",
+	       window_ms);
+
+	start = get_timer(0);
+	while (get_timer(start) < window_ms) {
+		ret = qcom_pmic_glink_altmode_poll(&state, 20);
+		if (ret && ret != -ETIMEDOUT)
+			break;
+
+		/*
+		 * PASSIVE: deliberately do NOT call qpg_service_ucsi_change()
+		 * here — no UCSI traffic at all, just receive + auto-ack PAN.
+		 */
+		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
+			last_notify_ms = state.last_notify_ms;
+			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x dp_pin=%u hpd=%u dp_seen=%u\n",
+			       get_timer(start),
+			       qpg_public_typec_state_name(state.typec_state),
+			       state.svid, state.orientation_raw, state.mux,
+			       state.dpam_raw, state.dp_pin_assignment,
+			       state.hpd, state.dp_seen);
+			if (state.dp_seen || state.mux == 3)
+				printf("qpg: *** DP ENTERED PASSIVELY (mux=%u hpd=%u) — now run 'tachyon dp start' ***\n",
+				       state.mux, state.hpd);
+		}
+	}
+
+	printf("qpg: listen done dp_seen=%u mux=%u hpd=%u dpam=%02x\n",
+	       state.dp_seen, state.mux, state.hpd, state.dpam_raw);
+
+	return CMD_RET_SUCCESS;
+}
+
 static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 		  char *const argv[])
 {
+	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "listen"))
+		return do_qpg_listen(cmdtp, flag, argc - 1, argv + 1);
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "vdm"))
 		return do_qpg_vdm(cmdtp, flag, argc - 1, argv + 1);
 	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "service"))
@@ -3902,6 +4076,7 @@ static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
 U_BOOT_CMD(
 	qpg, 3, 1, do_qpg,
 	"Qualcomm PMIC-GLINK diagnostics",
+	"listen [ms] - PASSIVE (Linux-style): PAN_EN + receive only, no UCSI/reset; fresh-attach dock to enter DP\n"
 	"service [timeout_ms] - keep PMIC-GLINK altmode service alive and print notifications\n"
 	"reset [hard] - UCSI connector reset to force re-attach + DP alt-mode re-entry\n"
 	"dfp [timeout_ms] - UCSI SET_UOR data-role swap to DFP/host, then watch for DP\n"

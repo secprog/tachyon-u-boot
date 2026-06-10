@@ -43,10 +43,16 @@ CONFIG_QCOM_RPMH_POWER_DOMAIN=y
 CONFIG_CLK_QCOM_SC7280_DISPCC=y
 CONFIG_PINCTRL_QCOM_SC7280=y
 CONFIG_VIDEO=y
-# Direct-PHY USB-C DP (edk2/HALDPLib model: force the combo PHY into DP mode +
-# link-train, no ADSP/alt-mode). Manual mode (CMD, not auto-probe VIDEO_*) so it
-# only runs on `tachyon dp start` — no boot-time pollution of the Linux handoff.
 # CONFIG_VIDEO_QCOM_TACHYON_DP is not set
+# DEFAULT = clean handoff: the DP path is DISABLED so U-Boot leaves the shared
+# MDSS/GPU/USB-C hardware untouched and LINUX DP works (TV shows the desktop).
+# CONFIRMED this session: enabling CONFIG_CMD_TACHYON_DP (the DP video driver,
+# which binds at boot) wedges Linux's display/GPU SMMU/IOMMU (msm-mdss -EINVAL,
+# adreno get_pages -28) even though its probe bails -EAGAIN; MDSS_BUS and the
+# combo PHY each ALONE are harmless.  To build a U-Boot-DP test image (e.g. for a
+# NATIVE USB-C DP monitor — the HP hub won't enter DP alt-mode from cold U-Boot)
+# re-enable all three below; expect Linux DP to need a cold power-cycle after.
+# DP-test image: VDM trigger (qpg vdm) + pin-aware combo mode + MDSS power.
 CONFIG_CMD_TACHYON_DP=y
 CONFIG_QCOM_MDSS_BUS=y
 CONFIG_PHY_QCOM_QMP_COMBO=y

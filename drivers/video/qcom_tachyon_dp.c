@@ -29,6 +29,7 @@
 #include <generic-phy.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/kernel.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
@@ -36,7 +37,9 @@
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
+#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/pmic_glink.h>
+#include <soc/qcom/tcs.h>
 #include <video.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -145,6 +148,14 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DP_MAINLINK_CTRL_ENABLE		BIT(0)
 #define DP_MAINLINK_CTRL_RESET		BIT(1)
 #define DP_MAINLINK_FB_BOUNDARY_SEL	BIT(25)
+/*
+ * MAINLINK_CTRL FLUSH_MODE[24:23] = 3 (SDE_PERIPH_UPDATE): make MSA/SDP updates
+ * latch into the live stream.  Linux msm_dp_setup_peripheral_flush() ORs this
+ * into MAINLINK_CTRL (dp_reg.h DP_MAINLINK_FLUSH_MODE_SDE_PERIPH_UPDATE =
+ * FIELD_PREP(GENMASK(24,23),3)); without it the freshly-programmed MSA may
+ * never reach the active stream -> trained link, READY_FOR_VIDEO, but blank.
+ */
+#define DP_MAINLINK_CTRL_FLUSH_MODE	(3 << 23)
 #define REG_DP_STATE_CTRL		0x004
 #define DP_STATE_CTRL_LINK_TRAINING_PATTERN1 BIT(0)
 #define DP_STATE_CTRL_LINK_TRAINING_PATTERN2 BIT(1)
@@ -259,6 +270,19 @@ DECLARE_GLOBAL_DATA_PTR;
 #define MMSS_DP_INTF_ACTIVE_HCTL	0x050
 #define MMSS_DP_INTF_POLARITY_CTL	0x058
 /*
+ * DP controller built-in Test Pattern Generator (BIST) — p0 region.  In Linux
+ * (msm_dp_panel_tpg_enable) the p0 MMSS_DP_INTF_* timing engine + these BIST/TPG
+ * registers are ONLY used to drive an internal checkered pattern, bypassing the
+ * DPU entirely.  Normal DPU-sourced video never enables the p0 timing engine.
+ */
+#define MMSS_DP_BIST_ENABLE		0x000
+#define DP_BIST_ENABLE_DPBIST_EN	BIT(0)
+#define MMSS_DP_TPG_MAIN_CONTROL	0x060
+#define DP_TPG_CHECKERED_RECT_PATTERN	0x100
+#define MMSS_DP_TPG_VIDEO_CONFIG	0x064
+#define DP_TPG_VIDEO_CONFIG_BPP_8BIT	0x01
+#define DP_TPG_VIDEO_CONFIG_RGB		0x04
+/*
  * DP_P0CLK_DSC_DTO (p0 region, abs 0xae9107c = p0 + 0x07c).  Controls MDP->DP
  * backpressure: OVERRIDE_ACK (bit1) = 0 enables backpressure so the DP TX pulls
  * pixel data from the MDP; = 1 stops the data flow.  OVERRIDE_ACK_VALUE (bit2).
@@ -303,11 +327,62 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DPU_SSPP_QOS_CTRL		0x06c
 #define DPU_SSPP_CLK_CTRL		0x330
 #define DPU_SSPP_PE_OVERRIDE		BIT(31)
-#define DPU_FORMAT_XRGB8888		0x000236a8
+/*
+ * SSPP software pixel-extension registers.  When SRC_OP_MODE.PE_OVERRIDE is set
+ * the HW uses these REQ_PIXELS counts for the per-line fetch instead of deriving
+ * them from SRC_SIZE.  Linux ALWAYS pairs PE_OVERRIDE with REQ_PIXELS=(h<<16)|w
+ * (dpu_hw_sspp setup_pe_config); leaving them at reset 0 makes the pipe fetch 0
+ * pixels -> the staged plane is transparent/black even though composited.
+ */
+#define DPU_SSPP_SW_PIX_EXT_C0_LR	0x100
+#define DPU_SSPP_SW_PIX_EXT_C0_TB	0x104
+#define DPU_SSPP_SW_PIX_EXT_C0_REQ_PIXELS 0x108
+/*
+ * SSPP multirect op-mode.  Linux always programs this to RECT_SOLO (0) for a
+ * single (non-SmartDMA) pipe (dpu_hw_sspp.c:147-178 via dpu_plane.c).  DMA0 on
+ * sc7280 has SMART_DMA_V2, so a prior UEFI/XBL GOP stage could leave it in a
+ * multirect mode across a warm path -> RECT0 would not output.  Force SOLO.
+ */
+#define DPU_SSPP_MULTIRECT_OPMODE	0x170
+/*
+ * 8-level CREQ QoS LUT (DPU >=v4 / sc7280 core_major_ver=7): the real CREQ LUT is
+ * at 0x74/0x78, NOT the legacy 4-level 0x68.  With QOS_CTRL danger/safe enabled
+ * but the 8-level CREQ LUT left at 0, the pipe can be credit-starved.  Linux
+ * sc7180_qos_linear = 0x0011222222335777 -> LUT_0(0x74)=0x22335777,
+ * LUT_1(0x78)=0x00112222.
+ */
+#define DPU_SSPP_CREQ_LUT_0		0x074
+#define DPU_SSPP_CREQ_LUT_1		0x078
+/*
+ * SSPP SRC_FORMAT for XRGB8888: the per-component bpc fields must all be BPC8
+ * (=3).  The old 0x000236a8 declared sub-8bpc components, so the DPU fetched
+ * our 8bpc XRGB8888 framebuffer as if it were lower depth -> wrong pixels into
+ * the DP INTF.  0x000236ff has all bpc fields = 3 (matches Linux dpu_hw_sspp
+ * src_format for XRGB8888: mdp_format.c BPC8A/BPC8/BPC8/BPC8, BPC8=3).
+ */
+#define DPU_FORMAT_XRGB8888		0x000236ff
 #define DPU_UNPACK_XRGB8888		0x03020001
 
 #define DPU_LM_OP_MODE			0x000
 #define DPU_LM_OUT_SIZE		0x004
+/*
+ * LM stage-0 blend registers (SC7280 sc7180_lm_sblk: blendstage_base[0]=0x20,
+ * relative to the mixer base).  LM_BLEND0_OP=stage_base+0x00, CONST_ALPHA=+0x04
+ * (Linux dpu_hw_lm.c).  Values for one opaque foreground plane over background:
+ *   OP          = FG_ALPHA_FG_CONST(0) | BG_ALPHA_BG_CONST(1<<8)        = 0x100
+ *   CONST_ALPHA = (bg>>8) | ((fg>>8)<<16), fg=0xffff bg=0               = 0x00ff0000
+ *   LM_OP_MODE  = BIT(stage) for DPU_STAGE_0                            = BIT(1)
+ */
+#define DPU_LM_BLEND0_OP		0x020
+#define DPU_LM_BLEND0_CONST_ALPHA	0x024
+#define DPU_LM_BLEND0_OP_VAL		0x00000100
+#define DPU_LM_BLEND0_CONST_ALPHA_VAL	0x00ff0000
+#define DPU_LM_OP_MODE_STAGE0		BIT(1)
+/* LM border color (mixer output where no pipe composites) — RED diagnostic. */
+#define DPU_LM_BORDER_COLOR_0		0x008
+#define DPU_LM_BORDER_COLOR_1		0x010
+#define DPU_LM_BORDER_RED_0		0x00000fff	/* R=0xfff | G<<16=0 */
+#define DPU_LM_BORDER_RED_1		0x0fff0000	/* B=0 | A=0xfff<<16 */
 
 #define DPU_CTL_LAYER_0		0x000
 #define DPU_CTL_LAYER_EXT_0		0x040
@@ -322,7 +397,19 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DPU_CTL_INTF_FLUSH		0x110
 #define DPU_CTL_PERIPH_FLUSH		0x128
 #define DPU_CTL_LAYER_BORDER_OUT	BIT(24)
-#define DPU_CTL_LAYER_DMA0_STAGE0	(1 << 18)
+/*
+ * CTL_LAYER stage field for SSPP_DMA0.  Linux dpu_hw_ctl_setup_blendstage
+ * (dpu_hw_ctl.c:532-552) loops i=0..stages and writes mix=(i+1) for the pipe at
+ * stage_cfg->stage[i].  The fullscreen plane is placed at pstate->stage =
+ * DPU_STAGE_0 (dpu_plane.c:838) and DPU_STAGE_0 = 1 (DPU_STAGE_BASE=0 is the
+ * background), so stage_cfg->stage[1] = DMA0 -> i=1 -> mix = (1+1) = 2 ->
+ * (2<<18).  ctl_blend_config[SSPP_DMA0] = {idx 0, shift 18}; BORDER_OUT always set.
+ * This MUST agree with LM_OP_MODE = (1<<DPU_STAGE_0) = BIT(1) and the BLEND0
+ * block at LM+0x20.  (mix=1 selects DPU_STAGE_BASE, which has NO blend block, so
+ * the pipe is never composited -> mixer emits border only = black screen with a
+ * valid signal.  An earlier change to 1<<18 was this exact regression.)
+ */
+#define DPU_CTL_LAYER_DMA0_STAGE0	(2 << 18)
 #define DPU_CTL_FLUSH_DMA0		BIT(11)
 #define DPU_CTL_FLUSH_LM0		BIT(6)
 #define DPU_CTL_FLUSH_CTL		BIT(17)
@@ -354,10 +441,29 @@ DECLARE_GLOBAL_DATA_PTR;
 #define DPU_INTF_MUX			0x25c
 #define DPU_INTF_STATUS			0x26c
 #define DPU_INTF_CONFIG2_DATA_HCTL_EN	BIT(4)
-#define DPU_INTF_FORMAT_XRGB8888	0x000021a8
+/* INTF_CONFIG active-region enables for a DP interface (Linux dpu_hw_intf
+ * dp_intf path ORs both into INTF_CONFIG; without them the active HCTL/VCTL
+ * data window is not emitted -> sink sees blanking only = "No Signal"). */
+#define DPU_INTF_CFG_ACTIVE_H_EN	BIT(29)
+#define DPU_INTF_CFG_ACTIVE_V_EN	BIT(30)
+/*
+ * INTF PANEL_FORMAT for RGB888: bpc fields all BPC8(=3) plus 0x21<<8.  Old
+ * 0x000021a8 declared sub-8bpc; 0x0000213f = BPC8 for g/b/r + 0x21<<8 (matches
+ * Linux dpu_hw_intf_setup_timing_engine panel_format for RGB888).
+ */
+#define DPU_INTF_FORMAT_XRGB8888	0x0000213f
 
 #define VBIF_XINL_QOS_RPT_CTRL		0xd00
 #define VBIF_XINL_QOS_LVL_PRIO_0	0xd20
+/* VBIF xin (AXI master) init registers — XBL/Linux program these; U-Boot must too. */
+#define VBIF_OUT_AXI_AMEMTYPE_CONF0	0x160	/* xins 0-7,  3-bit memtype each */
+#define VBIF_OUT_AXI_AMEMTYPE_CONF1	0x164	/* xins 8-13 */
+#define VBIF_XIN_PND_ERR		0x190
+#define VBIF_XIN_SRC_ERR		0x194
+#define VBIF_XIN_CLR_ERR		0x19c
+#define VBIF_XIN_HALT_CTRL0		0x200	/* write BIT(xin) to halt */
+#define VBIF_XIN_HALT_CTRL1		0x204	/* read BIT(xin): 1 = halted */
+#define VBIF_DMA0_XIN_ID		1
 
 #define QMP_V3_DP_COM_PHY_MODE_CTRL	0x000
 #define QMP_V3_DP_COM_TYPEC_CTRL	0x010
@@ -1621,24 +1727,6 @@ static u8 tachyon_dp_qmp_com_readb(struct tachyon_dp_priv *priv, u32 reg)
 }
 
 /*
- * Dump the QMP COM control and status register set for diagnostics.
- */
-static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
-				    const char *tag)
-{
-	log_warning("QMP COM %s: PWR=%02x RESET_OVRD=%02x SW_RESET=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x\n",
-		    tag,
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SWI_CTRL),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
-		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
-		    readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
-		    readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff);
-}
-
-/*
  * Slim COM update: ONLY writes TYPEC_CTRL and PHY_MODE_CTRL.
  * The phy-qcom-qmp-combo provider owns POWER_DOWN_CTRL, RESET_OVRD_CTRL,
  * SW_RESET, and SWI_CTRL via generic_phy_init().
@@ -1656,7 +1744,18 @@ static void tachyon_dp_qmp_com_dump(struct tachyon_dp_priv *priv,
  */
 static u8 tachyon_dp_qmp_phy_mode(struct tachyon_dp_priv *priv)
 {
-	if (tachyon_dp_pin_assignment_lanes(priv) >= 4)
+	u8 dp_lanes = tachyon_dp_pin_assignment_lanes(priv);
+
+	/*
+	 * Without a valid Type-C pin assignment (e.g. an early call before the
+	 * forced/diagnostic path has chosen one) the pin lane count is 0; fall
+	 * back to the link's resolved lane count so the combo split always
+	 * tracks the number of DP lanes we actually drive.
+	 */
+	if (!dp_lanes)
+		dp_lanes = priv->lanes ? priv->lanes : priv->max_lanes;
+
+	if (dp_lanes >= 4)
 		return QMP_DP_COM_DP_MODE;
 	return QMP_DP_COM_DP_MODE | QMP_DP_COM_USB3_MODE;
 }
@@ -1749,16 +1848,33 @@ static void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
 {
+	bool reverse = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE;
 	/*
-	 * Bring the DP PHY out of powerdown/clamp using the 4-lane Qualcomm
-	 * HAL value. PD_CTL is mostly active-low enables, so this is not 0.
+	 * PD_CTL out of powerdown/clamp, powering up ONLY the DP lanes actually
+	 * in use.  A 2-lane (pin D/F) link must leave the other pair powered down
+	 * so DP lands on the correct physical lanes; the old unconditional 0x7d
+	 * (4-lane) powered all four even for a 2-lane combo (MODE=0x03), which can
+	 * mis-route the link.  Matches Linux qmp_combo_configure_dp_mode():
+	 *   base = PWRDN_B|AUX_PWRDN_B|PLL_PWRDN_B|DP_CLAMP_EN_B (0x65)
+	 *   + LANE_0_1_PWRDN_B if 4-lane OR reversed
+	 *   + LANE_2_3_PWRDN_B if 4-lane OR normal
+	 * => 4-lane=0x7d, 2-lane normal=0x75, 2-lane reverse=0x6d.
+	 * (PD_CTL bits are active-low enables: a set *_B bit powers that block.)
 	 */
-	writel(QMP_DP_PHY_PD_CTL_4LANE_ON, priv->phy_dp + QMP_DP_PHY_PD_CTL);
+	u8 pd = QMP_DP_PHY_PD_CTL_PWRDN_B | QMP_DP_PHY_PD_CTL_AUX_PWRDN_B |
+		QMP_DP_PHY_PD_CTL_PLL_PWRDN_B | QMP_DP_PHY_PD_CTL_DP_CLAMP_EN_B;
+
+	if (priv->lanes >= 4 || reverse)
+		pd |= QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN_B;
+	if (priv->lanes >= 4 || !reverse)
+		pd |= QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN_B;
+
+	writel(pd, priv->phy_dp + QMP_DP_PHY_PD_CTL);
 	udelay(100);
 	priv->qmp_dp_touched = true;
 
-	log_warning("QMP DP power-up all lanes: PD=%02x STATUS=%02x\n",
-		    tachyon_dp_qmp_pd_low(priv),
+	log_warning("QMP DP power-up lanes=%u reverse=%d: PD_CTL=%02x STATUS=%02x\n",
+		    priv->lanes, reverse, tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 }
 
@@ -2490,26 +2606,6 @@ static int tachyon_dp_qmp_v4_configure_dp_phy(struct tachyon_dp_priv *priv)
 	log_warning("QMP DP V4 post-cfg 18->19 done\n");
 
 	return 0;
-}
-
-/*
- * Phase 11: Controlled teardown for retune.
- * Only used if forced RBR x4 fails during training after the initial
- * successful pre-DPCD configure.
- */
-static void tachyon_dp_qmp_dp_phy_teardown_for_retune(struct tachyon_dp_priv *priv)
-{
-	void __iomem *serdes = priv->qmp_dp_serdes;
-
-	log_warning("QMP DP teardown for retune\n");
-
-	writel(0x00, priv->phy_dp + QMP_DP_PHY_CFG);
-	writel(0x00, serdes + QMP_V4_COM_RESETSM_CNTRL);
-	tachyon_dp_qmp_power_down(priv);
-	writel(0x01, serdes + QMP_V4_COM_SW_RESET);
-	udelay(100);
-
-	tachyon_dp_qmp_dump_pll_state(priv, "after teardown");
 }
 
 static void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv)
@@ -3950,6 +4046,19 @@ static void tachyon_dp_apply_dp_porch_adjust(struct tachyon_dp_priv *priv)
 {
 	struct display_timing *t = &priv->timing;
 
+	/*
+	 * Linux drives this hardware with the STANDARD CEA porch distribution
+	 * (front porch intact).  Folding the front porch into the back porch
+	 * (active region bottom-right) makes the MSA declare hsync_start right
+	 * after active (hfp=0) -> the DP->HDMI dock regenerates NON-CEA HDMI
+	 * timing the monitor rejects ("No Signal"), and the same non-standard
+	 * timing feeds the DP controller's own BIST (so even TPG was blank).
+	 * Default: leave the porches as the mode defines them (== Linux).  Set
+	 * tachyon_dp_porch_adjust=1 to restore the old bottom-right fold.
+	 */
+	if (!tachyon_dp_env_bool("tachyon_dp_porch_adjust"))
+		return;
+
 	tachyon_dp_timing_entry(&t->hback_porch,
 				t->hback_porch.typ + t->hfront_porch.typ);
 	tachyon_dp_timing_entry(&t->hfront_porch, 0);
@@ -4151,6 +4260,20 @@ static void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv)
 
 	priv->max_lanes = min_t(u8, priv->graph_lanes ?: 1,
 				tachyon_dp_pin_assignment_lanes(priv));
+
+	/*
+	 * Optional hard override for bring-up: tachyon_dp_force_lanes caps the
+	 * trained lane count (1-4) regardless of pin/sink, so a flaky high lane
+	 * can be ruled out without a rebuild.
+	 */
+	if (tachyon_dp_env_has_u32("tachyon_dp_force_lanes")) {
+		u8 fl = tachyon_dp_env_u32("tachyon_dp_force_lanes",
+					   priv->max_lanes);
+
+		if (fl >= 1 && fl <= 4)
+			priv->max_lanes = min_t(u8, priv->max_lanes, fl);
+	}
+
 	priv->lanes = min_t(u8, priv->caps.lanes ?: 1, priv->max_lanes);
 	priv->max_rate = min(priv->caps.max_rate,
 			     tachyon_dp_env_u32("tachyon_dp_max_rate",
@@ -4172,17 +4295,19 @@ static u8 tachyon_dp_bw_code(u32 rate)
 static u32 tachyon_dp_configuration_ctrl(struct tachyon_dp_priv *priv)
 {
 	/*
-	 *  - STATIC_DYNAMIC_COUNTER = 1 for our synchronous-clock stream.
-	 *  - BPC = 1 (8bpc).  Previously 2 (10bpc), which made the controller
-	 *    packetize 30bpp over our 24bpp XRGB8888 pixels -> the DP->HDMI dock
-	 *    couldn't lock the stream (post-video lane status collapsed to 0) and
-	 *    the TV showed "No Signal".
-	 *  - PROGRESSIVE_INTERLACED (bit2) = 0: our modes are progressive.  This
-	 *    was wrongly forced to 1 (interlaced).
-	 *  - SYNC_ASYNC_CLOCK (bit0) = 0: leaves it clear; sync vs async is
-	 *    expressed via STATIC_DYNAMIC_COUNTER, not this bit.
+	 *  - SYNC_ASYNC_CLK (bit0) + STATIC_DYNAMIC_CN (bit1): synchronous clock
+	 *    + static Mvid.  Linux msm dp_ctrl sets BOTH ("sync clock & static
+	 *    Mvid", dp_ctrl.c:421-422); we previously set only bit1.
+	 *  - P_INTERLACED (bit2): in this controller SETTING the bit selects
+	 *    PROGRESSIVE — Linux dp_ctrl.c:418 ORs DP_CONFIGURATION_CTRL_P_INTERLACED
+	 *    with the comment "progressive video".  We previously CLEARED it, which
+	 *    tells the TX the stream is interlaced -> a progressive DP->HDMI dock
+	 *    rejects the MSA = "No Signal".  (The macro name is misleading; set=prog.)
+	 *  - BPC = 1 (8bpc) for our 24bpp XRGB8888 pixels.
 	 */
-	u32 cfg = DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
+	u32 cfg = DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK |
+		  DP_CONFIGURATION_CTRL_STATIC_DYNAMIC_CN |
+		  DP_CONFIGURATION_CTRL_P_INTERLACED |
 		  (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT) |
 		  ((priv->lanes - 1) <<
 		   DP_CONFIGURATION_CTRL_NUM_OF_LANES_SHIFT) |
@@ -4244,7 +4369,8 @@ static void tachyon_dp_mainlink_enable_training(struct tachyon_dp_priv *priv)
 	val &= ~DP_MAINLINK_CTRL_RESET;
 	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
 
-	val |= DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL;
+	val |= DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL |
+	       DP_MAINLINK_CTRL_FLUSH_MODE;
 	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
 
 	log_warning("DP mainlink enable linux-seq: MAINLINK_CTRL=%08x MAINLINK_READY=%08x STATE_CTRL=%08x\n",
@@ -4903,88 +5029,895 @@ static void tachyon_dp_program_msa_clock(struct tachyon_dp_priv *priv)
 		    pclk_khz, priv->rate);
 }
 
-static u64 tachyon_ceil_div(u64 n, u64 d)
+/*
+ * --------------------------------------------------------------------------
+ * DP transfer-unit (TU) calculation -- bit-exact port of the Linux msm DP
+ * driver's _dp_ctrl_calc_tu() + helpers (drivers/gpu/drm/msm/dp/dp_ctrl.c),
+ * verified against the standalone reference tu_calc_ref.c.  Computes
+ * TU_SIZE / VALID_BOUNDARY_LINK / DELAY_START_LINK and the boundary-
+ * moderation parameters for ANY mode (the old code hardcoded the 1080p
+ * values and fell back to a boundary-moderation-less calc otherwise, which
+ * the dock would not frame-lock).  DRM 32.32 signed fixed-point exactly as
+ * include/drm/drm_fixed.h.
+ * --------------------------------------------------------------------------
+ */
+#define TDP_FXP_POINT		32
+#define TDP_FXP_ONE		(1ULL << TDP_FXP_POINT)
+#define TDP_FXP_ALMOST_ONE	(TDP_FXP_ONE - 1ULL)
+
+static u64 tdp_div64_u64_rem(u64 dividend, u64 divisor, s64 *rem)
 {
-	return d ? (n + d - 1) / d : 0;
+	*rem = (s64)(dividend % divisor);
+	return dividend / divisor;
 }
 
-/*
- * Program the DP transfer-unit (TU_SIZE / VALID_BOUNDARY_LINK / DELAY_START_LINK)
- * following simple, non-boundary-
- * moderated path, synchronous clock.  The old code hardcoded TU=64 with a
- * truncated valid_boundary and left DELAY_START_LINK=0 — a malformed transfer
- * unit the DP->HDMI converter can't extract video from.
- *
- *   ratio   = (pclk_khz * bpp) / (link_khz * lanes * 8)
- *   TU      = the value in [32,64] minimising ceil(ratio*TU) - ratio*TU
- *   valid   = ceil(ratio * TU)
- *   delay   = extra_pixclk_in_linkclk + (TU - valid) + extra_buffer_margin
- * with bpp = 24 (8bpc RGB).  All in fixed-point integer math.
- */
-static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
+static int tdp_fixp2int(s64 a)
 {
-	const struct display_timing *t = &priv->timing;
-	u64 pclk_khz = t->pixelclock.typ / 1000;
-	u64 link_khz = priv->rate;
-	u32 lanes = priv->lanes;
-	u32 vis = t->hactive.typ;
-	const u32 bpp = 24;			/* 8bpc RGB */
-	const u32 extra_pixclk_cycle_delay = 4;	/* EXTRA_PIXCLK_CYCLE_DELAY */
-	u64 rn, rd, rn_o, rd_o, best_err = ~0ULL;
-	u32 tu, best_tu = 64, valid = 1;
-	u32 extra_margin, num_tus, extra_bytes, extra_pclk, extra_linkclk;
-	u32 filler, delay_start, vb_reg;
+	return (int)(a >> TDP_FXP_POINT);
+}
 
-	if (!pclk_khz || !lanes || !link_khz || !vis)
-		return;
+static int tdp_fixp2int_ceil(s64 a)
+{
+	if (a >= 0)
+		return tdp_fixp2int(a + TDP_FXP_ALMOST_ONE);
+	return tdp_fixp2int(a - TDP_FXP_ALMOST_ONE);
+}
 
-	rd = link_khz * lanes * 8;
-	rn = pclk_khz * bpp;
-	rd_o = rd;
-	rn_o = rn;
+static unsigned int tdp_fixp_msbset(s64 a)
+{
+	unsigned int shift, sign = (a >> 63) & 1;
 
-	/* RATIO_SCALE (~1.001) when the visible width isn't lane-aligned, ratio<1 */
-	if ((vis % lanes) != 0 && rn < rd) {
-		rn *= 1001;
-		rd *= 1000;
-		if (rn > rd)			/* clamp to 1.0 */
-			rn = rd;
+	for (shift = 62; shift > 0; --shift)
+		if (((a >> shift) & 1) != sign)
+			return shift;
+	return 0;
+}
+
+static s64 tdp_fixp_mul(s64 a, s64 b)
+{
+	unsigned int shift = tdp_fixp_msbset(a) + tdp_fixp_msbset(b);
+	s64 result;
+
+	if (shift > 61) {
+		shift = shift - 61;
+		a >>= (shift >> 1) + (shift & 1);
+		b >>= shift >> 1;
+	} else {
+		shift = 0;
 	}
 
-	/* Pick TU in [32,64] minimising ceil(ratio*TU) - ratio*TU. */
-	for (tu = 32; tu <= 64; tu++) {
-		u64 prod = rn * tu;
-		u32 vb = (u32)tachyon_ceil_div(prod, rd);
-		u64 err = (u64)vb * rd - prod;	/* (ceil - exact) * rd, >= 0 */
+	result = a * b;
 
-		if (err < best_err) {
-			best_err = err;
-			best_tu = tu;
-			valid = vb ? vb : 1;
+	if (shift > TDP_FXP_POINT)
+		return result << (shift - TDP_FXP_POINT);
+	if (shift < TDP_FXP_POINT)
+		return result >> (TDP_FXP_POINT - shift);
+	return result;
+}
+
+static s64 tdp_fixp_div(s64 a, s64 b)
+{
+	unsigned int shift = 62 - tdp_fixp_msbset(a);
+	s64 result;
+
+	a <<= shift;
+	if (shift < TDP_FXP_POINT)
+		b >>= (TDP_FXP_POINT - shift);
+
+	result = a / b;
+
+	if (shift > TDP_FXP_POINT)
+		return result >> (shift - TDP_FXP_POINT);
+	return result;
+}
+
+static s64 tdp_fixp_from_fraction(s64 a, s64 b)
+{
+	bool a_neg = a < 0;
+	bool b_neg = b < 0;
+	u64 a_abs = a_neg ? (u64)(-a) : (u64)a;
+	u64 b_abs = b_neg ? (u64)(-b) : (u64)b;
+	s64 rem_s;
+	u64 rem, res_abs;
+	s64 res;
+	u32 i;
+
+	res_abs = tdp_div64_u64_rem(a_abs, b_abs, &rem_s);
+	rem = (u64)rem_s;
+
+	for (i = TDP_FXP_POINT; i != 0; --i) {
+		rem <<= 1;
+		res_abs <<= 1;
+		if (rem >= b_abs) {
+			res_abs |= 1;
+			rem -= b_abs;
 		}
 	}
 
-	/* DELAY_START_LINK (synchronous clock, no boundary moderation). */
-	extra_margin = (u32)tachyon_ceil_div(link_khz * extra_pixclk_cycle_delay,
-					     pclk_khz);
-	num_tus = (vis * bpp / 8) / valid;
-	extra_bytes = (u32)tachyon_ceil_div((u64)(num_tus + 1) *
-				((u64)valid * rd_o - rn_o * best_tu), rd_o);
-	extra_pclk = (u32)tachyon_ceil_div((u64)extra_bytes * 8, bpp);
-	extra_linkclk = (u32)tachyon_ceil_div((u64)extra_pclk * link_khz, pclk_khz);
-	filler = best_tu - valid;
-	delay_start = extra_linkclk + filler + extra_margin;
-	if (delay_start > 0x3ff)
-		delay_start = 0x3ff;
+	res_abs += (rem << 1) >= b_abs ? 1 : 0;
 
-	vb_reg = (valid & 0x7f) |
-		 ((delay_start & 0x3ff) << REG_DP_DELAY_START_LINK_SHIFT);
+	res = (s64)res_abs;
+	if (a_neg ^ b_neg)
+		res = -res;
+	return res;
+}
 
-	writel(best_tu - 1, priv->link + REG_DP_TU);
+struct tdp_tu_input {
+	u64 lclk;		/* 162, 270, 540, 810 */
+	u64 pclk_khz;
+	u64 hactive;
+	u64 hporch;		/* bp + fp + pulse */
+	int nlanes;
+	int bpp;
+	int pixel_enc;		/* 444, 420, 422 */
+	int dsc_en;
+	int async_en;
+	int fec_en;
+	int compress_ratio;
+	int num_of_dsc_slices;
+};
+
+struct tdp_tu_table {
+	u8 valid_boundary_link;
+	u16 delay_start_link;
+	bool boundary_moderation_en;
+	u8 valid_lower_boundary_link;
+	u8 upper_boundary_count;
+	u8 lower_boundary_count;
+	u8 tu_size_minus1;
+};
+
+struct tdp_tu_algo {
+	s64 lclk_fp;
+	s64 pclk_fp;
+	s64 lwidth;
+	s64 lwidth_fp;
+	s64 hbp_relative_to_pclk;
+	s64 hbp_relative_to_pclk_fp;
+	int nlanes;
+	int bpp;
+	int pixelEnc;
+	int dsc_en;
+	int async_en;
+	int bpc;
+
+	unsigned int delay_start_link_extra_pixclk;
+	int extra_buffer_margin;
+	s64 ratio_fp;
+	s64 original_ratio_fp;
+
+	s64 err_fp;
+	s64 n_err_fp;
+	s64 n_n_err_fp;
+	int tu_size;
+	int tu_size_desired;
+	int tu_size_minus1;
+
+	int valid_boundary_link;
+	s64 resulting_valid_fp;
+	s64 total_valid_fp;
+	s64 effective_valid_fp;
+	s64 effective_valid_recorded_fp;
+	int n_tus;
+	int n_tus_per_lane;
+	int paired_tus;
+	int remainder_tus;
+	int remainder_tus_upper;
+	int remainder_tus_lower;
+	int extra_bytes;
+	int filler_size;
+	int delay_start_link;
+
+	int extra_pclk_cycles;
+	int extra_pclk_cycles_in_link_clk;
+	s64 ratio_by_tu_fp;
+	s64 average_valid2_fp;
+	int new_valid_boundary_link;
+	int remainder_symbols_exist;
+	int n_symbols;
+	s64 n_remainder_symbols_per_lane_fp;
+	s64 last_partial_tu_fp;
+	s64 TU_ratio_err_fp;
+
+	int n_tus_incl_last_incomplete_tu;
+	int extra_pclk_cycles_tmp;
+	int extra_pclk_cycles_in_link_clk_tmp;
+	int extra_required_bytes_new_tmp;
+	int filler_size_tmp;
+	int lower_filler_size_tmp;
+	int delay_start_link_tmp;
+
+	bool boundary_moderation_en;
+	int boundary_mod_lower_err;
+	int upper_boundary_count;
+	int lower_boundary_count;
+	int i_upper_boundary_count;
+	int i_lower_boundary_count;
+	int valid_lower_boundary_link;
+	int even_distribution_BF;
+	int even_distribution_legacy;
+	int even_distribution;
+	int min_hblank_violated;
+	s64 delay_start_time_fp;
+	s64 hbp_time_fp;
+	s64 hactive_time_fp;
+	s64 diff_abs_fp;
+
+	s64 ratio;
+};
+
+/* _tu_param_compare: 0 if a==b, 1 if a>b, 2 if a<b */
+static int tdp_tu_param_compare(s64 a, s64 b)
+{
+	u32 a_sign, b_sign;
+	s64 a_temp, b_temp, minus_1;
+
+	if (a == b)
+		return 0;
+
+	minus_1 = tdp_fixp_from_fraction(-1, 1);
+
+	a_sign = ((a >> 32) & 0x80000000) ? 1 : 0;
+	b_sign = ((b >> 32) & 0x80000000) ? 1 : 0;
+
+	if (a_sign > b_sign)
+		return 2;
+	else if (b_sign > a_sign)
+		return 1;
+
+	if (!a_sign && !b_sign) {
+		if (a > b)
+			return 1;
+		else
+			return 2;
+	} else {
+		a_temp = tdp_fixp_mul(a, minus_1);
+		b_temp = tdp_fixp_mul(b, minus_1);
+
+		if (a_temp > b_temp)
+			return 2;
+		else
+			return 1;
+	}
+}
+
+static void tdp_tu_update_timings(struct tdp_tu_input *in,
+				  struct tdp_tu_algo *tu)
+{
+	int nlanes = in->nlanes;
+	int dsc_num_slices = in->num_of_dsc_slices;
+	int dsc_num_bytes = 0;
+	int numerator;
+	s64 pclk_dsc_fp;
+	s64 dwidth_dsc_fp;
+	s64 hbp_dsc_fp;
+	int tot_num_eoc_symbols = 0;
+	int tot_num_hor_bytes = 0;
+	int tot_num_dummy_bytes = 0;
+	int dwidth_dsc_bytes = 0;
+	int eoc_bytes = 0;
+	s64 temp1_fp, temp2_fp, temp3_fp;
+
+	tu->lclk_fp = tdp_fixp_from_fraction(in->lclk, 1);
+	tu->pclk_fp = tdp_fixp_from_fraction(in->pclk_khz, 1000);
+	tu->lwidth = in->hactive;
+	tu->hbp_relative_to_pclk = in->hporch;
+	tu->nlanes = in->nlanes;
+	tu->bpp = in->bpp;
+	tu->pixelEnc = in->pixel_enc;
+	tu->dsc_en = in->dsc_en;
+	tu->async_en = in->async_en;
+	tu->lwidth_fp = tdp_fixp_from_fraction(in->hactive, 1);
+	tu->hbp_relative_to_pclk_fp = tdp_fixp_from_fraction(in->hporch, 1);
+
+	if (tu->pixelEnc == 420) {
+		temp1_fp = tdp_fixp_from_fraction(2, 1);
+		tu->pclk_fp = tdp_fixp_div(tu->pclk_fp, temp1_fp);
+		tu->lwidth_fp = tdp_fixp_div(tu->lwidth_fp, temp1_fp);
+		/* Matches Linux msm dp_ctrl.c verbatim: literal 2, not temp1_fp. */
+		tu->hbp_relative_to_pclk_fp =
+			tdp_fixp_div(tu->hbp_relative_to_pclk_fp, 2);
+	}
+
+	if (tu->pixelEnc == 422) {
+		switch (tu->bpp) {
+		case 24:
+			tu->bpp = 16;
+			tu->bpc = 8;
+			break;
+		case 30:
+			tu->bpp = 20;
+			tu->bpc = 10;
+			break;
+		default:
+			tu->bpp = 16;
+			tu->bpc = 8;
+			break;
+		}
+	} else {
+		tu->bpc = tu->bpp / 3;
+	}
+
+	if (!in->dsc_en)
+		goto fec_check;
+
+	temp1_fp = tdp_fixp_from_fraction(in->compress_ratio, 100);
+	temp2_fp = tdp_fixp_from_fraction(in->bpp, 1);
+	temp3_fp = tdp_fixp_div(temp2_fp, temp1_fp);
+	temp2_fp = tdp_fixp_mul(tu->lwidth_fp, temp3_fp);
+
+	temp1_fp = tdp_fixp_from_fraction(8, 1);
+	temp3_fp = tdp_fixp_div(temp2_fp, temp1_fp);
+
+	numerator = tdp_fixp2int(temp3_fp);
+
+	dsc_num_bytes = dsc_num_slices ? numerator / dsc_num_slices : 0;
+	eoc_bytes = dsc_num_bytes % nlanes;
+	tot_num_eoc_symbols = nlanes * dsc_num_slices;
+	tot_num_hor_bytes = dsc_num_bytes * dsc_num_slices;
+	tot_num_dummy_bytes = (nlanes - eoc_bytes) * dsc_num_slices;
+
+	dwidth_dsc_bytes = (tot_num_hor_bytes + tot_num_eoc_symbols +
+			    (eoc_bytes == 0 ? 0 : tot_num_dummy_bytes));
+
+	dwidth_dsc_fp = tdp_fixp_from_fraction(dwidth_dsc_bytes, 3);
+
+	temp2_fp = tdp_fixp_mul(tu->pclk_fp, dwidth_dsc_fp);
+	temp1_fp = tdp_fixp_div(temp2_fp, tu->lwidth_fp);
+	pclk_dsc_fp = temp1_fp;
+
+	temp1_fp = tdp_fixp_div(pclk_dsc_fp, tu->pclk_fp);
+	temp2_fp = tdp_fixp_mul(tu->hbp_relative_to_pclk_fp, temp1_fp);
+	hbp_dsc_fp = temp2_fp;
+
+	tu->pclk_fp = pclk_dsc_fp;
+	tu->lwidth_fp = dwidth_dsc_fp;
+	tu->hbp_relative_to_pclk_fp = hbp_dsc_fp;
+
+fec_check:
+	if (in->fec_en) {
+		temp1_fp = tdp_fixp_from_fraction(976, 1000); /* 0.976 */
+		tu->lclk_fp = tdp_fixp_mul(tu->lclk_fp, temp1_fp);
+	}
+}
+
+static void tdp_tu_valid_boundary_calc(struct tdp_tu_algo *tu)
+{
+	s64 temp1_fp, temp2_fp, temp, temp1, temp2;
+	int compare_result_1, compare_result_2, compare_result_3;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	temp2_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+
+	tu->new_valid_boundary_link = tdp_fixp2int_ceil(temp2_fp);
+
+	temp = (tu->i_upper_boundary_count * tu->new_valid_boundary_link +
+		tu->i_lower_boundary_count * (tu->new_valid_boundary_link - 1));
+	tu->average_valid2_fp = tdp_fixp_from_fraction(temp,
+				(tu->i_upper_boundary_count +
+				 tu->i_lower_boundary_count));
+
+	temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+	temp2_fp = tu->lwidth_fp;
+	temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+	temp2_fp = tdp_fixp_div(temp1_fp, tu->average_valid2_fp);
+	tu->n_tus = tdp_fixp2int(temp2_fp);
+	if ((temp2_fp & 0xFFFFFFFF) > 0xFFFFF000)
+		tu->n_tus += 1;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->n_tus, 1);
+	temp2_fp = tdp_fixp_mul(temp1_fp, tu->average_valid2_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->n_symbols, 1);
+	temp2_fp = temp1_fp - temp2_fp;
+	temp1_fp = tdp_fixp_from_fraction(tu->nlanes, 1);
+	temp2_fp = tdp_fixp_div(temp2_fp, temp1_fp);
+	tu->n_remainder_symbols_per_lane_fp = temp2_fp;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	tu->last_partial_tu_fp =
+		tdp_fixp_div(tu->n_remainder_symbols_per_lane_fp, temp1_fp);
+
+	if (tu->n_remainder_symbols_per_lane_fp != 0)
+		tu->remainder_symbols_exist = 1;
+	else
+		tu->remainder_symbols_exist = 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->n_tus, tu->nlanes);
+	tu->n_tus_per_lane = tdp_fixp2int(temp1_fp);
+
+	tu->paired_tus = (int)((tu->n_tus_per_lane) /
+			(tu->i_upper_boundary_count + tu->i_lower_boundary_count));
+
+	tu->remainder_tus = tu->n_tus_per_lane - tu->paired_tus *
+			(tu->i_upper_boundary_count + tu->i_lower_boundary_count);
+
+	if ((tu->remainder_tus - tu->i_upper_boundary_count) > 0) {
+		tu->remainder_tus_upper = tu->i_upper_boundary_count;
+		tu->remainder_tus_lower = tu->remainder_tus -
+					  tu->i_upper_boundary_count;
+	} else {
+		tu->remainder_tus_upper = tu->remainder_tus;
+		tu->remainder_tus_lower = 0;
+	}
+
+	temp = tu->paired_tus * (tu->i_upper_boundary_count *
+		tu->new_valid_boundary_link + tu->i_lower_boundary_count *
+		(tu->new_valid_boundary_link - 1)) +
+		(tu->remainder_tus_upper * tu->new_valid_boundary_link) +
+		(tu->remainder_tus_lower * (tu->new_valid_boundary_link - 1));
+	tu->total_valid_fp = tdp_fixp_from_fraction(temp, 1);
+
+	if (tu->remainder_symbols_exist) {
+		temp1_fp = tu->total_valid_fp +
+			   tu->n_remainder_symbols_per_lane_fp;
+		temp2_fp = tdp_fixp_from_fraction(tu->n_tus_per_lane, 1);
+		temp2_fp = temp2_fp + tu->last_partial_tu_fp;
+		temp1_fp = tdp_fixp_div(temp1_fp, temp2_fp);
+	} else {
+		temp2_fp = tdp_fixp_from_fraction(tu->n_tus_per_lane, 1);
+		temp1_fp = tdp_fixp_div(tu->total_valid_fp, temp2_fp);
+	}
+	tu->effective_valid_fp = temp1_fp;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	temp2_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+	tu->n_n_err_fp = tu->effective_valid_fp - temp2_fp;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	temp2_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+	tu->n_err_fp = tu->average_valid2_fp - temp2_fp;
+
+	tu->even_distribution = tu->n_tus % tu->nlanes == 0 ? 1 : 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+	temp2_fp = tu->lwidth_fp;
+	temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+	temp2_fp = tdp_fixp_div(temp1_fp, tu->average_valid2_fp);
+
+	if (temp2_fp)
+		tu->n_tus_incl_last_incomplete_tu = tdp_fixp2int_ceil(temp2_fp);
+	else
+		tu->n_tus_incl_last_incomplete_tu = 0;
+
+	temp1 = 0;
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	temp2_fp = tdp_fixp_mul(tu->original_ratio_fp, temp1_fp);
+	temp1_fp = tu->average_valid2_fp - temp2_fp;
+	temp2_fp = tdp_fixp_from_fraction(tu->n_tus_incl_last_incomplete_tu, 1);
+	temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+
+	if (temp1_fp)
+		temp1 = tdp_fixp2int_ceil(temp1_fp);
+
+	temp = tu->i_upper_boundary_count * tu->nlanes;
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+	temp2_fp = tdp_fixp_mul(tu->original_ratio_fp, temp1_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->new_valid_boundary_link, 1);
+	temp2_fp = temp1_fp - temp2_fp;
+	temp1_fp = tdp_fixp_from_fraction(temp, 1);
+	temp2_fp = tdp_fixp_mul(temp1_fp, temp2_fp);
+
+	if (temp2_fp)
+		temp2 = tdp_fixp2int_ceil(temp2_fp);
+	else
+		temp2 = 0;
+	tu->extra_required_bytes_new_tmp = (int)(temp1 + temp2);
+
+	temp1_fp = tdp_fixp_from_fraction(8, tu->bpp);
+	temp2_fp = tdp_fixp_from_fraction(tu->extra_required_bytes_new_tmp, 1);
+	temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+
+	if (temp1_fp)
+		tu->extra_pclk_cycles_tmp = tdp_fixp2int_ceil(temp1_fp);
+	else
+		tu->extra_pclk_cycles_tmp = 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->extra_pclk_cycles_tmp, 1);
+	temp2_fp = tdp_fixp_div(tu->lclk_fp, tu->pclk_fp);
+	temp1_fp = tdp_fixp_mul(temp1_fp, temp2_fp);
+
+	if (temp1_fp)
+		tu->extra_pclk_cycles_in_link_clk_tmp =
+			tdp_fixp2int_ceil(temp1_fp);
+	else
+		tu->extra_pclk_cycles_in_link_clk_tmp = 0;
+
+	tu->filler_size_tmp = tu->tu_size - tu->new_valid_boundary_link;
+	tu->lower_filler_size_tmp = tu->filler_size_tmp + 1;
+
+	tu->delay_start_link_tmp = tu->extra_pclk_cycles_in_link_clk_tmp +
+				   tu->lower_filler_size_tmp +
+				   tu->extra_buffer_margin;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->delay_start_link_tmp, 1);
+	tu->delay_start_time_fp = tdp_fixp_div(temp1_fp, tu->lclk_fp);
+
+	compare_result_1 = tdp_tu_param_compare(tu->n_n_err_fp, tu->diff_abs_fp);
+	if (compare_result_1 == 2)
+		compare_result_1 = 1;
+	else
+		compare_result_1 = 0;
+
+	compare_result_2 = tdp_tu_param_compare(tu->n_n_err_fp, tu->err_fp);
+	if (compare_result_2 == 2)
+		compare_result_2 = 1;
+	else
+		compare_result_2 = 0;
+
+	compare_result_3 = tdp_tu_param_compare(tu->hbp_time_fp,
+						tu->delay_start_time_fp);
+	if (compare_result_3 == 2)
+		compare_result_3 = 0;
+	else
+		compare_result_3 = 1;
+
+	if (((tu->even_distribution == 1) ||
+	     ((tu->even_distribution_BF == 0) &&
+	      (tu->even_distribution_legacy == 0))) &&
+	    tu->n_err_fp >= 0 && tu->n_n_err_fp >= 0 &&
+	    compare_result_2 &&
+	    (compare_result_1 || (tu->min_hblank_violated == 1)) &&
+	    (tu->new_valid_boundary_link - 1) > 0 &&
+	    compare_result_3 &&
+	    (tu->delay_start_link_tmp <= 1023)) {
+		tu->upper_boundary_count = tu->i_upper_boundary_count;
+		tu->lower_boundary_count = tu->i_lower_boundary_count;
+		tu->err_fp = tu->n_n_err_fp;
+		tu->boundary_moderation_en = true;
+		tu->tu_size_desired = tu->tu_size;
+		tu->valid_boundary_link = tu->new_valid_boundary_link;
+		tu->effective_valid_recorded_fp = tu->effective_valid_fp;
+		tu->even_distribution_BF = 1;
+		tu->delay_start_link = tu->delay_start_link_tmp;
+	} else if (tu->boundary_mod_lower_err == 0) {
+		compare_result_1 = tdp_tu_param_compare(tu->n_n_err_fp,
+							tu->diff_abs_fp);
+		if (compare_result_1 == 2)
+			tu->boundary_mod_lower_err = 1;
+	}
+}
+
+static void tdp_dp_calc_tu(struct tdp_tu_input *in, struct tdp_tu_table *tu_table)
+{
+	struct tdp_tu_algo _tu;
+	struct tdp_tu_algo *tu = &_tu;
+	int compare_result_1, compare_result_2;
+	u64 temp = 0;
+	s64 temp_fp = 0, temp1_fp = 0, temp2_fp = 0;
+
+	s64 LCLK_FAST_SKEW_fp = tdp_fixp_from_fraction(6, 10000);	/* 0.0006 */
+	s64 const_p49_fp = tdp_fixp_from_fraction(49, 100);		/* 0.49 */
+	s64 const_p56_fp = tdp_fixp_from_fraction(56, 100);		/* 0.56 */
+	s64 RATIO_SCALE_fp = tdp_fixp_from_fraction(1001, 1000);
+
+	u8 DP_BRUTE_FORCE = 1;
+	s64 BRUTE_FORCE_THRESHOLD_fp = tdp_fixp_from_fraction(1, 10);	/* 0.1 */
+	unsigned int EXTRA_PIXCLK_CYCLE_DELAY = 4;
+	unsigned int HBLANK_MARGIN = 4;
+
+	memset(tu, 0, sizeof(*tu));
+
+	tdp_tu_update_timings(in, tu);
+
+	tu->err_fp = tdp_fixp_from_fraction(1000, 1);
+
+	temp1_fp = tdp_fixp_from_fraction(4, 1);
+	temp2_fp = tdp_fixp_mul(temp1_fp, tu->lclk_fp);
+	temp_fp = tdp_fixp_div(temp2_fp, tu->pclk_fp);
+	tu->extra_buffer_margin = tdp_fixp2int_ceil(temp_fp);
+
+	temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+	temp2_fp = tdp_fixp_mul(tu->pclk_fp, temp1_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->nlanes, 1);
+	temp2_fp = tdp_fixp_div(temp2_fp, temp1_fp);
+	tu->ratio_fp = tdp_fixp_div(temp2_fp, tu->lclk_fp);
+
+	tu->original_ratio_fp = tu->ratio_fp;
+	tu->boundary_moderation_en = false;
+	tu->upper_boundary_count = 0;
+	tu->lower_boundary_count = 0;
+	tu->i_upper_boundary_count = 0;
+	tu->i_lower_boundary_count = 0;
+	tu->valid_lower_boundary_link = 0;
+	tu->even_distribution_BF = 0;
+	tu->even_distribution_legacy = 0;
+	tu->even_distribution = 0;
+	tu->delay_start_time_fp = 0;
+
+	tu->err_fp = tdp_fixp_from_fraction(1000, 1);
+	tu->n_err_fp = 0;
+	tu->n_n_err_fp = 0;
+
+	tu->ratio = tdp_fixp2int(tu->ratio_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->nlanes, 1);
+	tdp_div64_u64_rem(tu->lwidth_fp, temp1_fp, &temp2_fp);
+	if (temp2_fp != 0 && !tu->ratio && tu->dsc_en == 0) {
+		tu->ratio_fp = tdp_fixp_mul(tu->ratio_fp, RATIO_SCALE_fp);
+		tu->ratio = tdp_fixp2int(tu->ratio_fp);
+		if (tu->ratio)
+			tu->ratio_fp = tdp_fixp_from_fraction(1, 1);
+	}
+
+	if (tu->ratio > 1)
+		tu->ratio = 1;
+
+	if (tu->ratio == 1)
+		goto tu_size_calc;
+
+	compare_result_1 = tdp_tu_param_compare(tu->ratio_fp, const_p49_fp);
+	if (!compare_result_1 || compare_result_1 == 1)
+		compare_result_1 = 1;
+	else
+		compare_result_1 = 0;
+
+	compare_result_2 = tdp_tu_param_compare(tu->ratio_fp, const_p56_fp);
+	if (!compare_result_2 || compare_result_2 == 2)
+		compare_result_2 = 1;
+	else
+		compare_result_2 = 0;
+
+	if (tu->dsc_en && compare_result_1 && compare_result_2)
+		HBLANK_MARGIN += 4;
+
+tu_size_calc:
+	for (tu->tu_size = 32; tu->tu_size <= 64; tu->tu_size++) {
+		temp1_fp = tdp_fixp_from_fraction(tu->tu_size, 1);
+		temp2_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+		temp = tdp_fixp2int_ceil(temp2_fp);
+		temp1_fp = tdp_fixp_from_fraction(temp, 1);
+		tu->n_err_fp = temp1_fp - temp2_fp;
+
+		if (tu->n_err_fp < tu->err_fp) {
+			tu->err_fp = tu->n_err_fp;
+			tu->tu_size_desired = tu->tu_size;
+		}
+	}
+
+	tu->tu_size_minus1 = tu->tu_size_desired - 1;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+	temp2_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+	tu->valid_boundary_link = tdp_fixp2int_ceil(temp2_fp);
+
+	temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+	temp2_fp = tu->lwidth_fp;
+	temp2_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+
+	temp1_fp = tdp_fixp_from_fraction(tu->valid_boundary_link, 1);
+	temp2_fp = tdp_fixp_div(temp2_fp, temp1_fp);
+	tu->n_tus = tdp_fixp2int(temp2_fp);
+	if ((temp2_fp & 0xFFFFFFFF) > 0xFFFFF000)
+		tu->n_tus += 1;
+
+	tu->even_distribution_legacy = tu->n_tus % tu->nlanes == 0 ? 1 : 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+	temp2_fp = tdp_fixp_mul(tu->original_ratio_fp, temp1_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->valid_boundary_link, 1);
+	temp2_fp = temp1_fp - temp2_fp;
+	temp1_fp = tdp_fixp_from_fraction(tu->n_tus + 1, 1);
+	temp2_fp = tdp_fixp_mul(temp1_fp, temp2_fp);
+
+	temp = tdp_fixp2int(temp2_fp);
+	if (temp && temp2_fp)
+		tu->extra_bytes = tdp_fixp2int_ceil(temp2_fp);
+	else
+		tu->extra_bytes = 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->extra_bytes, 1);
+	temp2_fp = tdp_fixp_from_fraction(8, tu->bpp);
+	temp1_fp = tdp_fixp_mul(temp1_fp, temp2_fp);
+
+	if (temp && temp1_fp)
+		tu->extra_pclk_cycles = tdp_fixp2int_ceil(temp1_fp);
+	else
+		tu->extra_pclk_cycles = tdp_fixp2int(temp1_fp);
+
+	temp1_fp = tdp_fixp_div(tu->lclk_fp, tu->pclk_fp);
+	temp2_fp = tdp_fixp_from_fraction(tu->extra_pclk_cycles, 1);
+	temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+
+	if (temp1_fp)
+		tu->extra_pclk_cycles_in_link_clk = tdp_fixp2int_ceil(temp1_fp);
+	else
+		tu->extra_pclk_cycles_in_link_clk = tdp_fixp2int(temp1_fp);
+
+	tu->filler_size = tu->tu_size_desired - tu->valid_boundary_link;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+	tu->ratio_by_tu_fp = tdp_fixp_mul(tu->ratio_fp, temp1_fp);
+
+	tu->delay_start_link = tu->extra_pclk_cycles_in_link_clk +
+			       tu->filler_size + tu->extra_buffer_margin;
+
+	tu->resulting_valid_fp =
+		tdp_fixp_from_fraction(tu->valid_boundary_link, 1);
+
+	temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+	temp2_fp = tdp_fixp_div(tu->resulting_valid_fp, temp1_fp);
+	tu->TU_ratio_err_fp = temp2_fp - tu->original_ratio_fp;
+
+	temp1_fp = tdp_fixp_from_fraction(HBLANK_MARGIN, 1);
+	temp1_fp = tu->hbp_relative_to_pclk_fp - temp1_fp;
+	tu->hbp_time_fp = tdp_fixp_div(temp1_fp, tu->pclk_fp);
+
+	temp1_fp = tdp_fixp_from_fraction(tu->delay_start_link, 1);
+	tu->delay_start_time_fp = tdp_fixp_div(temp1_fp, tu->lclk_fp);
+
+	compare_result_1 = tdp_tu_param_compare(tu->hbp_time_fp,
+						tu->delay_start_time_fp);
+	if (compare_result_1 == 2)
+		tu->min_hblank_violated = 1;
+
+	tu->hactive_time_fp = tdp_fixp_div(tu->lwidth_fp, tu->pclk_fp);
+
+	compare_result_2 = tdp_tu_param_compare(tu->hactive_time_fp,
+						tu->delay_start_time_fp);
+	if (compare_result_2 == 2)
+		tu->min_hblank_violated = 1;
+
+	tu->delay_start_time_fp = 0;
+
+	tu->delay_start_link_extra_pixclk = EXTRA_PIXCLK_CYCLE_DELAY;
+	tu->diff_abs_fp = tu->resulting_valid_fp - tu->ratio_by_tu_fp;
+
+	temp = tdp_fixp2int(tu->diff_abs_fp);
+	if (!temp && tu->diff_abs_fp <= 0xffff)
+		tu->diff_abs_fp = 0;
+
+	if (tu->diff_abs_fp < 0)
+		tu->diff_abs_fp = tdp_fixp_mul(tu->diff_abs_fp, -1);
+
+	tu->boundary_mod_lower_err = 0;
+	if ((tu->diff_abs_fp != 0 &&
+	     ((tu->diff_abs_fp > BRUTE_FORCE_THRESHOLD_fp) ||
+	      (tu->even_distribution_legacy == 0) ||
+	      (DP_BRUTE_FORCE == 1))) ||
+	    (tu->min_hblank_violated == 1)) {
+		do {
+			tu->err_fp = tdp_fixp_from_fraction(1000, 1);
+
+			temp1_fp = tdp_fixp_div(tu->lclk_fp, tu->pclk_fp);
+			temp2_fp = tdp_fixp_from_fraction(
+					tu->delay_start_link_extra_pixclk, 1);
+			temp1_fp = tdp_fixp_mul(temp2_fp, temp1_fp);
+
+			if (temp1_fp)
+				tu->extra_buffer_margin =
+					tdp_fixp2int_ceil(temp1_fp);
+			else
+				tu->extra_buffer_margin = 0;
+
+			temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+			temp1_fp = tdp_fixp_mul(tu->lwidth_fp, temp1_fp);
+
+			if (temp1_fp)
+				tu->n_symbols = tdp_fixp2int_ceil(temp1_fp);
+			else
+				tu->n_symbols = 0;
+
+			for (tu->tu_size = 32; tu->tu_size <= 64; tu->tu_size++) {
+				for (tu->i_upper_boundary_count = 1;
+				     tu->i_upper_boundary_count <= 15;
+				     tu->i_upper_boundary_count++) {
+					for (tu->i_lower_boundary_count = 1;
+					     tu->i_lower_boundary_count <= 15;
+					     tu->i_lower_boundary_count++) {
+						tdp_tu_valid_boundary_calc(tu);
+					}
+				}
+			}
+			tu->delay_start_link_extra_pixclk--;
+		} while (tu->boundary_moderation_en != true &&
+			 tu->boundary_mod_lower_err == 1 &&
+			 tu->delay_start_link_extra_pixclk != 0);
+
+		if (tu->boundary_moderation_en == true) {
+			temp1_fp = tdp_fixp_from_fraction(
+				(tu->upper_boundary_count *
+				 tu->valid_boundary_link +
+				 tu->lower_boundary_count *
+				 (tu->valid_boundary_link - 1)), 1);
+			temp2_fp = tdp_fixp_from_fraction(
+				(tu->upper_boundary_count +
+				 tu->lower_boundary_count), 1);
+			tu->resulting_valid_fp = tdp_fixp_div(temp1_fp, temp2_fp);
+
+			temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+			tu->ratio_by_tu_fp =
+				tdp_fixp_mul(tu->original_ratio_fp, temp1_fp);
+
+			tu->valid_lower_boundary_link =
+				tu->valid_boundary_link - 1;
+
+			temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+			temp1_fp = tdp_fixp_mul(tu->lwidth_fp, temp1_fp);
+			temp2_fp = tdp_fixp_div(temp1_fp, tu->resulting_valid_fp);
+			tu->n_tus = tdp_fixp2int(temp2_fp);
+
+			tu->tu_size_minus1 = tu->tu_size_desired - 1;
+			tu->even_distribution_BF = 1;
+
+			temp1_fp = tdp_fixp_from_fraction(tu->tu_size_desired, 1);
+			temp2_fp = tdp_fixp_div(tu->resulting_valid_fp, temp1_fp);
+			tu->TU_ratio_err_fp = temp2_fp - tu->original_ratio_fp;
+		}
+	}
+
+	temp2_fp = tdp_fixp_mul(LCLK_FAST_SKEW_fp, tu->lwidth_fp);
+
+	if (temp2_fp)
+		temp = tdp_fixp2int_ceil(temp2_fp);
+	else
+		temp = 0;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->nlanes, 1);
+	temp2_fp = tdp_fixp_mul(tu->original_ratio_fp, temp1_fp);
+	temp1_fp = tdp_fixp_from_fraction(tu->bpp, 8);
+	temp2_fp = tdp_fixp_div(temp1_fp, temp2_fp);
+	temp1_fp = tdp_fixp_from_fraction(temp, 1);
+	temp2_fp = tdp_fixp_mul(temp1_fp, temp2_fp);
+	temp = tdp_fixp2int(temp2_fp);
+
+	if (tu->async_en)
+		tu->delay_start_link += (int)temp;
+
+	temp1_fp = tdp_fixp_from_fraction(tu->delay_start_link, 1);
+	tu->delay_start_time_fp = tdp_fixp_div(temp1_fp, tu->lclk_fp);
+
+	tu_table->valid_boundary_link		= tu->valid_boundary_link;
+	tu_table->delay_start_link		= tu->delay_start_link;
+	tu_table->boundary_moderation_en	= tu->boundary_moderation_en;
+	tu_table->valid_lower_boundary_link	= tu->valid_lower_boundary_link;
+	tu_table->upper_boundary_count		= tu->upper_boundary_count;
+	tu_table->lower_boundary_count		= tu->lower_boundary_count;
+	tu_table->tu_size_minus1		= tu->tu_size_minus1;
+}
+
+static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
+{
+	const struct display_timing *t = &priv->timing;
+	struct tdp_tu_input in;
+	struct tdp_tu_table tut;
+	u32 tu_reg, vb_reg, vb2_reg;
+
+	if (!priv->rate || !priv->lanes || !t->pixelclock.typ || !t->hactive.typ)
+		return;
+
+	memset(&in, 0, sizeof(in));
+	memset(&tut, 0, sizeof(tut));
+
+	in.lclk = priv->rate / 1000;		/* link symbol clock: 162/270/540/810 */
+	in.pclk_khz = t->pixelclock.typ / 1000;
+	in.hactive = t->hactive.typ;
+	in.hporch = (u64)t->hfront_porch.typ + t->hsync_len.typ +
+		    t->hback_porch.typ;
+	in.nlanes = priv->lanes;
+	in.bpp = 24;				/* 8bpc RGB */
+	in.pixel_enc = 444;
+	in.compress_ratio = 100;
+
+	tdp_dp_calc_tu(&in, &tut);
+
+	/* Register packing per msm_dp_ctrl_setup_tr_unit(). */
+	tu_reg = tut.tu_size_minus1;
+	vb_reg = tut.valid_boundary_link |
+		 ((u32)tut.delay_start_link << REG_DP_DELAY_START_LINK_SHIFT);
+	vb2_reg = ((u32)tut.valid_lower_boundary_link << 1) |
+		  ((u32)tut.upper_boundary_count << 16) |
+		  ((u32)tut.lower_boundary_count << 20);
+	if (tut.boundary_moderation_en)
+		vb2_reg |= BIT(0);
+
+	writel(tu_reg, priv->link + REG_DP_TU);
 	writel(vb_reg, priv->link + REG_DP_VALID_BOUNDARY);
-	writel(0, priv->link + REG_DP_VALID_BOUNDARY_2);
-	log_warning("DP TU: tu=%u valid=%u delay_start=%u VB=%08x num_tus=%u\n",
-		    best_tu, valid, delay_start, vb_reg, num_tus);
+	writel(vb2_reg, priv->link + REG_DP_VALID_BOUNDARY_2);
+
+	log_warning("DP TU: %ux%u lanes=%u TU=%02x VB=%08x VB2=%08x (tu_size=%u valid=%u delay=%u mod=%u)\n",
+		    t->hactive.typ, t->vactive.typ, priv->lanes,
+		    tu_reg, vb_reg, vb2_reg, tut.tu_size_minus1 + 1,
+		    tut.valid_boundary_link, tut.delay_start_link,
+		    tut.boundary_moderation_en);
 }
 
 static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
@@ -4998,8 +5931,22 @@ static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
 	u32 display_v_start, display_v_end;
 	u32 hsync_start_x, hsync_end_x;
 	u32 hsync_ctl, display_hctl;
+	bool tpg = tachyon_dp_env_bool("tachyon_dp_tpg");
 
 	if (!priv->p0)
+		return;
+
+	/*
+	 * The p0 MMSS_DP_INTF_* timing engine is the DP controller's built-in
+	 * Test Pattern Generator path (Linux msm_dp_panel_tpg_enable).  For
+	 * normal DPU-sourced video the DP controller slaves off the DPU INTF and
+	 * Linux NEVER enables this engine; enabling it without a BIST pixel
+	 * source (the old behaviour) made the DP TX run an empty internal timing
+	 * engine instead of the DPU stream -> trained link but sink "No Signal".
+	 * Default: leave it off (DPU INTF drives).  Set tachyon_dp_tpg=1 to emit
+	 * the internal checkered pattern (proves DP/PHY/dock/monitor end to end).
+	 */
+	if (!tpg)
 		return;
 
 	display_v_start = ((vtotal - vsync_start) * htotal) +
@@ -5031,7 +5978,14 @@ static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
 	writel(0, priv->p0 + MMSS_DP_INTF_POLARITY_CTL);
 	writel(readl(priv->p0 + MMSS_DP_INTF_CONFIG),
 	       priv->p0 + MMSS_DP_INTF_CONFIG);
+	/* BIST pixel source (checkered) -> then arm the p0 timing engine. */
+	writel(DP_TPG_CHECKERED_RECT_PATTERN,
+	       priv->p0 + MMSS_DP_TPG_MAIN_CONTROL);
+	writel(DP_TPG_VIDEO_CONFIG_BPP_8BIT | DP_TPG_VIDEO_CONFIG_RGB,
+	       priv->p0 + MMSS_DP_TPG_VIDEO_CONFIG);
+	writel(DP_BIST_ENABLE_DPBIST_EN, priv->p0 + MMSS_DP_BIST_ENABLE);
 	writel(DP_TIMING_ENGINE_EN_EN, priv->p0 + MMSS_DP_TIMING_ENGINE_EN);
+	log_warning("DP TPG checkered pattern ON (p0 timing engine + BIST)\n");
 }
 
 static void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
@@ -5097,6 +6051,32 @@ static void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv)
 		    readl(lm + DPU_LM_OUT_SIZE), readl(intf + DPU_INTF_STATUS),
 		    readl(intf + DPU_INTF_MUX),
 		    readl(intf + DPU_INTF_UNDERFLOW_COLOR));
+
+	/* Confirm the LM-composite + SSPP op-mode config actually latched. */
+	log_warning("DPU LM_OP_MODE=%08x BLEND0_OP=%08x SSPP_OP_MODE=%08x MULTIRECT=%08x\n",
+		    readl(lm + DPU_LM_OP_MODE), readl(lm + DPU_LM_BLEND0_OP),
+		    readl(sspp + DPU_SSPP_SRC_OP_MODE),
+		    readl(sspp + DPU_SSPP_MULTIRECT_OPMODE));
+
+	/*
+	 * Sample the framebuffer the SSPP is pointed at (SRC0_ADDR) so the
+	 * bars-vs-black question is answered IN the dp-start log (post-PD the
+	 * serial floods and md is unusable).  Invalidate first so we read what
+	 * the non-coherent DPU master would see in DRAM, not a stale CPU line.
+	 * Expect the 8 colour bars 00ffffff/00ffff00/0000ffff/.../00303030 at
+	 * x = k*(w/8).  All-zero => the fill never landed at this address.
+	 */
+	{
+		u32 fb_pa = readl(sspp + DPU_SSPP_SRC0_ADDR);
+
+		if (fb_pa) {
+			u32 *fb = (u32 *)(ulong)fb_pa;
+
+			invalidate_dcache_range((ulong)fb, (ulong)fb + 0x2000);
+			log_warning("DPU FB@%08x: x0=%08x x240=%08x x480=%08x x960=%08x x1680=%08x\n",
+				    fb_pa, fb[0], fb[240], fb[480], fb[960], fb[1680]);
+		}
+	}
 }
 
 /*
@@ -5193,7 +6173,8 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	 * collapses 0x77 -> 0x00 right here, which was the "No Signal" cause).
 	 * Just (re)enable the mainlink so the freshly programmed MSA is latched.
 	 */
-	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL,
+	writel(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL |
+	       DP_MAINLINK_CTRL_FLUSH_MODE,
 	       priv->link + REG_DP_MAINLINK_CTRL);
 	tachyon_dp_log_lanes(priv, "after MAINLINK enable");
 
@@ -5232,6 +6213,34 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 		writel(dto, priv->p0 + MMSS_DP_P0CLK_DSC_DTO);
 		log_warning("DP backpressure enabled: DSC_DTO=%08x\n",
 			    readl(priv->p0 + MMSS_DP_P0CLK_DSC_DTO));
+	}
+
+	/*
+	 * Start the pixel source LAST.  Only now that the DP controller is armed
+	 * (SEND_VIDEO + backpressure) do we enable the DPU INTF timing engine, so
+	 * the DP TX latches a clean blanking->active transition from a
+	 * freshly-started timing engine — what the DP->HDMI bridge needs to lock.
+	 * (Previously the INTF engine was turned on back in program_intf/scanout,
+	 * BEFORE SEND_VIDEO, so pixels free-ran into an un-armed/SW-reset DP
+	 * controller -> sink "No Signal" despite a trained, ready link.)  This
+	 * mirrors Linux dpu_encoder_phys_vid handle_post_kickoff (INTF enabled
+	 * after the DP stream-on + CTL flush).  The pending CTL flush from
+	 * tachyon_dpu_program_ctl (issued with the engine off) is consumed at this
+	 * first vsync.
+	 */
+	if (priv->dpu && !tachyon_dp_env_bool("tachyon_dp_tpg")) {
+		writel(1, priv->dpu + DPU_INTF_0_BASE +
+			  DPU_INTF_TIMING_ENGINE_EN);
+		log_warning("DP INTF timing engine ON (after SEND_VIDEO)\n");
+	} else if (priv->dpu) {
+		/*
+		 * TPG mode: leave the DPU INTF timing engine OFF so the DP
+		 * controller's internal p0 BIST is the sole pixel/timing source
+		 * (no DPU vs p0 timing-engine conflict).  TPG shares the same DP
+		 * main link + MSA + TU as normal video, so this isolates the
+		 * DPU pixel path from the DP stream.
+		 */
+		log_warning("DP TPG mode: DPU INTF timing engine left OFF\n");
 	}
 
 	{
@@ -5351,11 +6360,26 @@ static void tachyon_dpu_program_sspp(struct tachyon_dp_priv *priv,
 	writel(0, sspp + DPU_SSPP_SRC_YSTRIDE1);
 	writel(DPU_FORMAT_XRGB8888, sspp + DPU_SSPP_SRC_FORMAT);
 	writel(DPU_UNPACK_XRGB8888, sspp + DPU_SSPP_SRC_UNPACK_PATTERN);
+	/*
+	 * ROOT-CAUSE FIX: PE_OVERRIDE makes the SSPP use the SW pixel-extension
+	 * REQ_PIXELS for the per-line fetch count.  Without programming it the pipe
+	 * fetched 0 pixels -> staged-but-black.  Program no extension (LR/TB=0) and
+	 * REQ_PIXELS = full image (height<<16 | width), then assert PE_OVERRIDE --
+	 * matches Linux dpu_hw_sspp_setup_pe_config.
+	 */
+	writel(0, sspp + DPU_SSPP_SW_PIX_EXT_C0_LR);
+	writel(0, sspp + DPU_SSPP_SW_PIX_EXT_C0_TB);
+	writel((height << 16) | width, sspp + DPU_SSPP_SW_PIX_EXT_C0_REQ_PIXELS);
 	writel(DPU_SSPP_PE_OVERRIDE, sspp + DPU_SSPP_SRC_OP_MODE);
+	/* Force RECT_SOLO so a warm-path multirect leftover can't suppress RECT0. */
+	writel(0, sspp + DPU_SSPP_MULTIRECT_OPMODE);
 	writel(0x87, sspp + DPU_SSPP_FETCH_CONFIG);
 	writel(0xffff, sspp + DPU_SSPP_DANGER_LUT);
 	writel(0xff00, sspp + DPU_SSPP_SAFE_LUT);
 	writel(0, sspp + DPU_SSPP_CREQ_LUT);
+	/* Program the real 8-level CREQ QoS LUT (0x74/0x78) so the pipe isn't credit-starved. */
+	writel(0x22335777, sspp + DPU_SSPP_CREQ_LUT_0);
+	writel(0x00112222, sspp + DPU_SSPP_CREQ_LUT_1);
 	writel(1, sspp + DPU_SSPP_QOS_CTRL);
 	writel(1, sspp + DPU_SSPP_CLK_CTRL);
 }
@@ -5365,8 +6389,42 @@ static void tachyon_dpu_program_lm(struct tachyon_dp_priv *priv,
 {
 	void __iomem *lm = priv->dpu + DPU_LM_0_BASE;
 
-	writel(0, lm + DPU_LM_OP_MODE);
 	writel((uc_priv->ysize << 16) | uc_priv->xsize, lm + DPU_LM_OUT_SIZE);
+
+	/*
+	 * Program the LM stage-0 blend so the SSPP layer (staged at DPU_STAGE_0
+	 * in the CTL) is actually composited into the mixer output.  WITHOUT
+	 * this the LM blend mux is at reset -> the mixer emits border/background
+	 * only, the staged pixels are never mixed, the INTF timing engine
+	 * free-runs over blanking, and the DP TX (in SEND_VIDEO) carries no
+	 * active video -> the dock bridge reports "No Signal" (not a black
+	 * picture).  Mirrors Linux dpu_hw_lm_setup_blend_config_combined_alpha +
+	 * setup_color3 for one opaque plane on SC7280.
+	 */
+	writel(DPU_LM_BLEND0_OP_VAL, lm + DPU_LM_BLEND0_OP);
+	writel(DPU_LM_BLEND0_CONST_ALPHA_VAL, lm + DPU_LM_BLEND0_CONST_ALPHA);
+	/*
+	 * LM_OP_MODE (BLEND_COLOR_OUT) selects which stage's foreground is
+	 * composited into the mixer output.  Linux dpu_crtc.c:500-501 sets
+	 * mixer_op_mode |= 1 << pstate->stage, and dpu_hw_lm_setup_color3
+	 * (dpu_hw_lm.c:191-203) writes it into LM_OP_MODE.  For one fullscreen
+	 * plane at DPU_STAGE_0 (=1) the final value is BIT(1) (STAGE0_FG_ALPHA).
+	 * Writing 0 leaves the BLEND0 block (0x20/0x24) configured but NEVER
+	 * composited -> mixer emits its border only = black framebuffer with a
+	 * valid signal.  Must agree with CTL_LAYER mix = (2<<18).  (An earlier
+	 * change from BIT(1) to 0 was this exact regression.)
+	 */
+	writel(DPU_LM_OP_MODE_STAGE0, lm + DPU_LM_OP_MODE);
+
+	/*
+	 * DIAGNOSTIC: paint the mixer BORDER red.  BORDER_OUT is set in the CTL,
+	 * so any region not covered by the composited SSPP layer shows red.
+	 * Screen RED  => mixer->INTF->DP path works, pipe NOT composited.
+	 * Screen WHITE=> pipe composited (FB shows) - fix worked.
+	 * Screen BLACK=> mixer output never reaches the INTF (datapath/underflow).
+	 */
+	writel(DPU_LM_BORDER_RED_0, lm + DPU_LM_BORDER_COLOR_0);
+	writel(DPU_LM_BORDER_RED_1, lm + DPU_LM_BORDER_COLOR_1);
 }
 
 static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
@@ -5395,7 +6453,8 @@ static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
 	active_v_end = active_v_start + uc_priv->ysize * htotal - 1;
 
 	writel(0, intf + DPU_INTF_TIMING_ENGINE_EN);
-	writel(0, intf + DPU_INTF_CONFIG);
+	writel(DPU_INTF_CFG_ACTIVE_H_EN | DPU_INTF_CFG_ACTIVE_V_EN,
+	       intf + DPU_INTF_CONFIG);
 	writel((htotal << 16) | hsync, intf + DPU_INTF_HSYNC_CTL);
 	writel(vtotal * htotal, intf + DPU_INTF_VSYNC_PERIOD_F0);
 	writel(vsync * htotal, intf + DPU_INTF_VSYNC_PULSE_WIDTH_F0);
@@ -5408,6 +6467,7 @@ static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
 	writel((hend << 16) | hstart, intf + DPU_INTF_DISPLAY_DATA_HCTL);
 	writel((hend << 16) | hstart, intf + DPU_INTF_ACTIVE_DATA_HCTL);
 	writel(0, intf + DPU_INTF_BORDER_COLOR);
+	/* Underflow colour = black (a transient underrun shouldn't flash). */
 	writel(0, intf + DPU_INTF_UNDERFLOW_COLOR);
 	writel(0, intf + DPU_INTF_HSYNC_SKEW);
 	writel(0, intf + DPU_INTF_POLARITY_CTL);
@@ -5415,7 +6475,18 @@ static void tachyon_dpu_program_intf(struct tachyon_dp_priv *priv,
 	writel(DPU_INTF_FORMAT_XRGB8888, intf + DPU_INTF_PANEL_FORMAT);
 	writel(1, intf + DPU_INTF_FRAME_LINE_COUNT_EN);
 	writel(0, intf + DPU_INTF_MUX);
-	writel(1, intf + DPU_INTF_TIMING_ENGINE_EN);
+	/*
+	 * Do NOT enable the timing engine here.  The DP transmitter must be armed
+	 * (SEND_VIDEO) BEFORE the pixel source starts, otherwise the DP TX never
+	 * sees a clean blanking->active transition and the DP->HDMI bridge's DP RX
+	 * won't lock to the main-video stream (trained link, READY_FOR_VIDEO,
+	 * frame counter advancing, yet sink "No Signal").  The engine is enabled
+	 * as the FINAL step in tachyon_dp_program_mainlink, after SEND_VIDEO —
+	 * mirroring Linux's post-kickoff INTF enable and the rule "Video mode must
+	 * flush CTL before enabling the timing engine" (the CTL flush in
+	 * tachyon_dpu_program_ctl runs with the engine off; the pending flush is
+	 * consumed at the first vsync once we enable it below).
+	 */
 }
 
 static int tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
@@ -5428,8 +6499,17 @@ static int tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
 	if (ret)
 		return ret;
 
-	writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
-	       ctl + DPU_CTL_LAYER_0);
+	/*
+	 * DIAGNOSTIC: tachyon_dp_border_only=1 stages NO pipe (border-out only) so
+	 * the mixer outputs the (red) border across the whole frame.  Screen RED =>
+	 * LM->PP->INTF->DP datapath works and the bug is the SSPP pipe (fetch/SMMU
+	 * or staging); screen BLACK => the mixer output never reaches the INTF.
+	 */
+	if (tachyon_dp_env_bool("tachyon_dp_border_only"))
+		writel(DPU_CTL_LAYER_BORDER_OUT, ctl + DPU_CTL_LAYER_0);
+	else
+		writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
+		       ctl + DPU_CTL_LAYER_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT2_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT3_0);
@@ -5452,6 +6532,252 @@ static int tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
 	return 0;
 }
 
+/*
+ * The DPU framebuffer read goes MASTER_MDP0 -> mmss_noc -> DDR.  That AXI path
+ * is bandwidth-gated by an RPMh BCM vote that U-Boot otherwise never makes, so
+ * the SSPP fetch is starved to zero and the pipe underruns (solid INTF
+ * underflow colour) even with every DPU register correct and the FB full of
+ * pixels.  Linux msm_mdss_enable() votes a mandatory MIN_IB_BW=400MB/s floor on
+ * the mdp0-mem path before the AXI clocks can move data.  Replicate that by
+ * voting MM1 (the one non-keepalive BCM on the path; it carries qxm_mdp0) using
+ * U-Boot's already-compiled RPMh-RSC + cmd-db transport.  MM0/SH0/MC0 are
+ * keepalive (held by XBL/RPMh, DRAM+LLCC already up) and only re-asserted as
+ * cheap insurance.  rpmh_rsc_send_data() is the same tested path the rpmh clock
+ * driver uses for its xo.lvl vote, so no raw TCS poking.
+ */
+struct rsc_drv;
+int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg);
+
+/*
+ * Secure-monitor MMIO accessors (implemented in drivers/soc/qcom/qcom_adsp_pas.c).
+ * Used to reach the XPU/secure-owned MMNOC MMU-TBU GDSC bank that bare EL2-NS
+ * writes can't touch.
+ */
+int qcom_scm_io_readl(phys_addr_t addr, u32 *val);
+int qcom_scm_io_writel(phys_addr_t addr, u32 val);
+
+/* sc7280 cmd-db BCM aux record (Linux icc-rpmh.c struct bcm_db). */
+struct tachyon_bcm_aux {
+	__le32 unit;
+	__le16 width;
+	u8 vcd;
+	u8 reserved;
+};
+
+/* bcm_div(): a non-zero sub-unit vote must not collapse to 0 (bcm-voter.c). */
+static u64 tachyon_bcm_div(u64 num, u32 base)
+{
+	if (num && num < base)
+		return 1;
+	return base ? num / base : 0;
+}
+
+/*
+ * Compute the BCM vote fields, replicating bcm_aggregate() (bcm-voter.c:99-116).
+ * CRUCIAL: avg (vote_x) divides by buswidth*channels; peak (vote_y) divides by
+ * buswidth ONLY.  unit/width are firmware values read from cmd-db at runtime.
+ */
+static u32 tachyon_bcm_vote_x(const char *name, u32 buswidth, u32 channels,
+			      u32 ab_kbps)
+{
+	const struct tachyon_bcm_aux *aux;
+	size_t len = 0;
+	u64 unit, width, t;
+
+	aux = cmd_db_read_aux_data(name, &len);
+	if (IS_ERR_OR_NULL(aux) || len < sizeof(*aux))
+		return 0;
+	unit  = le32_to_cpu(aux->unit);
+	width = le16_to_cpu(aux->width);
+	if (!unit || !width || !buswidth || !channels)
+		return 0;
+
+	t = tachyon_bcm_div((u64)ab_kbps * width, (u64)buswidth * channels);
+	t = tachyon_bcm_div(t * 1000, (u32)unit);
+	return t > BCM_TCS_CMD_VOTE_MASK ? BCM_TCS_CMD_VOTE_MASK : (u32)t;
+}
+
+static u32 tachyon_bcm_vote_y(const char *name, u32 buswidth, u32 ib_kbps)
+{
+	const struct tachyon_bcm_aux *aux;
+	size_t len = 0;
+	u64 unit, width, t;
+
+	aux = cmd_db_read_aux_data(name, &len);
+	if (IS_ERR_OR_NULL(aux) || len < sizeof(*aux))
+		return 0;
+	unit  = le32_to_cpu(aux->unit);
+	width = le16_to_cpu(aux->width);
+	if (!unit || !width || !buswidth)
+		return 0;
+
+	t = tachyon_bcm_div((u64)ib_kbps * width, buswidth);
+	t = tachyon_bcm_div(t * 1000, (u32)unit);
+	return t > BCM_TCS_CMD_VOTE_MASK ? BCM_TCS_CMD_VOTE_MASK : (u32)t;
+}
+
+static int tachyon_bcm_send(struct rsc_drv *drv, u32 addr, u32 data)
+{
+	struct tcs_cmd cmd = { .addr = addr, .data = data, .wait = 1 };
+	struct tcs_request msg = {
+		.state = RPMH_ACTIVE_ONLY_STATE,
+		.wait_for_compl = 1,
+		.is_read = false,
+		.num_cmds = 1,
+		.cmds = &cmd,
+	};
+
+	if (!addr)
+		return -ENODEV;
+	return rpmh_rsc_send_data(drv, &msg);
+}
+
+/*
+ * Linux raises the SC7280_CX rpmhpd voltage corner to SVS (RPMH level 128)
+ * atomically with the 300MHz DISP_CC_MDSS_MDP_CLK via the OPP framework
+ * (sc7280.dtsi power-domains=<&rpmhpd SC7280_CX>; mdp_opp_table opp-300000000
+ * required-opps=<&rpmhpd_opp_svs>).  U-Boot only sets the core clock, leaving
+ * the DPU datapath at the idle CX voltage -> the SSPP DRAM fetch starves even
+ * at 300MHz with bandwidth granted.  Replicate the ARC corner vote: .data is
+ * the INDEX into the firmware "cx.lvl" level table for the first level >= 128
+ * (rpmhpd.c rpmhpd_send_corner), sent active-only over the same RSC.
+ */
+static void tachyon_dp_vote_cx_corner(struct rsc_drv *drv)
+{
+	const __le16 *lvl;
+	size_t len = 0, n, i;
+	u32 addr;
+	int idx = -1;
+
+	addr = cmd_db_read_addr("cx.lvl");
+	if (!addr) {
+		log_warning("DP: no cx.lvl ARC addr; skipping CX corner vote\n");
+		return;
+	}
+	lvl = cmd_db_read_aux_data("cx.lvl", &len);
+	if (IS_ERR_OR_NULL(lvl) || len < sizeof(*lvl)) {
+		log_warning("DP: no cx.lvl aux data; skipping CX corner vote\n");
+		return;
+	}
+	n = len / sizeof(*lvl);
+	for (i = 0; i < n; i++) {
+		u16 v = le16_to_cpu(lvl[i]);
+
+		if (i > 0 && v == 0)		/* zero-padded tail */
+			break;
+		if (v >= 128) {			/* RPMH_REGULATOR_LEVEL_SVS */
+			idx = (int)i;
+			break;
+		}
+	}
+	if (idx < 0)
+		idx = (int)n - 1;		/* clamp to max corner */
+
+	{
+		struct tcs_cmd cmd = { .addr = addr, .data = (u32)idx, .wait = 1 };
+		struct tcs_request msg = {
+			.state = RPMH_ACTIVE_ONLY_STATE, .wait_for_compl = 1,
+			.is_read = false, .num_cmds = 1, .cmds = &cmd,
+		};
+		int ret = rpmh_rsc_send_data(drv, &msg);
+
+		log_warning("DP: CX corner vote addr=%#x idx=%d ret=%d\n",
+			    addr, idx, ret);
+	}
+}
+
+static void tachyon_dp_grant_mdp0_bandwidth(void)
+{
+	/*
+	 * Grant the SSPP its DRAM read throughput, replicating what Linux does
+	 * over the same apps_rsc/RPMh transport:
+	 *  (1) Vote the REAL 1080p60 bandwidth (AB~622MB/s, IB=1.6GB/s) on EVERY
+	 *      BCM of the MASTER_MDP0->EBI path (icc_set_bw fans a path vote out to
+	 *      all nodes): MM1(qxm_mdp0) MM0(qns_mem_noc_hf) SH0(qns_llcc) MC0(ebi),
+	 *      each with its OWN buswidth+channels, + the ACV mask BCM.  Voting only
+	 *      MM1 leaves the DDR/LLCC bus clocks unraised -> still starved.
+	 *  (2) Raise the SC7280_CX corner the 300MHz core clock requires.
+	 */
+	const u32 ab_kbps = 622080;	/* 1080p60 plane avg, Bps/1000 */
+	const u32 ib_kbps = 1600000;	/* peak 1.6 GB/s = min_dram_ib */
+	static const struct { const char *n; u32 bw; u32 ch; } path[] = {
+		{ "MM1", 32, 1 },	/* qxm_mdp0       */
+		{ "MM0", 32, 2 },	/* qns_mem_noc_hf */
+		{ "SH0", 16, 2 },	/* qns_llcc       */
+		{ "MC0",  4, 2 },	/* ebi            */
+	};
+	struct udevice *rsc;
+	struct rsc_drv *drv;
+	int i, ret;
+
+	ret = uclass_get_device_by_driver(UCLASS_MISC,
+					  DM_DRIVER_GET(qcom_rpmh_rsc), &rsc);
+	if (ret) {
+		log_warning("DP: no apps_rsc for MDP0 bw vote: %d\n", ret);
+		return;
+	}
+	drv = dev_get_priv(rsc);
+
+	for (i = 0; i < ARRAY_SIZE(path); i++) {
+		u32 a  = cmd_db_read_addr(path[i].n);
+		u32 vx = tachyon_bcm_vote_x(path[i].n, path[i].bw, path[i].ch,
+					    ab_kbps);
+		u32 vy = tachyon_bcm_vote_y(path[i].n, path[i].bw, ib_kbps);
+
+		ret = tachyon_bcm_send(drv, a, BCM_TCS_CMD(1, 1, vx, vy));
+		log_warning("DP: %s bw vote addr=%#x vx=%u vy=%u ret=%d\n",
+			    path[i].n, a, vx, vy, ret);
+	}
+
+	/* ACV mask BCM (enable_mask=BIT(3)): mark the DDR channel active. */
+	tachyon_bcm_send(drv, cmd_db_read_addr("ACV"), BCM_TCS_CMD(1, 1, 0, BIT(3)));
+
+	/* Raise the CX voltage corner the 300MHz datapath needs. */
+	tachyon_dp_vote_cx_corner(drv);
+}
+
+/*
+ * Fix the MDP stream's SMR mask.  The DT spec is iommus=<&apps_smmu 0x900
+ * 0x402>: SID 0x900, MASK 0x402 -- so the stream must match the MDP's masked
+ * sub-SIDs (0x900/0x902/0xd00/0xd02, bits 1 and 10 wildcarded).  But the live
+ * SMR[3] reads 0x80000900 (VALID|ID, MASK=0) -- it matches ONLY exactly
+ * 0x900.  If the DMA0 SSPP fetch emits a masked variant it is an UNMATCHED
+ * stream -> SMMU fault -> (on this platform, with secure fault handling) a
+ * reset.  Now that we know the TBU is powered (PWR_STATUS!=0) and the SMMU
+ * region is U-Boot-writable (CB3 writes stuck) + SVC_IO-serviced, widen the
+ * SMR to the DT mask.  Write both NS and via SVC_IO and read back to see
+ * which sticks.  Target SMR value = VALID|MASK(0x402<<16)|ID = 0x84020900.
+ */
+static void tachyon_dp_fix_mdp_smr(void)
+{
+	void __iomem *smmu = map_sysmem(0x15000000, 0x100000);
+	int n;
+
+	if (!smmu)
+		return;
+
+	for (n = 0; n < 128; n++) {
+		u32 smr = readl(smmu + 0x800 + 4 * n);
+
+		if (!(smr & BIT(31)) || (smr & 0xffff) != 0x0900)
+			continue;
+		{
+			phys_addr_t pa = 0x15000000UL + 0x800 + 4 * n;
+			u32 want = BIT(31) | (0x402u << 16) | 0x0900; /* 0x84020900 */
+			u32 sv = 0;
+
+			writel(want, smmu + 0x800 + 4 * n);	/* NS write   */
+			qcom_scm_io_writel(pa, want);		/* secure write */
+			qcom_scm_io_readl(pa, &sv);
+			log_warning("MDP SMR[%d] mask-fix: was=%08x want=%08x ns_rb=%08x scm_rb=%08x\n",
+				    n, smr, want, readl(smmu + 0x800 + 4 * n), sv);
+		}
+		break;
+	}
+
+	unmap_sysmem(smmu);
+}
+
 static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 				       struct video_uc_plat *plat,
 				       struct video_priv *uc_priv)
@@ -5468,15 +6794,56 @@ static int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 	setbits_le32(priv->dpu + DPU_TOP_BASE + DPU_CLK_CTRL,
 		     DPU_CLK_CTRL_DMA0);
 
-	/* Basic VBIF QoS: set all XIN clients to mid-level real-time priority */
+	/*
+	 * Make the DMA0 SSPP AXI read client (xin_id=1) fetch-ready at the VBIF.
+	 * THIS is why the SSPP fetched zero (solid INTF underflow) despite correct
+	 * config + FB + clock + voltage + BCM bandwidth: at cold handoff the VBIF
+	 * OUT_AXI_AMEMTYPE for the MDP read client is 0, so the SMMU/NoC drops
+	 * every MDP read.  XBL sets AMEMTYPE=0x33333333/0x00333333 "to work with
+	 * the new SMMU" (HALMDSS hal_mdp_vbif.c) and Linux re-runs
+	 * dpu_vbif_init_memtypes() every runtime resume; U-Boot did neither (its
+	 * old 0xd00/0xd20 writes were the wrong registers entirely).  Also un-halt
+	 * the xin and clear stale AXI error latches in case XBL teardown left them.
+	 */
 	if (priv->vbif) {
-		writel(0, priv->vbif + VBIF_XINL_QOS_RPT_CTRL);
-		writel(0x22222222, priv->vbif + VBIF_XINL_QOS_LVL_PRIO_0);
+		u32 pnd = readl(priv->vbif + VBIF_XIN_PND_ERR);
+		u32 src = readl(priv->vbif + VBIF_XIN_SRC_ERR);
+		u32 halt1_before = readl(priv->vbif + VBIF_XIN_HALT_CTRL1);
+
+		/* Un-halt DMA0 (BIT(1) of HALT_CTRL0). */
+		clrbits_le32(priv->vbif + VBIF_XIN_HALT_CTRL0,
+			     BIT(VBIF_DMA0_XIN_ID));
+		/* Clear any stale pending/source AXI error latches. */
+		if (pnd | src)
+			writel(pnd | src, priv->vbif + VBIF_XIN_CLR_ERR);
+		/* AMEMTYPE = 3 (cacheable normal) for every xin, like XBL/Linux. */
+		writel(0x33333333, priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF0);
+		writel(0x00333333, priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF1);
+
+		log_warning("VBIF xin1 init: HALT1_before=%08x PND=%08x SRC=%08x AMEM0=%08x\n",
+			    halt1_before, pnd, src,
+			    readl(priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF0));
 	}
+
+	/*
+	 * Grant the MDP0->DDR read bandwidth (RPMh BCM vote) BEFORE the SSPP
+	 * fetch is set up.  Without this the AXI read is starved and the pipe
+	 * underruns (solid INTF underflow colour) despite correct config.
+	 */
+	tachyon_dp_grant_mdp0_bandwidth();
 
 	tachyon_dpu_program_sspp(priv, plat, uc_priv);
 	tachyon_dpu_program_lm(priv, uc_priv);
 	tachyon_dpu_program_intf(priv, uc_priv);
+
+	/*
+	 * Widen the MDP stream's apps_smmu SMR to the DT mask (0x402) so the
+	 * DMA0 fetch's masked sub-SIDs match SMR[3]->S2CR[3]->CB3 instead of
+	 * faulting as an unmatched stream.  This is the step that lets the MDP
+	 * AXI read reach DRAM (the M=0 passthrough CB is sufficient).
+	 */
+	tachyon_dp_fix_mdp_smr();
+
 #ifdef CONFIG_VIDEO_TACHYON_DP_MULTI_PLANE
 	tachyon_dpu_program_lm_blend(priv);
 	return tachyon_dpu_program_ctl_multi(priv);
@@ -6103,6 +7470,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	u32 width, height;
 	int ret, altmode_ret;
 	bool has_sbu_mux;
+	bool forced_typec = false;
 
 #if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
 	if (!tachyon_dp_manual_probe_armed) {
@@ -6198,6 +7566,36 @@ static int tachyon_dp_probe(struct udevice *dev)
 	} else {
 		log_warning("DP Type-C Alt Mode not active yet: ret=%d; continuing DP init while PMIC service polls\n",
 			    altmode_ret);
+
+		/*
+		 * E1 (audit): the dock has not entered DP.  If a DFP partner is
+		 * attached and doesn't self-initiate the data-role swap, request
+		 * DFP ourselves (SET_UOR(DFP), now with ACCEPT_ROLE_SWAPS) so the
+		 * ADSP sink-path DP gate (DataRole==DFP, pe_snk.c:947) can fire —
+		 * no manual `qpg bounce` needed.  Disable with
+		 * tachyon_dp_no_auto_dfp=1 to keep the cold path pure-passive.
+		 */
+		if (!tachyon_dp_env_bool("tachyon_dp_no_auto_dfp")) {
+			int dfp = qcom_pmic_glink_request_dfp(
+				tachyon_dp_env_u32("tachyon_dp_auto_dfp_ms",
+						   4000));
+
+			log_warning("DP auto-DFP ret=%d; re-reading altmode\n",
+				    dfp);
+			altmode_ret = tachyon_dp_read_altmode(priv);
+			if (altmode_ret > 0) {
+				priv->typec_source =
+					TACHYON_DP_TYPEC_SOURCE_ALTMODE;
+				priv->typec_valid = true;
+				if (tachyon_dp_typec_state_valid(priv)) {
+					tachyon_dp_log_typec_resolved(priv);
+				} else {
+					priv->typec_valid = false;
+					priv->typec_source =
+						TACHYON_DP_TYPEC_SOURCE_NONE;
+				}
+			}
+		}
 	}
 
 	ret = tachyon_dp_request_sbu_mux(priv);
@@ -6229,6 +7627,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 		 */
 		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
 		priv->typec_valid = true;
+		forced_typec = true;
 
 		if (tachyon_dp_env_bool("tachyon_dp_force_reverse"))
 			priv->orientation = TACHYON_DP_ORIENTATION_REVERSE;
@@ -6236,46 +7635,100 @@ static int tachyon_dp_probe(struct udevice *dev)
 			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
 
 		/*
-		 * Use D = USB3 + DP / 2-lane as first default because Linux
-		 * showed rate=540000 and num_lanes=2.
+		 * Forced/diagnostic path: there was no ADSP alt-mode notify, so
+		 * the negotiated Type-C pin is unknown. The Tachyon's target
+		 * sinks are USB-C docks/hubs, which negotiate pin D = 2-lane DP +
+		 * USB3 (combo MODE=0x03) — so default to pin D. Override with
+		 * tachyon_dp_force_pin only for experiments (C=2 / E=4 are 4-lane
+		 * DP-only MODE=0x02; F=5 is the reversed 2-lane combo). The pin
+		 * choice drives both the link lane budget (reset_link_policy) and
+		 * the QMP combo split (tachyon_dp_qmp_phy_mode).
 		 */
-		priv->pin_assignment = 3;
+		{
+			u8 forced_pin = tachyon_dp_env_u32("tachyon_dp_force_pin",
+							   3);
+
+			if (!tachyon_dp_valid_pin_assignment(forced_pin)) {
+				log_warning("DP invalid tachyon_dp_force_pin=%u; using pin D (3)\n",
+					    forced_pin);
+				forced_pin = 3;
+			}
+			priv->pin_assignment = forced_pin;
+		}
+		log_warning("DP forced Type-C: orientation=%u pin=%u pin_lanes=%u (override: tachyon_dp_force_pin / _reverse / _lanes / _max_rate)\n",
+			    priv->orientation, priv->pin_assignment,
+			    tachyon_dp_pin_assignment_lanes(priv));
 		tachyon_dp_log_typec_resolved(priv);
 	}
 
-	tachyon_dp_program_sbu_mux(priv);
-
 	/*
-	 * Bring the DP PHY up to PHY_READY (DP_STATUS) BEFORE AUX.  The ADSP has
-	 * entered DP alt-mode (mux=DP, HPD=1) but AUX still times out unless the
-	 * QMP DP PHY PLL is locked (C_READY/PHY_READY) — otherwise DP_STATUS=00
-	 * and every AUX read fails with DP_INTR_TIMEOUT.  The full rate-specific
-	 * PHY config re-runs later in link training; here we bring it up at a
-	 * safe default (HBR / 2-lane, matching pin-assignment D) purely so
-	 * AUX/EDID can reach the sink.
+	 * Resolve the (orientation, pin) actually used and read the sink's DPCD
+	 * link caps.  Each attempt first brings the DP PHY to PHY_READY
+	 * (DP_STATUS) and forces AUX on for that orientation — without a locked
+	 * PLL, AUX reads fail with DP_INTR_TIMEOUT and DP_STATUS=00.
+	 *
+	 * With a real ADSP alt-mode notify we already know orientation+pin, so
+	 * there is a single candidate.  On the forced/diagnostic path the hub
+	 * only reveals its pin once it has entered DP, so instead of forcing one
+	 * mode we SWEEP the viable 2-lane dock assignments — pin D (normal) then
+	 * pin F (D reversed), both 2-lane DP+USB3 / combo MODE=0x03 — and keep
+	 * whichever the sink answers DPCD on.  AUX timing out (-110) just means
+	 * "no sink on this orientation"; move to the next candidate.  An explicit
+	 * tachyon_dp_force_pin / tachyon_dp_force_reverse pins a single attempt
+	 * (use pin C=2 / E=4 there for a 4-lane DP-only sink).
 	 */
-	if (!priv->rate)
-		priv->rate = DP_LINK_RATE_HBR;
-	if (!priv->lanes)
-		priv->lanes = 2;
-	ret = tachyon_dp_qmp_program_dp_phy(priv);
-	log_warning("DP pre-AUX PHY bring-up ret=%d rate=%u lanes=%u DP_STATUS=%02x\n",
-		    ret, priv->rate, priv->lanes,
-		    tachyon_dp_qmp_status_low(priv));
+	{
+		struct { enum tachyon_dp_orientation orient; u8 pin; } cand[4];
+		bool explicit_pin =
+			tachyon_dp_env_has_u32("tachyon_dp_force_pin") ||
+			tachyon_dp_env_bool("tachyon_dp_force_reverse");
+		int ncand = 0, ci;
 
-	/*
-	 * Read the sink's DPCD link caps now that the PHY is ready and AUX is
-	 * up.  The wait_sink HPD-gated DPCD read gets skipped when the cached
-	 * Type-C state is stale (notify reported safe/hpd=0 even though DP is
-	 * actually active), leaving max_rate/max_lanes=0 — which makes the EDID
-	 * mode filter drop *every* mode and the link-train guard bail.  Read
-	 * caps here directly; if it fails or yields nothing, fall back to a
-	 * safe HBR / 2-lane budget so mode selection + link training proceed.
-	 */
-	ret = tachyon_dp_read_dpcd_caps(priv);
-	log_warning("DP pre-AUX DPCD caps ret=%d caps.lanes=%u caps.max_rate=%u max_rate=%u max_lanes=%u\n",
-		    ret, priv->caps.lanes, priv->caps.max_rate,
-		    priv->max_rate, priv->max_lanes);
+		if (!forced_typec || explicit_pin) {
+			cand[ncand].orient = priv->orientation;
+			cand[ncand].pin = priv->pin_assignment;
+			ncand++;
+		} else {
+			cand[ncand].orient = TACHYON_DP_ORIENTATION_NORMAL;
+			cand[ncand].pin = 3;	/* pin D: 2-lane DP + USB3 */
+			ncand++;
+			cand[ncand].orient = TACHYON_DP_ORIENTATION_REVERSE;
+			cand[ncand].pin = 3;	/* pin F: same, reversed */
+			ncand++;
+		}
+
+		ret = -EIO;
+		for (ci = 0; ci < ncand; ci++) {
+			priv->orientation = cand[ci].orient;
+			priv->pin_assignment = cand[ci].pin;
+			priv->rate = DP_LINK_RATE_HBR;
+			priv->lanes = 2;
+
+			log_warning("DP probe %d/%d: orientation=%u pin=%u pin_lanes=%u\n",
+				    ci + 1, ncand, priv->orientation,
+				    priv->pin_assignment,
+				    tachyon_dp_pin_assignment_lanes(priv));
+
+			tachyon_dp_program_sbu_mux(priv);
+			tachyon_dp_prepare_aux_for_orientation(priv,
+							       priv->orientation);
+
+			ret = tachyon_dp_qmp_program_dp_phy(priv);
+			log_warning("DP probe PHY bring-up ret=%d DP_STATUS=%02x\n",
+				    ret, tachyon_dp_qmp_status_low(priv));
+
+			ret = tachyon_dp_read_dpcd_caps(priv);
+			log_warning("DP probe DPCD ret=%d caps.lanes=%u caps.max_rate=%u\n",
+				    ret, priv->caps.lanes, priv->caps.max_rate);
+
+			if (!ret && priv->caps.lanes && priv->caps.max_rate) {
+				log_warning("DP probe LOCKED orientation=%u pin=%u after %d/%d\n",
+					    priv->orientation,
+					    priv->pin_assignment, ci + 1, ncand);
+				break;
+			}
+		}
+	}
 	if (ret || !priv->caps.lanes || !priv->caps.max_rate) {
 		priv->caps.lanes = priv->caps.lanes ? priv->caps.lanes : 2;
 		priv->caps.max_rate = priv->caps.max_rate ?
@@ -6399,13 +7852,25 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	video_set_flush_dcache(dev, true);
 	/*
-	 * Fill the framebuffer with vertical colour bars instead of clearing it
-	 * to black.  If the DPU is genuinely fetching the framebuffer and the DP
-	 * link + dock are working, the TV shows bars; if it still shows "No
-	 * Signal", the dock isn't producing HDMI at all (and a black FB would
-	 * have looked identical, hiding that distinction).
+	 * Initialise the framebuffer the DPU scans out.  Default to a clean
+	 * black background so the real U-Boot console renders on it: with
+	 * CONFIG_NO_FB_CLEAR=y the video uclass does NOT clear this freshly
+	 * lmb-allocated buffer, after which video_post_probe draws the logo and
+	 * the vidconsole renders the prompt/output (see tachyon_dp_cmd, which
+	 * routes stdout onto the vidconsole once DP is up).  Set the env var
+	 * "tachyon_dp_test_pattern" to instead paint vertical colour bars — a
+	 * fetch-vs-no-fetch diagnostic: if the dock shows bars the DPU is
+	 * genuinely fetching the framebuffer.
 	 */
-	tachyon_dp_fill_test_pattern(plat, uc_priv);
+	if (tachyon_dp_env_bool("tachyon_dp_test_pattern")) {
+		tachyon_dp_fill_test_pattern(plat, uc_priv);
+	} else {
+		memset((void *)plat->base, 0,
+		       (size_t)uc_priv->line_length * uc_priv->ysize);
+		flush_dcache_range((ulong)plat->base,
+				   (ulong)plat->base +
+				   (ulong)uc_priv->line_length * uc_priv->ysize);
+	}
 
 	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
 	if (ret)
@@ -6874,6 +8339,22 @@ int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
 	    !strcmp(argv[2], "probe")) {
 		tachyon_dp_arm_manual_probe();
 		ret = tachyon_dp_find_device(&dev, true);
+		/*
+		 * DP is up and video_post_probe has bound + registered the
+		 * "vidconsole" stdio device.  Route U-Boot's console onto it
+		 * (alongside serial) so the prompt and command output appear on
+		 * the dock.  CONFIG_CONSOLE_MUX + CONFIG_SYS_CONSOLE_IS_IN_ENV
+		 * make the stdout env callback (on_console) re-evaluate the iomux
+		 * immediately.  Skipped in test-pattern mode so the diagnostic
+		 * colour bars are not overwritten by console text.
+		 */
+		if (!ret && dev &&
+		    !tachyon_dp_env_bool("tachyon_dp_test_pattern")) {
+			const char *cur = env_get("stdout");
+
+			if (!cur || !strstr(cur, "vidconsole"))
+				env_set("stdout", "serial,vidconsole");
+		}
 		tachyon_dp_print_device_status(dev);
 		tachyon_dp_print_pmic_state();
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;

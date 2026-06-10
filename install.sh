@@ -112,6 +112,13 @@ ssh_exec() {
 scp_exec() {
     local src="$1"
     local dst="$2"
+    # On Windows/Git-Bash the native scp.exe cannot read MSYS-style local
+    # paths (/c/Users/...). Convert local (non host:path) args to Windows
+    # form. No-op on Mac/Linux where cygpath is absent.
+    if command -v cygpath >/dev/null 2>&1; then
+        case "$src" in *:*) ;; /*) src="$(cygpath -m "$src")" ;; esac
+        case "$dst" in *:*) ;; /*) dst="$(cygpath -m "$dst")" ;; esac
+    fi
     if [ "$USE_SSHPASS" = true ]; then
         sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no "$src" "$dst"
     else

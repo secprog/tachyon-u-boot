@@ -159,6 +159,19 @@ static const struct gate_clk sc7280_clks[] = {
 	GATE_CLK(GCC_SDCC1_AHB_CLK,  0x75004, BIT(0)),
 	GATE_CLK(GCC_SDCC1_APPS_CLK, 0x75008, BIT(0)),
 	GATE_CLK(GCC_CFG_NOC_LPASS_CLK, 0x47020, BIT(0)),
+	/*
+	 * MDSS<->DDR AXI read/write clocks ("bus"/"nrt_bus" in the sc7280-dpu
+	 * node).  These are plain HWCG branches (BRANCH_HALT_SKIP in Linux
+	 * gcc-sc7280.c, so no halt poll needed).  Without them the DPU SSPP's
+	 * AXI read path to DRAM is unclocked: the pipe fetches zero and the
+	 * INTF emits its underflow colour every active line (a solid colour on
+	 * the dock) even though all DPU config, the framebuffer, the MDP core
+	 * clock and the RPMh bandwidth/voltage votes are correct.  U-Boot's GCC
+	 * driver omitted them, and sc7280_enable() silently no-ops unknown ids,
+	 * so clk_enable("bus") returned success while doing nothing.
+	 */
+	GATE_CLK(GCC_DISP_HF_AXI_CLK, 0x2700c, BIT(0)),
+	GATE_CLK(GCC_DISP_SF_AXI_CLK, 0x27014, BIT(0)),
 };
 
 static int sc7280_enable(struct clk *clk)

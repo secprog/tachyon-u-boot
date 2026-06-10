@@ -62,6 +62,7 @@ const struct qcom_pmic_glink_altmode_state *
 qcom_pmic_glink_altmode_get_state(void);
 bool qcom_pmic_glink_altmode_hpd_asserted(void);
 int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode);
+int qcom_pmic_glink_request_dfp(u32 settle_ms);
 #else
 static inline int qcom_pmic_glink_altmode_start(void)
 {
@@ -88,6 +89,11 @@ static inline bool qcom_pmic_glink_altmode_hpd_asserted(void)
 
 static inline int
 qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
+{
+	return -ENOSYS;
+}
+
+static inline int qcom_pmic_glink_request_dfp(u32 settle_ms)
 {
 	return -ENOSYS;
 }

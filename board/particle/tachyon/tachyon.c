@@ -735,9 +735,26 @@ int tachyon_pmic_configure(void) {
  */
 void qcom_late_init(void)
 {
-	int r = tachyon_pmic_configure();
+	int r = -EAGAIN, tries;
+
+	/*
+	 * The HLOS OS-type bit MUST be set before the ADSP boots — the ADSP
+	 * reads it once at DPM init and BOOTLOADER => bPANEn=0 => USB-C DP never
+	 * enters.  tachyon_pmic_configure() already verifies the readback, but a
+	 * transient PMIC-bus failure would otherwise be logged once and ignored,
+	 * leaving the ADSP silently in charging-only mode.  Retry a few times and
+	 * shout loudly if it never sticks, so the failure is diagnosable instead
+	 * of presenting as a mysterious "DP never enters".
+	 */
+	for (tries = 0; tries < 5 && r < 0; tries++) {
+		r = tachyon_pmic_configure();
+		if (r < 0)
+			printf("HLOS OS-type write attempt %d failed: %d\n",
+			       tries + 1, r);
+	}
 	if (r < 0)
-		printf("Failed to set OS type to HLOS at init: %d\n", r);
+		printf("*** WARNING: HLOS OS-type NEVER set (%d) - ADSP will run charging-only, USB-C DP will NOT enter ***\n",
+		       r);
 }
 
 int tachyon_system_setup(void *fdt) {

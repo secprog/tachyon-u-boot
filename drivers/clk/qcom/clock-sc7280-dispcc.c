@@ -79,7 +79,24 @@ static int sc7280_dispcc_enable(struct clk *clk)
 				     sc7280_dp_pixel_n, 2 << 8, 16);
 		break;
 	case DISP_CC_MDSS_MDP_CLK:
-		clk_rcg_set_rate_mnd(priv->base, 0x1090, 1, 0, 0, 0, 8);
+		/*
+		 * MDP core clock.  Was TCXO/1 = 19.2 MHz (src=0, div=1) which is
+		 * far too slow to sustain a 1080p60 SSPP fetch: the DPU pipe
+		 * underruns and the INTF emits its underflow colour (black) on
+		 * every active line while still frame-locking off the DP pixel
+		 * clock (FB has the bars, all config correct, yet black).
+		 * Source GPLL0 (mux value 4 on disp_cc_parent_map_4, Linux
+		 * dispcc-sc7280.c:113) and divide by 2 (raw CFG_SRC_DIV code 3 =
+		 * 2*2-1) -> 600/2 = 300 MHz, matching Linux
+		 * ftbl_disp_cc_mdss_mdp_clk_src F(300000000, GPLL0, 2, 0, 0).
+		 * NOTE: clk_rcg_set_rate_mnd writes div RAW (no 2*div-1) and ORs
+		 * source straight into CFG_SRC_SEL[10:8], so source must be
+		 * pre-shifted (4 << 8); a bare 4 masks to 0 = TCXO.
+		 */
+		clk_rcg_set_rate_mnd(priv->base, 0x1090, 3, 0, 0, 4 << 8, 8);
+		/* Confirm the rate took (prompt can't read dispcc when idle). */
+		printf("dispcc MDP_CLK: CMD=%08x CFG=%08x (want CFG src[10:8]=4 div[4:0]=3)\n",
+		       readl(priv->base + 0x1090), readl(priv->base + 0x1094));
 		break;
 	case DISP_CC_MDSS_PCLK0_CLK:
 		clk_rcg_set_rate_mnd(priv->base, 0x1078, 1, 0, 0, 1 << 8, 8);

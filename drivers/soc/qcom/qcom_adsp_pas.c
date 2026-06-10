@@ -1108,6 +1108,75 @@ static int qcom_scm_call(const struct qcom_scm_desc *desc,
 	return res.a0 ? qcom_scm_remap_error(res.a0) : 0;
 }
 
+/*
+ * FAST/atomic SMC variant.  Some SIP services (notably SVC_IO, 0x05) are
+ * registered in QTEE as FAST calls and are rejected if issued as a STD
+ * (yielding) call.  Linux issues SVC_IO via qcom_scm_call_atomic ->
+ * ARM_SMCCC_FAST_CALL; mirror that here.  No EBUSY/INTERRUPTED retry loop:
+ * fast calls do not yield.
+ */
+static int qcom_scm_call_atomic(const struct qcom_scm_desc *desc,
+				struct qcom_scm_res *out)
+{
+	struct arm_smccc_quirk quirk = { .id = ARM_SMCCC_QUIRK_QCOM_A6 };
+	struct arm_smccc_res res;
+	unsigned long a0;
+
+	a0 = ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_64,
+				ARM_SMCCC_OWNER_SIP,
+				SCM_SMC_FNID(desc->svc, desc->cmd));
+	quirk.state.a6 = 0;
+
+	arm_smccc_smc_quirk(a0, desc->arginfo, desc->args[0], desc->args[1],
+			    desc->args[2], desc->args[3], quirk.state.a6, 0,
+			    &res, &quirk);
+
+	if (out) {
+		out->result[0] = res.a1;
+		out->result[1] = res.a2;
+		out->result[2] = res.a3;
+	}
+
+	return res.a0 ? qcom_scm_remap_error(res.a0) : 0;
+}
+
+/*
+ * Secure-monitor MMIO read/write (QCOM_SCM_SVC_IO=0x05, IO_READ=1/IO_WRITE=2).
+ * Used to reach XPU/secure-owned registers the non-secure AP context cannot
+ * touch directly (e.g. the MMNOC MMU-TBU GDSC bank at gcc 0x7d0xx, whose bare
+ * EL2-NS writes are silently NACKed).  The kernel uses the same SIP for the
+ * TBU power-status register.  Takes a PHYSICAL address.
+ */
+int qcom_scm_io_readl(phys_addr_t addr, u32 *val)
+{
+	struct qcom_scm_desc desc = {
+		.svc = 0x05,
+		.cmd = 0x01,
+		.arginfo = QCOM_SCM_ARGS(1),
+		.args[0] = addr,
+	};
+	struct qcom_scm_res res;
+	int ret = qcom_scm_call_atomic(&desc, &res);
+
+	if (!ret && val)
+		*val = (u32)res.result[0];
+
+	return ret;
+}
+
+int qcom_scm_io_writel(phys_addr_t addr, u32 val)
+{
+	struct qcom_scm_desc desc = {
+		.svc = 0x05,
+		.cmd = 0x02,
+		.arginfo = QCOM_SCM_ARGS(2),
+		.args[0] = addr,
+		.args[1] = val,
+	};
+
+	return qcom_scm_call_atomic(&desc, NULL);
+}
+
 static size_t qpas_metadata_aligned;
 
 struct qpas_metadata_ctx {
