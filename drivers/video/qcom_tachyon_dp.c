@@ -24,6 +24,9 @@
 #include <dm/uclass-internal.h>
 #include <cpu_func.h>
 #include <edid.h>
+#if CONFIG_IS_ENABLED(EFI_LOADER)
+#include <efi_loader.h>
+#endif
 #include <env.h>
 #include <fdtdec.h>
 #include <generic-phy.h>
@@ -8355,6 +8358,44 @@ int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
 			if (!cur || !strstr(cur, "vidconsole"))
 				env_set("stdout", "serial,vidconsole");
 		}
+#if CONFIG_IS_ENABLED(EFI_LOADER)
+		/*
+		 * Expose the live DP framebuffer to EFI applications (the boot
+		 * manager and the booting OS's EFI stub) via the Graphics Output
+		 * Protocol, so the dock keeps displaying across the
+		 * U-Boot -> EFI -> OS handoff.
+		 *
+		 * The GOP is installed by efi_gop_register() against the first
+		 * *active* UCLASS_VIDEO device; efi_init_obj_list() runs that
+		 * exactly once, lazily, on first EFI use.  Drive it here now that
+		 * our manual-probe DP device is active, so the GOP reliably
+		 * captures our framebuffer regardless of whether EFI is reached
+		 * before or after "tachyon dp start":
+		 *   - EFI not up yet -> efi_init_obj_list() brings it up and
+		 *     registers the GOP against our active device;
+		 *   - EFI already up -> its one-shot GOP scan ran before DP came
+		 *     up, so install a GOP for our framebuffer explicitly.
+		 * One-shot guarded so a repeated "tachyon dp start" cannot add a
+		 * duplicate GOP handle.
+		 */
+		if (!ret && dev) {
+			static bool gop_done;
+
+			if (!gop_done) {
+				efi_status_t es;
+
+				if (efi_obj_list_initialized == EFI_SUCCESS)
+					es = efi_gop_register();
+				else
+					es = efi_init_obj_list();
+				if (es == EFI_SUCCESS)
+					gop_done = true;
+				printf("tachyon dp: EFI GOP %s (ret=%lx)\n",
+				       gop_done ? "registered" : "deferred",
+				       es & ~EFI_ERROR_MASK);
+			}
+		}
+#endif
 		tachyon_dp_print_device_status(dev);
 		tachyon_dp_print_pmic_state();
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
