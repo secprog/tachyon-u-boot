@@ -7016,29 +7016,18 @@ static int tachyon_dp_remove(struct udevice *dev)
 	struct tachyon_dp_priv *priv = dev_get_priv(dev);
 
 	/*
-	 * Seamless handoff (DEFAULT): leave the DPU, DP controller and QMP PHY
-	 * running, still scanning the U-Boot framebuffer (0xfe000000 = the EFI
-	 * GOP fb_base), instead of tearing DP down at OS handoff.  The OS's
-	 * earlycon=efifb renders onto that same live buffer, so the EARLY kernel
-	 * log is visible on the dock through boot, until the native display
-	 * driver (msm_dpu) takes over.  Without this the dock is dark until
-	 * msm_dpu probes (~23s) and only the late log (console=tty0) shows.
-	 *
-	 * Cost: the dispcc DP branch clocks stay enabled, so Linux's
-	 * clk_disable_unused() WARNs "disp_cc_mdss_dp_*_clk stuck at 'on'".  That
-	 * is harmless (everything works) and is silenced by marking those branch
-	 * clocks CLK_IGNORE_UNUSED in the kernel's dispcc-sc7280.c.
-	 *
-	 * Set env "tachyon_dp_clean_handoff" to instead fully tear DP down for a
-	 * cold, quiesced handoff (no early dock log) -- a fallback if msm_dpu
-	 * cannot cleanly take over a live link.
+	 * Clean teardown at OS handoff.  A "seamless" handoff that leaves the DP
+	 * link live for the OS was tried and DISPROVEN on HW: Linux's msm_dpu
+	 * then fails its modeset ("Cannot find any crtc or sizes", DP-1 stays
+	 * disabled) and the dock is black for the whole boot.  And an early dock
+	 * log via earlycon=efifb is not possible here anyway -- booting through
+	 * GRUB loses the GOP linear-fb base, so the kernel registers efifb0 with
+	 * lfb_base=0 ("efifb0 at I/O port 0x0").  So tear DP down cleanly and let
+	 * msm_dpu bring DP-1 up itself; the kernel log then shows on the dock
+	 * (via console=tty0 / fbcon) once msm_dpu sets the mode.
 	 */
-	if (tachyon_dp_env_bool("tachyon_dp_clean_handoff")) {
-		tachyon_dp_quiesce(priv);
-		return 0;
-	}
+	tachyon_dp_quiesce(priv);
 
-	log_warning("DP seamless handoff: leaving DP live for OS earlycon=efifb\n");
 	return 0;
 }
 
