@@ -466,6 +466,14 @@ static void dwc3_phy_setup(struct dwc3 *dwc)
 	reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
 
 	/*
+	 * Make sure UX_EXIT_PX is cleared as it causes issues with some PHYs
+	 * (matches Linux dwc3_ss_phy_setup). Leaving it set makes the SS PHY
+	 * mishandle U1/U2/U3 exit, so a detected SuperSpeed device fails the
+	 * Address Device command (event-33 timeout).
+	 */
+	reg &= ~DWC3_GUSB3PIPECTL_UX_EXIT_PX;
+
+	/*
 	 * Above 1.94a, it is recommended to set DWC3_GUSB3PIPECTL_SUSPHY
 	 * to '0' during coreConsultant configuration. So default value
 	 * will be '0' when the core is reset. Application needs to set it
@@ -1108,6 +1116,21 @@ void dwc3_of_parse(struct dwc3 *dwc)
 				"snps,dis_u3_susphy_quirk");
 	dwc->dis_u2_susphy_quirk = dev_read_bool(dev,
 				"snps,dis_u2_susphy_quirk");
+	dwc->parkmode_disable_ss_quirk = dev_read_bool(dev,
+				"snps,parkmode-disable-ss-quirk");
+	/*
+	 * On Qualcomm the qcom,dwc3 glue binds the host to a "ports" subnode,
+	 * so dwc->dev points at that leaf while the snps,* quirks live on the
+	 * parent controller node (e.g. the flattened usb_1). Fall back to the
+	 * parent so the quirk is actually picked up.
+	 */
+	if (!dwc->parkmode_disable_ss_quirk) {
+		struct udevice *parent = dev_get_parent(dev);
+
+		if (parent)
+			dwc->parkmode_disable_ss_quirk = dev_read_bool(parent,
+					"snps,parkmode-disable-ss-quirk");
+	}
 	dwc->dis_del_phy_power_chg_quirk = dev_read_bool(dev,
 				"snps,dis-del-phy-power-chg-quirk");
 	dwc->dis_tx_ipgap_linecheck_quirk = dev_read_bool(dev,
@@ -1187,6 +1210,26 @@ int dwc3_init(struct dwc3 *dwc)
 		if (dwc->dis_tx_ipgap_linecheck_quirk)
 			reg |= DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
 
+		dwc3_writel(dwc->regs, DWC3_GUCTL1, reg);
+	}
+
+	/*
+	 * Qualcomm SC7xxx/SM8xxx DWC3 in host mode must disable SuperSpeed
+	 * "park mode" (snps,parkmode-disable-ss-quirk): with park mode enabled
+	 * the SS scheduler stalls the first control transfers on a
+	 * freshly-addressed SS device, so the xHCI Address Device command never
+	 * posts a completion event.
+	 *
+	 * NOTE: this is applied OUTSIDE the "revision >= 250A" block above
+	 * because that block stores the raw GSNPSID in dwc->revision and the
+	 * DWC3_REVISION_* constants are all 0x5533xxxx (DWC_usb3). On a
+	 * DWC_usb31 core (GSNPSID 0x3331xxxx, e.g. SC7280) the comparison is
+	 * always false, so the whole block - and the park-mode quirk - would be
+	 * skipped. GUCTL1 exists on usb31 too.
+	 */
+	if (dwc->parkmode_disable_ss_quirk) {
+		reg = dwc3_readl(dwc->regs, DWC3_GUCTL1);
+		reg |= DWC3_GUCTL1_PARKMODE_DISABLE_SS;
 		dwc3_writel(dwc->regs, DWC3_GUCTL1, reg);
 	}
 

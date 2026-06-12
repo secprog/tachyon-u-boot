@@ -431,7 +431,7 @@ static int lmb_map_update_notify(phys_addr_t addr, phys_size_t size,
 {
 	if (CONFIG_IS_ENABLED(EFI_LOADER) &&
 	    !lmb.test && !(flags & LMB_NONOTIFY))
-		return efi_map_update_notify(addr, size, op);
+		return efi_map_update_notify(addr, size, op, flags);
 
 	return 0;
 }

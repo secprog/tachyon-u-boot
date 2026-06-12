@@ -493,8 +493,18 @@ __maybe_unused static unsigned int dp_size(struct udevice *dev)
 #endif
 #ifdef CONFIG_USB
 		case UCLASS_MASS_STORAGE:
-			return dp_size(dev->parent)
-				+ sizeof(struct efi_device_path_controller);
+			/*
+			 * Standard USB mass-storage device paths are
+			 * USB(port,iface)/HD(part) with NO Hardware/Controller
+			 * node. U-Boot historically inserted a Ctrl(lun) node
+			 * here, but spec-conformant EFI apps (e.g. the Rufus
+			 * UEFI:NTFS loader, whose GetParentDevice strips exactly
+			 * one node and CompareDevicePaths does a strict
+			 * node-by-node byte walk) assume the standard topology
+			 * and fail to match the extra node. Emit none. Must stay
+			 * in lockstep with dp_fill().
+			 */
+			return dp_size(dev->parent);
 #endif
 		default:
 			/* UCLASS_BLKMAP, UCLASS_HOST, UCLASS_VIRTIO */
@@ -625,16 +635,14 @@ __maybe_unused static void *dp_fill(void *buf, struct udevice *dev)
 			}
 #endif
 #if defined(CONFIG_USB)
-		case UCLASS_MASS_STORAGE: {
-			struct blk_desc *desc = dev_get_uclass_plat(dev);
-			struct efi_device_path_controller *dp = buf;
-
-			dp->dp.type	= DEVICE_PATH_TYPE_HARDWARE_DEVICE;
-			dp->dp.sub_type = DEVICE_PATH_SUB_TYPE_CONTROLLER;
-			dp->dp.length	= sizeof(*dp);
-			dp->controller_number = desc->lun;
-			return &dp[1];
-		}
+		case UCLASS_MASS_STORAGE:
+			/*
+			 * No Hardware/Controller node for USB mass storage: the
+			 * standard path is USB(port,iface)/HD(part). The parent
+			 * UCLASS_MASS_STORAGE case already emitted the USB node.
+			 * Keep in lockstep with dp_size().
+			 */
+			return buf;
 #endif
 		default: {
 			/* UCLASS_BLKMAP, UCLASS_HOST, UCLASS_VIRTIO */

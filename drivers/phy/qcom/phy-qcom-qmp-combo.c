@@ -339,6 +339,23 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, unsigned long phy_id)
 	u32 val;
 	int ret, i;
 
+	/*
+	 * The combo-PHY common block, resets, regulators, clocks and the
+	 * TYPEC/PHY_MODE state are SHARED with DisplayPort. If DP already
+	 * brought the COM online (the Tachyon DP driver runs first), do NOT
+	 * re-assert the shared resets or rewrite POWER_DOWN/TYPEC/PHY_MODE —
+	 * that would knock the live DP link over. Only release the
+	 * USB3-specific reset and power the USB3 PCS so the SS lane can come up
+	 * alongside DP. This keeps DP working when 'usb start' follows
+	 * 'tachyon dp start'.
+	 */
+	if (qmp->com_initialized) {
+		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+			     SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+		qphy_setbits(pcs, QPHY_V4_PCS_POWER_DOWN_CONTROL, SW_PWRDN);
+		return 0;
+	}
+
 	ret = reset_assert_bulk(&qmp->resets);
 	if (ret) {
 		printf("Failed to assert resets: %d\n", ret);

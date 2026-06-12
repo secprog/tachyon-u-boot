@@ -1,0 +1,6 @@
+# Generated from dsdt.asl by the build (cpp -> iasl -> hex C array).
+# These are build artifacts and must not be committed.
+/dsdt_generated.c
+/dsdt_generated.aml
+/dsdt_generated.asl.tmp
+/dsdt_generated.hex

@@ -536,11 +536,14 @@ efi_status_t efi_install_fdt(void *fdt)
 	efi_status_t ret;
 
 	/*
-	 * The EBBR spec requires that we have either an FDT or an ACPI table
-	 * but not both.
+	 * The EBBR spec prefers a platform to expose either an FDT or an ACPI
+	 * table, not both. The Tachyon, however, is a DUAL-BOOT board: Windows
+	 * consumes the ACPI tables while Linux consumes the device tree. We
+	 * therefore intentionally install BOTH configuration tables (see below)
+	 * and let the OS pick the one it understands - Windows ignores the FDT
+	 * GUID, and arm64 Linux prefers DT whenever a real device tree is
+	 * present. Do NOT drop the DT here.
 	 */
-	if (CONFIG_IS_ENABLED(GENERATE_ACPI_TABLE) && fdt)
-		log_warning("Can't have ACPI table and device tree - ignoring DT.\n");
 
 	if (fdt == EFI_FDT_USE_INTERNAL) {
 		const char *fdt_opt;
@@ -573,11 +576,12 @@ efi_status_t efi_install_fdt(void *fdt)
 		return EFI_LOAD_ERROR;
 	}
 
-	if (CONFIG_IS_ENABLED(GENERATE_ACPI_TABLE)) {
-		/* Create memory reservations as indicated by the device tree */
-		efi_carve_out_dt_rsv(fdt);
-		return EFI_SUCCESS;
-	}
+	/*
+	 * Dual-boot: install the device tree even when ACPI tables are also
+	 * generated (the upstream early-return here left Linux with no DT ->
+	 * "EFI stub: Generating empty DTB"). Windows still finds and uses the
+	 * separately-installed ACPI tables and ignores the FDT.
+	 */
 
 	/* Prepare device tree for payload */
 	ret = copy_fdt(&fdt);

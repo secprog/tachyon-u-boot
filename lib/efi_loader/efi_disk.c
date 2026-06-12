@@ -8,6 +8,8 @@
 #define LOG_CATEGORY LOGC_EFI
 
 #include <blk.h>
+#include <cpu_func.h>
+#include <asm/cache.h>
 #include <dm.h>
 #include <dm/device-internal.h>
 #include <dm/tag.h>
@@ -24,13 +26,15 @@ struct efi_system_partition efi_system_partition = {
 };
 
 const efi_guid_t efi_block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
+const efi_guid_t efi_disk_io_guid = EFI_DISK_IO_PROTOCOL_GUID;
 const efi_guid_t efi_system_partition_guid = PARTITION_SYSTEM_GUID;
 
 /**
  * struct efi_disk_obj - EFI disk object
  *
  * @header:	EFI object header
- * @ops:	EFI disk I/O protocol interface
+ * @ops:	EFI block I/O protocol interface
+ * @disk_io:	EFI disk I/O protocol interface (byte-granular access)
  * @media:	block I/O media information
  * @dp:		device path to the block device
  * @volume:	simple file system protocol of the partition
@@ -38,6 +42,7 @@ const efi_guid_t efi_system_partition_guid = PARTITION_SYSTEM_GUID;
 struct efi_disk_obj {
 	struct efi_object header;
 	struct efi_block_io ops;
+	struct efi_disk disk_io;
 	struct efi_block_io_media media;
 	struct efi_device_path *dp;
 	struct efi_simple_file_system_protocol *volume;
@@ -103,14 +108,14 @@ static efi_status_t efi_disk_rw_blocks(struct efi_block_io *this,
 {
 	struct efi_disk_obj *diskobj;
 	int blksz;
-	int blocks;
+	lbaint_t blocks;
 	unsigned long n;
 
 	diskobj = container_of(this, struct efi_disk_obj, ops);
 	blksz = diskobj->media.block_size;
 	blocks = buffer_size / blksz;
 
-	EFI_PRINT("blocks=%x lba=%llx blksz=%x dir=%d\n",
+	EFI_PRINT("blocks=" LBAF " lba=%llx blksz=%x dir=%d\n",
 		  blocks, lba, blksz, direction);
 
 	/* We only support full block access */
@@ -307,6 +312,242 @@ static const struct efi_block_io block_io_disk_template = {
 	.flush_blocks = &efi_disk_flush_blocks,
 };
 
+/*
+ * Size of the cache-aligned bounce buffer used by the DISK_IO general path.
+ * A multiple of both the largest block size and ARCH_DMA_MINALIGN; large
+ * enough to keep a multi-hundred-MB read (the Windows installer's boot.wim)
+ * to a reasonable transaction count.
+ */
+#define EFI_DISK_DIO_BOUNCE_SIZE	(64 * 1024)
+
+/**
+ * efi_disk_io_read_disk() - read bytes from a block device at a byte offset
+ *
+ * This function implements the ReadDisk service of the EFI_DISK_IO_PROTOCOL.
+ * Unlike BlockIo, DiskIo permits unaligned byte offsets, non-block-multiple
+ * sizes and unaligned destination buffers; that is layered here on top of the
+ * block I/O worker (efi_disk_rw_blocks). A fully aligned request is DMA'd
+ * straight through; anything else is bounced through a cache-aligned buffer,
+ * because DMA-ing into an unaligned destination lets the bulk-IN dcache
+ * invalidate corrupt the head/tail cache line it shares with adjacent data.
+ * Some EFI applications (e.g. the Rufus UEFI:NTFS loader) enumerate disks via
+ * the DISK_IO protocol, so U-Boot must expose it on every block/partition
+ * handle or LocateHandleBuffer(DiskIo) returns EFI_NOT_FOUND.
+ *
+ * Note: this calls the internal efi_disk_rw_blocks() worker directly rather
+ * than the EFI_ENTRY-wrapped efi_disk_read_blocks(), because nesting EFI_ENTRY
+ * inside an EFI callback corrupts the saved application gd.
+ *
+ * @this:	pointer to the DISK_IO protocol
+ * @media_id:	id of the medium to be read from
+ * @offset:	starting byte offset
+ * @buffer_size: number of bytes to read
+ * @buffer:	destination buffer
+ * Return:	status code
+ */
+static efi_status_t EFIAPI efi_disk_io_read_disk(struct efi_disk *this,
+				u32 media_id, u64 offset,
+				efi_uintn_t buffer_size, void *buffer)
+{
+	struct efi_disk_obj *diskobj;
+	struct efi_block_io *blkio;
+	efi_status_t r = EFI_SUCCESS;
+	u8 *bounce = NULL;
+	u8 *dst = buffer;
+	u32 blksz;
+	u32 head;
+	u64 lba;
+
+	EFI_ENTRY("%p, %x, %llx, %zx, %p", this, media_id, offset,
+		  buffer_size, buffer);
+
+	diskobj = container_of(this, struct efi_disk_obj, disk_io);
+	blkio = &diskobj->ops;
+	blksz = diskobj->media.block_size;
+
+	if (!blksz) {
+		r = EFI_DEVICE_ERROR;
+		goto out;
+	}
+	if (media_id != diskobj->media.media_id) {
+		r = EFI_MEDIA_CHANGED;
+		goto out;
+	}
+	if (offset + buffer_size >
+	    ((u64)diskobj->media.last_block + 1) * blksz) {
+		r = EFI_INVALID_PARAMETER;
+		goto out;
+	}
+
+	/*
+	 * Fast path: a fully block-aligned request into a DMA-aligned buffer
+	 * can be DMA'd straight through with no copy.
+	 */
+	if (!(offset % blksz) && !(buffer_size % blksz) &&
+	    !((uintptr_t)buffer & (ARCH_DMA_MINALIGN - 1))) {
+		r = efi_disk_rw_blocks(blkio, media_id, offset / blksz,
+				       buffer_size, buffer, EFI_DISK_READ);
+		goto out;
+	}
+
+	/*
+	 * General path: DiskIo permits unaligned byte offsets, non-block
+	 * sizes and unaligned destination buffers. DMA-ing directly into such
+	 * a destination corrupts data: the bulk-IN dcache-invalidate rounds
+	 * out to ARCH_DMA_MINALIGN lines and drops the head/tail line shared
+	 * with adjacent CPU data. Bounce every transfer through a
+	 * cache-aligned buffer and memcpy into the caller. Chunked so a huge
+	 * read (e.g. the Windows installer's boot.wim) stays bounded.
+	 */
+	bounce = memalign(ARCH_DMA_MINALIGN, EFI_DISK_DIO_BOUNCE_SIZE);
+	if (!bounce) {
+		r = EFI_OUT_OF_RESOURCES;
+		goto out;
+	}
+
+	lba = offset / blksz;
+	head = offset % blksz;
+
+	while (buffer_size) {
+		u64 want_blocks = ((u64)head + buffer_size + blksz - 1) / blksz;
+		u32 chunk_blocks = EFI_DISK_DIO_BOUNCE_SIZE / blksz;
+		efi_uintn_t span, avail, n;
+
+		if (want_blocks < chunk_blocks)
+			chunk_blocks = (u32)want_blocks;
+		span = (efi_uintn_t)chunk_blocks * blksz;
+
+		r = efi_disk_rw_blocks(blkio, media_id, lba, span, bounce,
+				       EFI_DISK_READ);
+		if (r != EFI_SUCCESS)
+			goto out;
+
+		avail = span - head;
+		n = buffer_size < avail ? buffer_size : avail;
+		memcpy(dst, bounce + head, n);
+		dst += n;
+		buffer_size -= n;
+		lba += chunk_blocks;
+		head = 0;
+	}
+out:
+	free(bounce);
+	return EFI_EXIT(r);
+}
+
+/**
+ * efi_disk_io_write_disk() - write bytes to a block device at a byte offset
+ *
+ * This function implements the WriteDisk service of the EFI_DISK_IO_PROTOCOL.
+ * Partial blocks are handled read-modify-write; aligned runs go straight
+ * through. See efi_disk_io_read_disk() for why the internal worker is used.
+ *
+ * @this:	pointer to the DISK_IO protocol
+ * @media_id:	id of the medium to be written to
+ * @offset:	starting byte offset
+ * @buffer_size: number of bytes to write
+ * @buffer:	source buffer
+ * Return:	status code
+ */
+static efi_status_t EFIAPI efi_disk_io_write_disk(struct efi_disk *this,
+				u32 media_id, u64 offset,
+				efi_uintn_t buffer_size, void *buffer)
+{
+	struct efi_disk_obj *diskobj;
+	struct efi_block_io *blkio;
+	efi_status_t r = EFI_SUCCESS;
+	u8 *bounce = NULL;
+	u8 *src = buffer;
+	u32 blksz;
+	u32 head;
+	u64 lba;
+
+	EFI_ENTRY("%p, %x, %llx, %zx, %p", this, media_id, offset,
+		  buffer_size, buffer);
+
+	diskobj = container_of(this, struct efi_disk_obj, disk_io);
+	blkio = &diskobj->ops;
+	blksz = diskobj->media.block_size;
+
+	if (!blksz) {
+		r = EFI_DEVICE_ERROR;
+		goto out;
+	}
+	if (diskobj->media.read_only) {
+		r = EFI_WRITE_PROTECTED;
+		goto out;
+	}
+	if (media_id != diskobj->media.media_id) {
+		r = EFI_MEDIA_CHANGED;
+		goto out;
+	}
+	if (offset + buffer_size >
+	    ((u64)diskobj->media.last_block + 1) * blksz) {
+		r = EFI_INVALID_PARAMETER;
+		goto out;
+	}
+
+	/* Fast path: aligned request from a DMA-aligned buffer, no copy. */
+	if (!(offset % blksz) && !(buffer_size % blksz) &&
+	    !((uintptr_t)buffer & (ARCH_DMA_MINALIGN - 1))) {
+		r = efi_disk_rw_blocks(blkio, media_id, offset / blksz,
+				       buffer_size, buffer, EFI_DISK_WRITE);
+		goto out;
+	}
+
+	/* General path: bounce through a cache-aligned buffer (see read). */
+	bounce = memalign(ARCH_DMA_MINALIGN, EFI_DISK_DIO_BOUNCE_SIZE);
+	if (!bounce) {
+		r = EFI_OUT_OF_RESOURCES;
+		goto out;
+	}
+
+	lba = offset / blksz;
+	head = offset % blksz;
+
+	while (buffer_size) {
+		u64 want_blocks = ((u64)head + buffer_size + blksz - 1) / blksz;
+		u32 chunk_blocks = EFI_DISK_DIO_BOUNCE_SIZE / blksz;
+		efi_uintn_t span, avail, n;
+
+		if (want_blocks < chunk_blocks)
+			chunk_blocks = (u32)want_blocks;
+		span = (efi_uintn_t)chunk_blocks * blksz;
+
+		avail = span - head;
+		n = buffer_size < avail ? buffer_size : avail;
+
+		/*
+		 * Read-modify-write when this chunk starts or ends mid-block;
+		 * a fully block-aligned span can be written without the read.
+		 */
+		if (head || (n % blksz)) {
+			r = efi_disk_rw_blocks(blkio, media_id, lba, span,
+					       bounce, EFI_DISK_READ);
+			if (r != EFI_SUCCESS)
+				goto out;
+		}
+		memcpy(bounce + head, src, n);
+		r = efi_disk_rw_blocks(blkio, media_id, lba, span, bounce,
+				       EFI_DISK_WRITE);
+		if (r != EFI_SUCCESS)
+			goto out;
+		src += n;
+		buffer_size -= n;
+		lba += chunk_blocks;
+		head = 0;
+	}
+out:
+	free(bounce);
+	return EFI_EXIT(r);
+}
+
+static const struct efi_disk disk_io_template = {
+	.revision = 0x00010000, /* EFI_DISK_IO_PROTOCOL_REVISION */
+	.read_disk = &efi_disk_io_read_disk,
+	.write_disk = &efi_disk_io_write_disk,
+};
+
 /**
  * efi_fs_from_path() - retrieve simple file system protocol
  *
@@ -475,6 +716,7 @@ static efi_status_t efi_disk_add_dev(
 					&handle,
 					&efi_guid_device_path, diskobj->dp,
 					&efi_block_io_guid, &diskobj->ops,
+					&efi_disk_io_guid, &diskobj->disk_io,
 					/*
 					 * esp_guid must be last entry as it
 					 * can be NULL. Its interface is NULL.
@@ -504,6 +746,7 @@ static efi_status_t efi_disk_add_dev(
 			goto error;
 	}
 	diskobj->ops = block_io_disk_template;
+	diskobj->disk_io = disk_io_template;
 
 	/* Fill in EFI IO Media info (for read/write callbacks) */
 	diskobj->media.removable_media = desc->removable;
@@ -514,7 +757,16 @@ static efi_status_t efi_disk_add_dev(
 	 */
 	diskobj->media.media_id = 1;
 	diskobj->media.block_size = desc->blksz;
-	diskobj->media.io_align = desc->blksz;
+	/*
+	 * io_align is the required BUFFER alignment, not the block size. Using
+	 * the block size (e.g. 512) wrongly rejects buffers from AllocatePool,
+	 * which only guarantees ARCH_DMA_MINALIGN alignment - this silently
+	 * breaks spec-conformant EFI apps (e.g. the Rufus UEFI:NTFS loader,
+	 * which AllocatePool()s BlockSize bytes and reads block 0 to detect
+	 * the filesystem). Use the DMA alignment, which AllocatePool satisfies
+	 * and which keeps the underlying block DMA cache-coherent.
+	 */
+	diskobj->media.io_align = ARCH_DMA_MINALIGN;
 	if (part)
 		diskobj->media.logical_partition = 1;
 	diskobj->ops.media = &diskobj->media;

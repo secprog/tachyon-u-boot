@@ -23,6 +23,8 @@
 #define PCIE_1_AUX_CLK_CMD_RCGR 0x8d058
 #define PCIE1_PHY_RCHNG_CMD_RCGR 0x8d03c
 #define PCIE_1_PIPE_CLK_PHY_MUX 0x8d054
+/* GCC_USB3_PRIM_PHY_PIPE_CLK source mux (branch gate is at 0xf05c) */
+#define USB3_PRIM_PIPE_CLK_PHY_MUX 0xf060
 
 static const struct freq_tbl ftbl_gcc_usb30_prim_master_clk_src[] = {
 	F(66666667, CFG_CLK_SRC_GPLL0_EVEN, 4.5, 0, 0),
@@ -202,6 +204,18 @@ static int sc7280_enable(struct clk *clk)
 		break;
 	case GCC_PCIE_1_PIPE_CLK:
 		clk_phy_mux_enable(priv->base, PCIE_1_PIPE_CLK_PHY_MUX, true);
+		break;
+	case GCC_USB3_PRIM_PHY_PIPE_CLK:
+		/*
+		 * Re-parent the USB3 primary PHY pipe clock from the XO/ref
+		 * source to the QMP combo PHY's locked pipe output. Without
+		 * this the DWC3 SuperSpeed PIPE interface gets no valid clock
+		 * (PHYSTATUS never asserts -> 'Host not halted' / no SS link),
+		 * so a USB3 device on the USB-C dock never enumerates. Mirrors
+		 * the GCC_PCIE_1_PIPE_CLK handling above. The branch gate
+		 * (0xf05c) is still enabled by qcom_gate_clk_en() below.
+		 */
+		clk_phy_mux_enable(priv->base, USB3_PRIM_PIPE_CLK_PHY_MUX, true);
 		break;
 	case GCC_PCIE_1_AUX_CLK:
 		clk_rcg_set_rate_mnd(priv->base, PCIE_1_AUX_CLK_CMD_RCGR, 1, 0, 0,

@@ -680,6 +680,18 @@ static int xhci_address_device(struct usb_device *udev, int root_portnr)
 	ctrl_ctx->add_flags = cpu_to_le32(SLOT_FLAG | EP0_FLAG);
 	ctrl_ctx->drop_flags = 0;
 
+	/*
+	 * The input control context (add_flags) is written here, AFTER
+	 * xhci_setup_addressable_virt_dev() already flushed the slot/EP0
+	 * contexts. With 64-byte contexts the control context is its own
+	 * cache line, so flush the whole input context before the controller
+	 * DMA-reads it - otherwise it sees stale add_flags=0 (no contexts to
+	 * evaluate) and Address Device never completes. Mirrors the flush in
+	 * xhci_set_configuration().
+	 */
+	xhci_flush_cache((uintptr_t)virt_dev->in_ctx->bytes,
+			 virt_dev->in_ctx->size);
+
 	xhci_queue_command(ctrl, virt_dev->in_ctx->dma,
 			   slot_id, 0, TRB_ADDR_DEV);
 	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);

@@ -436,6 +436,37 @@ static int do_efi_show_drivers(struct cmd_tbl *cmdtp, int flag,
 }
 
 /**
+ * do_efi_connect() - connect EFI drivers to all controllers
+ *
+ * Walks every UEFI handle and calls ConnectController on it, binding any
+ * matching driver. This is needed to bind an externally-loaded EFI driver
+ * (e.g. the Rufus NTFS/exFAT filesystem driver loaded via "bootefi") to the
+ * block/partition handles so its Simple File System becomes usable - U-Boot
+ * does not auto-connect drivers that register after the handles exist.
+ */
+static int do_efi_connect(struct cmd_tbl *cmdtp, int flag,
+			  int argc, char *const argv[])
+{
+	efi_handle_t *handles;
+	efi_uintn_t num, i;
+	efi_status_t ret;
+
+	ret = EFI_CALL(efi_locate_handle_buffer(ALL_HANDLES, NULL, NULL,
+						&num, &handles));
+	if (ret != EFI_SUCCESS)
+		return CMD_RET_FAILURE;
+
+	for (i = 0; i < num; i++)
+		EFI_CALL(BS->connect_controller(handles[i], NULL, NULL, true));
+
+	efi_free_pool(handles);
+	printf("efidebug: ran ConnectController on %lu handle(s)\n",
+	       (unsigned long)num);
+
+	return CMD_RET_SUCCESS;
+}
+
+/**
  * do_efi_show_handles() - show UEFI handles
  *
  * @cmdtp:	Command table
@@ -1580,6 +1611,8 @@ static struct cmd_tbl cmd_efidebug_sub[] = {
 			 "", ""),
 #endif
 	U_BOOT_CMD_MKENT(drivers, CONFIG_SYS_MAXARGS, 1, do_efi_show_drivers,
+			 "", ""),
+	U_BOOT_CMD_MKENT(connect, CONFIG_SYS_MAXARGS, 1, do_efi_connect,
 			 "", ""),
 	U_BOOT_CMD_MKENT(dh, CONFIG_SYS_MAXARGS, 1, do_efi_show_handles,
 			 "", ""),

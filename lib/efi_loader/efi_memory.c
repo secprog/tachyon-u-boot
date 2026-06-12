@@ -899,21 +899,34 @@ int efi_memory_init(void)
 }
 
 int efi_map_update_notify(phys_addr_t addr, phys_size_t size,
-			  enum lmb_map_op op)
+			  enum lmb_map_op op, u32 flags)
 {
 	u64 efi_addr;
 	u64 pages;
 	efi_status_t status;
+	int type;
 
 	efi_addr = (uintptr_t)map_sysmem(addr, 0);
 	pages = efi_size_in_pages(size + (efi_addr & EFI_PAGE_MASK));
 	efi_addr &= ~EFI_PAGE_MASK;
 
-	status = efi_add_memory_map_pg(efi_addr, pages,
-				       op == LMB_MAP_OP_RESERVE ?
-				       EFI_BOOT_SERVICES_DATA :
-				       EFI_CONVENTIONAL_MEMORY,
-				       false, 0);
+	if (op == LMB_MAP_OP_RESERVE) {
+		/*
+		 * no-map reserved-memory carveouts (secure/XPU-protected
+		 * firmware regions on Qualcomm SoCs) must be RESERVED, not
+		 * BootServicesData: an ACPI-booted OS (Windows) reclaims and
+		 * zeroes BootServicesData after ExitBootServices, and a
+		 * write into a protected carveout hard-resets the SoC.
+		 */
+		if (flags & LMB_NOMAP)
+			type = EFI_RESERVED_MEMORY_TYPE;
+		else
+			type = EFI_BOOT_SERVICES_DATA;
+	} else {
+		type = EFI_CONVENTIONAL_MEMORY;
+	}
+
+	status = efi_add_memory_map_pg(efi_addr, pages, type, false, 0);
 	if (status != EFI_SUCCESS) {
 		log_err("LMB Map notify failure %lu\n",
 			status & ~EFI_ERROR_MASK);

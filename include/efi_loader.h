@@ -1257,13 +1257,21 @@ void efi_add_known_memory(void);
  * @addr:	start of memory area
  * @size:	size of memory area
  * @op:		type of change
+ * @flags:	LMB flags of the region (e.g. LMB_NOMAP). Reservations
+ *		carrying LMB_NOMAP (device-tree reserved-memory carveouts the
+ *		OS must never touch, e.g. secure/XPU-protected firmware
+ *		regions) are entered as EFI_RESERVED_MEMORY_TYPE; plain
+ *		reservations as EFI_BOOT_SERVICES_DATA. An OS booting via
+ *		ACPI (Windows) reclaims and zeroes BootServicesData after
+ *		ExitBootServices, so mistyping a carveout causes an
+ *		instant secure-violation reset.
  * Return:	0 if change could be processed
  */
 #ifdef CONFIG_EFI_LOADER
 int efi_map_update_notify(phys_addr_t addr, phys_size_t size,
-			  enum lmb_map_op op);
+			  enum lmb_map_op op, u32 flags);
 #else
-#define efi_map_update_notify(addr, size, op) (0)
+#define efi_map_update_notify(addr, size, op, flags) (0)
 #endif
 
 /**

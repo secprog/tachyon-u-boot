@@ -15,6 +15,7 @@
 #include <linux/usb/gadget.h>
 #include <power/regulator.h>
 #include <usb/xhci.h>
+#include <generic-phy.h>
 #include "core.h"
 #include "dwc3-generic.h"
 #include "gadget.h"
@@ -125,6 +126,21 @@ static int dwc3_generic_probe(struct udevice *dev,
 		unmap_physmem(priv->base, MAP_NOCACHE);
 		return rc;
 	}
+
+	/*
+	 * dwc3_init()->dwc3_core_init() asserts GUSB3PIPECTL.PHYSOFTRST, which
+	 * resets the SuperSpeed PHY's PIPE interface. On the SC7280 QMP combo
+	 * PHY the SS PHY was already brought up by dwc3_setup_phy() above, so
+	 * this leaves the controller<->PHY PIPE data path de-synced even though
+	 * the link still trains to U0 autonomously - and Address Device never
+	 * completes. Linux brings the PHY up AFTER the core soft reset; mirror
+	 * that by re-initialising the SS PHY here. Re-init ONLY the SS PHY
+	 * (phys[1]); the HS PHY (phys[0]) is owned by the EUD serial debugger,
+	 * so re-initing it could drop the console. The QMP combo COM guard
+	 * keeps DP preserved.
+	 */
+	if (mode == USB_DR_MODE_HOST && priv->phys.count > 1)
+		generic_phy_init(&priv->phys.phys[1]);
 
 	return 0;
 }
@@ -520,8 +536,17 @@ static int dwc3_glue_bind_common(struct udevice *parent, ofnode node)
 	    (dr_mode == USB_DR_MODE_PERIPHERAL || dr_mode == USB_DR_MODE_OTG)) {
 		debug("%s: dr_mode: OTG or Peripheral\n", __func__);
 		driver = "dwc3-generic-peripheral";
-	} else if (CONFIG_IS_ENABLED(USB_HOST) && dr_mode == USB_DR_MODE_HOST) {
-		debug("%s: dr_mode: HOST\n", __func__);
+	} else if (CONFIG_IS_ENABLED(USB_HOST) &&
+		   (dr_mode == USB_DR_MODE_HOST || dr_mode == USB_DR_MODE_OTG)) {
+		/*
+		 * Default OTG to HOST: U-Boot has no peripheral/gadget support
+		 * here (DM_USB_GADGET disabled), so an "otg" controller would
+		 * otherwise be left unbound and fail the whole wrapper bind.
+		 * The Tachyon USB-C/dock port (usb_1) is dr_mode="otg"; this
+		 * lets it bind and act as a host so the dock enumerates.
+		 */
+		debug("%s: dr_mode: HOST (or OTG defaulting to host)\n",
+		      __func__);
 		driver = "dwc3-generic-host";
 	} else {
 		debug("%s: unsupported dr_mode %d\n", __func__, dr_mode);

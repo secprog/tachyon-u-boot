@@ -3568,10 +3568,11 @@ static efi_status_t efi_bind_controller(
 	r = EFI_CALL(binding_protocol->supported(binding_protocol,
 						 controller_handle,
 						 remain_device_path));
-	if (r == EFI_SUCCESS)
+	if (r == EFI_SUCCESS) {
 		r = EFI_CALL(binding_protocol->start(binding_protocol,
 						     controller_handle,
 						     remain_device_path));
+	}
 	efi_close_protocol(driver_image_handle,
 			   &efi_guid_driver_binding_protocol,
 			   driver_image_handle, NULL);

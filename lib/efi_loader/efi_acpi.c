@@ -28,28 +28,41 @@ efi_status_t efi_acpi_register(void)
 	efi_status_t ret;
 
 	/*
-	 * The bloblist is already marked reserved. For now, we don't bother
-	 * marking it with EFI_ACPI_RECLAIM_MEMORY since we would need to cut a
-	 * hole in the EFI_BOOT_SERVICES_CODE region added by
-	 * add_u_boot_and_runtime(). At some point that function could create a
-	 * more detailed map.
+	 * The ACPI tables MUST be mapped as EFI_ACPI_RECLAIM_MEMORY and the RSDP
+	 * MUST be installed as an EFI configuration table: unlike x86, ARM (and
+	 * therefore Windows-on-ARM) has no legacy memory scan to discover the
+	 * RSDP, and leaving the tables in boot-services/conventional memory lets
+	 * the OS reuse those pages after ExitBootServices and crash.
+	 *
+	 * When the tables live in the bloblist (CONFIG_BLOBLIST_TABLES) only the
+	 * table sub-region needs re-marking; the broad gd->arch.table_start area
+	 * used by the non-bloblist path is not populated. We deliberately mark
+	 * just that sub-region rather than skipping the install entirely (the
+	 * previous behaviour, which left ARM EFI payloads with no ACPI at all).
 	 */
-	if (IS_ENABLED(CONFIG_BLOBLIST_TABLES))
-		return EFI_SUCCESS;
-
-	/* Mark space used for tables */
-	start = ALIGN_DOWN(gd->arch.table_start, EFI_PAGE_MASK);
-	end = ALIGN(gd->arch.table_end, EFI_PAGE_MASK);
-	ret = efi_add_memory_map(start, end - start, EFI_ACPI_RECLAIM_MEMORY);
-	if (ret != EFI_SUCCESS)
-		return ret;
-	if (gd->arch.table_start_high) {
+	if (IS_ENABLED(CONFIG_BLOBLIST_TABLES)) {
 		start = ALIGN_DOWN(gd->arch.table_start_high, EFI_PAGE_MASK);
 		end = ALIGN(gd->arch.table_end_high, EFI_PAGE_MASK);
 		ret = efi_add_memory_map(start, end - start,
 					 EFI_ACPI_RECLAIM_MEMORY);
 		if (ret != EFI_SUCCESS)
 			return ret;
+	} else {
+		/* Mark space used for tables */
+		start = ALIGN_DOWN(gd->arch.table_start, EFI_PAGE_MASK);
+		end = ALIGN(gd->arch.table_end, EFI_PAGE_MASK);
+		ret = efi_add_memory_map(start, end - start,
+					 EFI_ACPI_RECLAIM_MEMORY);
+		if (ret != EFI_SUCCESS)
+			return ret;
+		if (gd->arch.table_start_high) {
+			start = ALIGN_DOWN(gd->arch.table_start_high, EFI_PAGE_MASK);
+			end = ALIGN(gd->arch.table_end_high, EFI_PAGE_MASK);
+			ret = efi_add_memory_map(start, end - start,
+						 EFI_ACPI_RECLAIM_MEMORY);
+			if (ret != EFI_SUCCESS)
+				return ret;
+		}
 	}
 
 	addr = gd_acpi_start();
