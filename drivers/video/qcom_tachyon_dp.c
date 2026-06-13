@@ -6785,7 +6785,16 @@ static void tachyon_dp_quiesce(struct tachyon_dp_priv *priv)
  * The err_quiesce path in the bringup code still quiesces on a failed train.
  */
 
-static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv);
+static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv)
+{
+	u8 status;
+
+	if (!priv->phy_dp)
+		return false;
+
+	status = tachyon_dp_qmp_status_low(priv);
+	return !!(status & QMP_DP_PHY_STATUS_PHY_READY);
+}
 
 static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 {
@@ -6925,12 +6934,6 @@ static void tachyon_dp_prepare_aux_for_orientation(
 		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL));
 }
 
-
-
-#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
-static bool tachyon_dp_manual_probe_armed;
-#endif
-
 static int tachyon_dp_probe(struct udevice *dev)
 {
 	struct tachyon_dp_priv *priv = dev_get_priv(dev);
@@ -6940,13 +6943,6 @@ static int tachyon_dp_probe(struct udevice *dev)
 	int ret, altmode_ret;
 	bool has_sbu_mux;
 	bool forced_typec = false;
-
-#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
-	if (!tachyon_dp_manual_probe_armed) {
-		log_debug("DP probe skipped until tachyon dp start\n");
-		return -EAGAIN;
-	}
-#endif
 
 	log_warning("DP probe start\n");
 
@@ -7296,9 +7292,8 @@ static int tachyon_dp_probe(struct udevice *dev)
 	 * Initialise the framebuffer the DPU scans out.  Default to a clean
 	 * black background so the real U-Boot console renders on it: with
 	 * CONFIG_NO_FB_CLEAR=y the video uclass does NOT clear this freshly
-	 * lmb-allocated buffer, after which video_post_probe draws the logo and
-	 * the vidconsole renders the prompt/output (see tachyon_dp_cmd, which
-	 * routes stdout onto the vidconsole once DP is up).  Set the env var
+	 * lmb-allocated buffer, after which video_post_probe draws the logo on
+	 * the dock.  Set the env var
 	 * "tachyon_dp_test_pattern" to instead paint vertical colour bars — a
 	 * fetch-vs-no-fetch diagnostic: if the dock shows bars the DPU is
 	 * genuinely fetching the framebuffer.
@@ -7519,306 +7514,11 @@ static int tachyon_dp_bind(struct udevice *dev)
 
 	plat->align = TACHYON_DP_FB_ALIGN;
 
-#if defined(CONFIG_CMD_TACHYON_DP) && !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
-	/*
-	 * Manual (opt-in) mode: reserve NO framebuffer at boot.  A bound video
-	 * device with a non-zero plat->size makes the video uclass reserve FB
-	 * memory and advertise a framebuffer at OS handoff, which wedges Linux's
-	 * DP/GPU IOMMU bring-up (msm-mdss -EINVAL / adreno get_pages -28) even
-	 * though our probe bails -EAGAIN and never touches HW.  Keeping size 0
-	 * makes a normal boot a clean handoff (Linux DP works); the framebuffer
-	 * is allocated below 4 GB in probe() only when "tachyon dp start" runs.
-	 */
-	plat->size = 0;
-#else
 	plat->size = TACHYON_DP_MAX_XRES * TACHYON_DP_MAX_YRES * 4;
-#endif
 
 	return 0;
 }
 
-#ifdef CONFIG_CMD_TACHYON_DP
-static void tachyon_dp_arm_manual_probe(void)
-{
-#if !defined(CONFIG_VIDEO_QCOM_TACHYON_DP)
-	tachyon_dp_manual_probe_armed = true;
-#endif
-}
-
-static int tachyon_dp_find_device(struct udevice **devp, bool probe)
-{
-	ofnode node;
-	int ret = -ENODEV;
-
-	for (node = ofnode_by_compatible(ofnode_null(), "qcom,sc7280-dp");
-	     ofnode_valid(node);
-	     node = ofnode_by_compatible(node, "qcom,sc7280-dp")) {
-		if (!ofnode_is_enabled(node))
-			continue;
-
-		if (probe)
-			ret = uclass_get_device_by_ofnode(UCLASS_VIDEO, node,
-							  devp);
-		else
-			ret = uclass_find_device_by_ofnode(UCLASS_VIDEO, node,
-							   devp);
-
-		if (ret == -ENODEV && probe) {
-			ret = lists_bind_fdt(dm_root(), node, devp, NULL, false);
-			printf("tachyon dp: node=%s bind ret=%d dev=%s\n",
-			       ofnode_get_name(node), ret,
-			       *devp ? (*devp)->name : "(none)");
-			if (!ret && *devp) {
-				printf("tachyon dp: direct probe dev=%s flags=%lx drv_flags=%lx\n",
-				       (*devp)->name,
-				       (ulong)dev_get_flags(*devp),
-				       (ulong)(*devp)->driver->flags);
-				ret = device_probe(*devp);
-			}
-		}
-
-		printf("tachyon dp: node=%s probe=%u ret=%d dev=%s\n",
-		       ofnode_get_name(node), probe ? 1 : 0, ret,
-		       *devp ? (*devp)->name : "(none)");
-		if (!ret)
-			return 0;
-	}
-
-	*devp = NULL;
-	return ret;
-}
-
-static const char *tachyon_dp_typec_source_name(enum tachyon_dp_typec_source source)
-{
-	switch (source) {
-	case TACHYON_DP_TYPEC_SOURCE_ALTMODE:
-		return "altmode";
-	case TACHYON_DP_TYPEC_SOURCE_NONE:
-	default:
-		return "none";
-	}
-}
-
-static const char *tachyon_dp_hpd_state_name(enum tachyon_dp_hpd_state state)
-{
-	switch (state) {
-	case TACHYON_DP_HPD_CONNECTED:
-		return "connected";
-	case TACHYON_DP_HPD_DISCONNECTED:
-		return "disconnected";
-	default:
-		return "unknown";
-	}
-}
-
-static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv)
-{
-	u8 status;
-
-	if (!priv->phy_dp)
-		return false;
-
-	status = tachyon_dp_qmp_status_low(priv);
-	return !!(status & QMP_DP_PHY_STATUS_PHY_READY);
-}
-
-static void tachyon_dp_print_qmp_status(struct tachyon_dp_priv *priv)
-{
-	if (!priv->qmp_dp_serdes || !priv->phy_dp) {
-		printf("tachyon dp: QMP state unavailable\n");
-		return;
-	}
-
-	printf("tachyon dp: QMP PHY_STATUS=%02x PD_CTL=%02x C_READY=%02x CMN=%02x TYPEC_CTRL=%02x PHY_MODE_CTRL=%02x\n",
-	       tachyon_dp_qmp_status_low(priv),
-	       tachyon_dp_qmp_pd_low(priv),
-	       readl(priv->qmp_dp_serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
-	       readl(priv->qmp_dp_serdes + QMP_V4_COM_CMN_STATUS) & 0xff,
-	       tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
-	       tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL));
-}
-
-static void tachyon_dp_print_aux_status(struct tachyon_dp_priv *priv)
-{
-	if (!priv->aux) {
-		printf("tachyon dp: AUX state unavailable\n");
-		return;
-	}
-
-	printf("tachyon dp: AUX ctrl=%08x status=%08x trans=%08x hpd_int=%08x\n",
-	       readl(priv->aux + REG_DP_AUX_CTRL),
-	       readl(priv->aux + REG_DP_AUX_STATUS),
-	       readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
-	       readl(priv->aux + REG_DP_DP_HPD_INT_STATUS));
-}
-
-static void tachyon_dp_print_device_status(struct udevice *dev)
-{
-	struct video_uc_plat *plat;
-	struct video_priv *uc_priv;
-	struct tachyon_dp_priv *priv;
-
-	if (!dev) {
-		printf("tachyon dp: video device not bound\n");
-		return;
-	}
-
-	printf("tachyon dp: dev=%s active=%u\n", dev->name,
-	       device_active(dev) ? 1 : 0);
-
-	priv = dev_get_priv(dev);
-	printf("tachyon dp: typec_source=%s typec_valid=%u orientation=%u pin=%u hpd_state=%s aux_enabled=%u aux_xfers_enabled=%u force_aux=%u\n",
-	       tachyon_dp_typec_source_name(priv->typec_source),
-	       priv->typec_valid, priv->orientation, priv->pin_assignment,
-	       tachyon_dp_hpd_state_name(priv->hpd_state),
-	       priv->aux_enabled, priv->aux_xfers_enabled,
-	       tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd"));
-	printf("tachyon dp: qmp_dp_touched=%u qmp_dp_serdes_programmed=%u qmp_dp_phy_started=%u\n",
-	       priv->qmp_dp_touched, priv->qmp_dp_serdes_programmed,
-	       priv->qmp_dp_phy_started);
-	printf("tachyon dp: dp_clks valid=%u,%u,%u,%u enabled=%u,%u,%u,%u\n",
-	       priv->dp_clk_valid[0], priv->dp_clk_valid[1],
-	       priv->dp_clk_valid[2], priv->dp_clk_valid[3],
-	       priv->dp_clk_enabled[0], priv->dp_clk_enabled[1],
-	       priv->dp_clk_enabled[2], priv->dp_clk_enabled[3]);
-	printf("tachyon dp: dpu_clks valid=%u,%u,%u,%u,%u,%u enabled=%u,%u,%u,%u,%u,%u\n",
-	       priv->dpu_clk_valid[0], priv->dpu_clk_valid[1],
-	       priv->dpu_clk_valid[2], priv->dpu_clk_valid[3],
-	       priv->dpu_clk_valid[4], priv->dpu_clk_valid[5],
-	       priv->dpu_clk_enabled[0], priv->dpu_clk_enabled[1],
-	       priv->dpu_clk_enabled[2], priv->dpu_clk_enabled[3],
-	       priv->dpu_clk_enabled[4], priv->dpu_clk_enabled[5]);
-
-	if (!device_active(dev))
-		return;
-
-	plat = dev_get_uclass_plat(dev);
-	uc_priv = dev_get_uclass_priv(dev);
-
-	printf("tachyon dp: mode=%ux%u bpix=%u format=%u fb=%lx size=%lx line=%u\n",
-	       uc_priv->xsize, uc_priv->ysize, uc_priv->bpix,
-	       uc_priv->format, (ulong)plat->base, (ulong)uc_priv->fb_size,
-	       uc_priv->line_length);
-
-	tachyon_dp_print_qmp_status(priv);
-	tachyon_dp_print_aux_status(priv);
-}
-
-static void tachyon_dp_print_pmic_state(void)
-{
-	const struct qcom_pmic_glink_altmode_state *state;
-
-	state = qcom_pmic_glink_altmode_get_state();
-	if (!state) {
-		printf("tachyon dp: PMIC state unavailable\n");
-		return;
-	}
-
-	printf("tachyon dp: PMIC service=%u pan=%u notify=%u state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u force_aux=%u\n",
-	       state->service_started, state->pan_enabled,
-	       state->notify_seen, state->typec_state, state->svid,
-	       state->orientation_raw, state->mux, state->dpam_raw,
-	       state->linux_mux_mode, state->dp_pin_assignment,
-	       state->hpd, state->hpd_irq,
-	       tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd"));
-}
-
-int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
-		   char *const argv[])
-{
-	struct udevice *dev = NULL;
-	int ret;
-
-	if (argc < 3 || strcmp(argv[1], "dp"))
-		return CMD_RET_USAGE;
-
-	if (!strcmp(argv[2], "start") || !strcmp(argv[2], "init") ||
-	    !strcmp(argv[2], "probe")) {
-		tachyon_dp_arm_manual_probe();
-		ret = tachyon_dp_find_device(&dev, true);
-		/*
-		 * DP is up and video_post_probe has bound + registered the
-		 * "vidconsole" stdio device.  Route U-Boot's console onto it
-		 * (alongside serial) so the prompt and command output appear on
-		 * the dock.  CONFIG_CONSOLE_MUX + CONFIG_SYS_CONSOLE_IS_IN_ENV
-		 * make the stdout env callback (on_console) re-evaluate the iomux
-		 * immediately.  Skipped in test-pattern mode so the diagnostic
-		 * colour bars are not overwritten by console text.
-		 */
-		if (!ret && dev &&
-		    !tachyon_dp_env_bool("tachyon_dp_test_pattern")) {
-			const char *cur = env_get("stdout");
-
-			if (!cur || !strstr(cur, "vidconsole"))
-				env_set("stdout", "serial,vidconsole");
-		}
-#if CONFIG_IS_ENABLED(EFI_LOADER)
-		/*
-		 * Expose the live DP framebuffer to EFI applications (the boot
-		 * manager and the booting OS's EFI stub) via the Graphics Output
-		 * Protocol, so the dock keeps displaying across the
-		 * U-Boot -> EFI -> OS handoff.
-		 *
-		 * The GOP is installed by efi_gop_register() against the first
-		 * *active* UCLASS_VIDEO device; efi_init_obj_list() runs that
-		 * exactly once, lazily, on first EFI use.  Drive it here now that
-		 * our manual-probe DP device is active, so the GOP reliably
-		 * captures our framebuffer regardless of whether EFI is reached
-		 * before or after "tachyon dp start":
-		 *   - EFI not up yet -> efi_init_obj_list() brings it up and
-		 *     registers the GOP against our active device;
-		 *   - EFI already up -> its one-shot GOP scan ran before DP came
-		 *     up, so install a GOP for our framebuffer explicitly.
-		 * One-shot guarded so a repeated "tachyon dp start" cannot add a
-		 * duplicate GOP handle.
-		 */
-		if (!ret && dev) {
-			static bool gop_done;
-
-			if (!gop_done) {
-				efi_status_t es;
-
-				if (efi_obj_list_initialized == EFI_SUCCESS)
-					es = efi_gop_register();
-				else
-					es = efi_init_obj_list();
-				if (es == EFI_SUCCESS)
-					gop_done = true;
-				printf("tachyon dp: EFI GOP %s (ret=%lx)\n",
-				       gop_done ? "registered" : "deferred",
-				       es & ~EFI_ERROR_MASK);
-			}
-		}
-#endif
-		tachyon_dp_print_device_status(dev);
-		tachyon_dp_print_pmic_state();
-		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-	}
-
-	if (!strcmp(argv[2], "sync")) {
-		tachyon_dp_arm_manual_probe();
-		ret = tachyon_dp_find_device(&dev, true);
-		if (ret)
-			return CMD_RET_FAILURE;
-
-		ret = video_sync(dev, true);
-		printf("tachyon dp: sync ret=%d\n", ret);
-		tachyon_dp_print_device_status(dev);
-		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-	}
-
-	if (!strcmp(argv[2], "status")) {
-		ret = tachyon_dp_find_device(&dev, false);
-		if (ret && ret != -ENODEV)
-			printf("tachyon dp: status find ret=%d\n", ret);
-		tachyon_dp_print_device_status(dev);
-		tachyon_dp_print_pmic_state();
-		return CMD_RET_SUCCESS;
-	}
-
-	return CMD_RET_USAGE;
-}
-#endif
 
 static const struct udevice_id tachyon_dp_ids[] = {
 	{ .compatible = "qcom,sc7280-dp" },

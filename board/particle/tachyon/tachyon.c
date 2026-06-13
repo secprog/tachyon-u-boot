@@ -33,11 +33,6 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
-#ifdef CONFIG_CMD_TACHYON_DP
-int tachyon_dp_cmd(struct cmd_tbl *cmdtp, int flag, int argc,
-		   char *const argv[]);
-#endif
-
 static efs_context s_efs = {};
 typedef struct blkdev_context {
 	struct blk_desc* desc;
@@ -494,25 +489,8 @@ static int do_tachyon(struct cmd_tbl* cmdtp, int flag, int argc,
 		return do_tachyon_resolution(cmdtp, flag, argc - 1, argv + 1);
 	}
 
-#ifdef CONFIG_CMD_TACHYON_DP
-	if (!strcmp(argv[1], "dp")) {
-		return tachyon_dp_cmd(cmdtp, flag, argc, argv);
-	}
-#endif
-
 	return CMD_RET_USAGE;
 }
-
-#ifdef CONFIG_CMD_TACHYON_DP
-#define TACHYON_DP_CMD_HELP \
-	"\n" \
-	"dp start\n" \
-	"dp probe\n" \
-	"dp sync\n" \
-	"dp status"
-#else
-#define TACHYON_DP_CMD_HELP ""
-#endif
 
 U_BOOT_CMD(
 	tachyon, 5, 1, do_tachyon,
@@ -523,7 +501,6 @@ U_BOOT_CMD(
 	"resolution menu\n"
 	"resolution save\n"
 	"resolution set <width>x<height> [save]"
-	TACHYON_DP_CMD_HELP
 );
 
 static int tachyon_setup_efs(void) {
