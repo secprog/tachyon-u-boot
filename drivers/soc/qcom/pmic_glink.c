@@ -11,8 +11,8 @@
 #define LOG_CATEGORY UCLASS_MISC
 
 #include <asm/gpio.h>
-#include <command.h>
 #include <dm.h>
+#include <dm/lists.h>
 #include <dm/ofnode.h>
 #include <dm/uclass.h>
 #include <env.h>
@@ -36,371 +36,22 @@
 #include <asm/unaligned.h>
 #include <time.h>
 
-#define QPG_SMEM_XPRT_DESCRIPTOR		478
-#define QPG_SMEM_XPRT_FIFO_0			479
-#define QPG_SMEM_XPRT_FIFO_1			480
-
-#define QPG_FIFO_FULL_RESERVE			8
-#define QPG_TX_BLOCKED_CMD_RESERVE		8
-#define QPG_RX_INTENT_SIZE			512
-#define QPG_CHANNEL_NAME			"PMIC_RTR_ADSP_APPS"
-#define QPG_ALTMODE_TIMEOUT_MS			5000
+#include "pmic_glink_internal.h"
 
 /*
- * IPCRTR is the qrtr/QMI transport GLINK channel the ADSP opens at boot; the
- * SERVREG_LOC protection-domain service runs over it. The ADSP's charger_pd
- * appears to need this transport (servreg registration) up before it will run
- * the DisplayPort alt-mode VDM. We bring the channel up as a second GLINK
- * channel and (Step 1) log the qrtr packets the ADSP sends so we can implement
- * a minimal qrtr/servreg responder.
+ * The GLINK session lives in the pmic-glink core device's private data.
+ * qpg_session_get() resolves (and probes) that core device and returns its
+ * priv; all transport/session functions operate on this single instance.
  */
-#define QPG_IPCRTR_NAME				"IPCRTR"
-#define QPG_IPCRTR_LCID				2
-#define QPG_IPCRTR_INTENT_SIZE			4096
+struct qpg *qpg_session_get(void)
+{
+	struct udevice *dev;
 
-/* qrtr (QIPCRTR) protocol — see Linux include/uapi/linux/qrtr.h */
-#define QRTR_PROTO_VER_1			1
-#define QRTR_TYPE_DATA				1
-#define QRTR_TYPE_HELLO				2
-#define QRTR_TYPE_BYE				3
-#define QRTR_TYPE_NEW_SERVER			4
-#define QRTR_TYPE_DEL_SERVER			5
-#define QRTR_TYPE_NEW_LOOKUP			10
-#define QRTR_TYPE_DEL_LOOKUP			11
-#define QRTR_NODE_BCAST				0xffffffffu
-#define QRTR_PORT_CTRL				0xfffffffeu
-/* Local (apps) qrtr node id we present to the ADSP. */
-#define QPG_QRTR_LOCAL_NODE			1
+	if (uclass_first_device_err(UCLASS_PMIC_GLINK, &dev))
+		return NULL;
 
-struct qpg_qrtr_hdr {
-	__le32 version;
-	__le32 type;
-	__le32 src_node;
-	__le32 src_port;
-	__le32 confirm_rx;
-	__le32 size;
-	__le32 dst_node;
-	__le32 dst_port;
-} __packed;
-
-struct qpg_qrtr_ctrl {
-	__le32 cmd;
-	__le32 service;
-	__le32 instance;
-	__le32 node;
-	__le32 port;
-} __packed;
-
-/*
- * servreg (protection-domain) over QMI — see Linux drivers/soc/qcom/pdr*.
- * The ADSP charger_pd hosts a NOTIFIER service (QMI service 0x42). To bring it
- * fully up (and let it run the DP alt-mode VDM) the AP must REGISTER_LISTENER
- * for "msm/adsp/charger_pd" with that notifier, then SET_ACK its state
- * indication — exactly what the Linux kernel pdr client does.
- */
-#define QMI_TYPE_REQUEST			0
-#define QMI_TYPE_RESPONSE			2
-#define QMI_TYPE_INDICATION			4
-#define SERVREG_NOTIFIER_QMI_SVC		0x42
-#define SERVREG_REGISTER_LISTENER_REQ		0x20
-#define SERVREG_STATE_UPDATED_IND		0x22
-#define SERVREG_SET_ACK_REQ			0x23
-#define QPG_SERVREG_PORT			0x14
-#define QPG_CHARGER_PD_PATH			"msm/adsp/charger_pd"
-
-struct qpg_qmi_hdr {
-	u8 type;
-	__le16 txn;
-	__le16 msg_id;
-	__le16 msg_len;
-} __packed;
-
-#define GLINK_VERSION_1				1
-#define GLINK_FEATURE_INTENT_REUSE		BIT(0)
-
-#define GLINK_CMD_VERSION			0
-#define GLINK_CMD_VERSION_ACK			1
-#define GLINK_CMD_OPEN				2
-#define GLINK_CMD_OPEN_ACK			4
-#define GLINK_CMD_INTENT			5
-#define GLINK_CMD_RX_DONE			6
-#define GLINK_CMD_RX_INTENT_REQ			7
-#define GLINK_CMD_RX_INTENT_REQ_ACK		8
-#define GLINK_CMD_TX_DATA			9
-#define GLINK_CMD_TX_DATA_CONT			12
-#define GLINK_CMD_READ_NOTIF			13
-#define GLINK_CMD_RX_DONE_W_REUSE		14
-
-#define PMIC_GLINK_OWNER_CHARGER		32778
-#define PMIC_GLINK_OWNER_USB_TYPE_C		32779
-#define PMIC_GLINK_OWNER_USBC_PAN		32780
-#define PMIC_GLINK_REQ_RESP			1
-
-/* PMIC_GLINK_OWNER_CHARGER (battmgr) opcodes */
-#define BATT_MNGR_GET_CHARGER_STATUS_REQ	0x0001
-#define BATT_MNGR_SET_OPERATIONAL_MODE_REQ	0x0003
-#define BATT_MNGR_SET_NOTIFICATION_CRITERIA_REQ	0x0004
-#define BATT_MNGR_NOTIFY_IND			0x0007
-
-#define UCSI_READ_BUFFER_REQ			0x11
-#define UCSI_WRITE_BUFFER_REQ			0x12
-#define UCSI_NOTIFY_IND			0x13
-
-#define USBC_CMD_READ_REQ			0x14
-#define USBC_SC8180X_NOTIFY_IND			0x13
-#define USBC_CMD_WRITE_REQ			0x15
-#define USBC_NOTIFY_IND				0x16
-
-#define ALTMODE_PAN_EN				0x10
-#define ALTMODE_PAN_ACK				0x11
-#define ALTMODE_READ_SEL			0x12
-
-#define UCSI_BUFFER_SIZE			48
-#define USBC_READ_BUFFER_SIZE			32
-#define UCSI_CMD_PPM_RESET			1
-#define UCSI_CMD_CONNECTOR_RESET		3
-#define UCSI_CMD_ACK_CC_CI			4
-#define UCSI_CMD_SET_UOR			9
-#define UCSI_CMD_SET_NOTIFICATION_ENABLE	5
-#define UCSI_CMD_GET_CAPABILITY			6
-#define UCSI_CMD_GET_CONNECTOR_CAPABILITY	7
-#define UCSI_CMD_GET_ALTERNATE_MODE		12
-#define UCSI_CMD_GET_CAM_SUPPORTED		13
-#define UCSI_CMD_GET_CURRENT_CAM		14
-#define UCSI_CMD_GET_CONNECTOR_STATUS		18
-#define QPG_UCSI_NTFY_CMD_COMPLETE	BIT(0)	/* Linux BIT(16) >> 16 */
-#define QPG_UCSI_NTFY_ERROR		BIT(15)	/* Linux BIT(31) >> 16 */
-#define QPG_UCSI_NTFY_ALL		0xdbe7	/* Linux 0xdbe70000 >> 16 */
-#define UCSI_CCI_NOT_SUPPORTED			BIT(25)
-#define UCSI_CCI_CANCEL_COMPLETE		BIT(26)
-#define UCSI_CCI_RESET_COMPLETE			BIT(27)
-#define UCSI_CCI_BUSY				BIT(28)
-#define UCSI_CCI_ACK_COMPLETE			BIT(29)
-#define UCSI_CCI_ERROR				BIT(30)
-#define UCSI_CCI_COMMAND_COMPLETE		BIT(31)
-#define UCSI_CCI_CONNECTOR_CHANGE_MASK		GENMASK(7, 1)
-#define UCSI_CCI_CONNECTOR_CHANGE_SHIFT		1
-#define UCSI_CCI_DATA_LENGTH_MASK		GENMASK(15, 8)
-#define UCSI_CCI_DATA_LENGTH_SHIFT		8
-#define UCSI_ACK_CC_CI_CONNECTOR_CHANGE		BIT(0)
-#define UCSI_ACK_CC_CI_COMMAND_COMPLETE		BIT(1)
-
-/*
- * UCSI u64 control value macros — serialize commands into bytes 8-15
- * of the UCSI write buffer via put_unaligned_le64().
- *
- * Byte layout (LE u64 value):
- *   bits  0- 7 (byte 8):  command
- *   bits  8-15 (byte 9):  data length
- *   bits 16-31 (bytes 10-11): command-specific word (2 bytes)
- *   bits 32-63 (bytes 12-15): command-specific dword (4 bytes)
- */
-#define UCSI_CTRL_CMD(cmd)			((u64)(cmd))
-#define UCSI_CTRL_D2(cmd, d2)			\
-	((u64)(cmd) | ((u64)(d2) << 16))
-#define UCSI_CTRL_D2_D4(cmd, d2, d4)		\
-	((u64)(cmd) | ((u64)(d2) << 16) | ((u64)(d4) << 32))
-
-#define USBC_READ_SEL_PIN_ASSIGNMENT		1
-#define USBC_READ_DATA_PIN_ASSIGNMENT		1
-
-#define USB_TYPEC_DP_SID			0xff01
-#define DPAM_HPD_A				1
-
-#define SC8180X_PORT_MASK			0x000000ff
-#define SC8180X_ORIENTATION_MASK		0x0000ff00
-#define SC8180X_MUX_MASK			0x00ff0000
-#define SC8180X_MODE_MASK			0x3f000000
-#define SC8180X_HPD_STATE_MASK			BIT(30)
-#define SC8180X_HPD_IRQ_MASK			BIT(31)
-
-#define SC8280XP_DPAM_MASK			0x3f
-#define SC8280XP_HPD_STATE_MASK			BIT(6)
-#define SC8280XP_HPD_IRQ_MASK			BIT(7)
-
-enum qpg_typec_state {
-	QPG_TYPEC_SAFE,
-	QPG_TYPEC_USB,
-	QPG_TYPEC_DP,
-};
-
-struct qpg_msg {
-	__le16 cmd;
-	__le16 param1;
-	__le32 param2;
-	u8 data[];
-} __packed;
-
-struct qpg_pmic_hdr {
-	__le32 owner;
-	__le32 type;
-	__le32 opcode;
-} __packed;
-
-struct qpg_usbc_write_req {
-	struct qpg_pmic_hdr hdr;
-	__le32 cmd;
-	__le32 arg;
-	__le32 reserved;
-} __packed;
-
-struct qpg_battmgr_opmode_req {
-	struct qpg_pmic_hdr hdr;
-	__le32 operational_mode;
-} __packed;
-
-struct qpg_battmgr_notify_crit_req {
-	struct qpg_pmic_hdr hdr;
-	__le32 battery_id;
-	__le32 power_state;
-	__le32 low_capacity;
-	__le32 high_capacity;
-} __packed;
-
-struct qpg_ucsi_read_buffer_req {
-	struct qpg_pmic_hdr hdr;
-} __packed;
-
-struct qpg_ucsi_read_buffer_resp {
-	struct qpg_pmic_hdr hdr;
-	u8 read_buffer[UCSI_BUFFER_SIZE];
-	__le32 return_code;
-} __packed;
-
-struct qpg_ucsi_write_buffer_req {
-	struct qpg_pmic_hdr hdr;
-	u8 write_buffer[UCSI_BUFFER_SIZE];
-	__le32 reserved;
-} __packed;
-
-struct qpg_ucsi_write_buffer_resp {
-	struct qpg_pmic_hdr hdr;
-	__le32 return_code;
-} __packed;
-
-struct qpg_ucsi_notify {
-	struct qpg_pmic_hdr hdr;
-	__le32 notification;
-	__le32 receiver;
-	__le32 reserved;
-} __packed;
-
-struct qpg_usbc_read_req {
-	struct qpg_pmic_hdr hdr;
-	__le32 reserved;
-} __packed;
-
-struct qpg_usbc_read_resp {
-	struct qpg_pmic_hdr hdr;
-	u8 read_buffer[USBC_READ_BUFFER_SIZE];
-	__le32 return_code;
-} __packed;
-
-struct qpg_usbc_notify {
-	struct qpg_pmic_hdr hdr;
-	u8 payload[16];
-	__le32 reserved;
-} __packed;
-
-struct qpg_usbc_sc8180x_notify {
-	struct qpg_pmic_hdr hdr;
-	__le32 notification;
-	__le32 reserved[2];
-} __packed;
-
-struct qpg_intent_pair {
-	__le32 size;
-	__le32 iid;
-} __packed;
-
-struct qpg_notify_debug {
-	bool seen;
-	u8 port;
-	u8 raw_orientation;
-	enum qcom_pmic_glink_orientation orientation;
-	u8 mux;
-	u16 svid;
-	u8 dpam;
-	u8 linux_mux_mode;
-	u8 dp_pin_assignment;
-	bool hpd;
-	bool hpd_irq;
-};
-
-struct qpg {
-	struct udevice *smem;
-	struct mbox_chan mbox_chan;
-	u32 remote_pid;
-	__le32 *tx_tail;
-	__le32 *tx_head;
-	__le32 *rx_tail;
-	__le32 *rx_head;
-	u8 *tx_fifo;
-	u8 *rx_fifo;
-	size_t tx_len;
-	size_t rx_len;
-	u16 lcid;
-	u16 rcid;
-	u32 next_liid;
-	u32 riid;
-	u32 riid_size;
-	bool riid_avail;
-	bool version_acked;
-	bool local_open_sent;
-	bool open_acked;
-	bool remote_opened;
-	bool remote_open_ack_pending;
-	bool remote_open_acked;
-	bool pan_acked;
-	bool battmgr_acked;
-	/* IPCRTR (qrtr/servreg) second GLINK channel state */
-	u16 ipcrtr_rcid;
-	u32 ipcrtr_liid;
-	bool ipcrtr_seen;
-	bool ipcrtr_open_ack_pending;
-	bool ipcrtr_local_open_sent;
-	bool ipcrtr_open_acked;
-	bool ipcrtr_intent_posted;
-	/* queue of remote (ADSP) RX intents for sending qrtr packets back */
-	u32 ipcrtr_riid_q[32];
-	u8 ipcrtr_riid_head;
-	u8 ipcrtr_riid_tail;
-	bool ipcrtr_hello_pending;
-	bool ipcrtr_hello_sent;
-	u32 ipcrtr_node;
-	/* servreg listener-client state for the ADSP charger_pd notifier */
-	u32 servreg_node;
-	u32 servreg_port;
-	bool servreg_notifier_seen;
-	bool servreg_register_pending;
-	bool servreg_registered;
-	bool servreg_ack_pending;
-	u16 servreg_txn;
-	u16 servreg_ack_txn;
-	u32 servreg_last_state;
-	bool altmode_notify_seen;
-	bool altmode_no_dp;
-	bool ucsi_read_acked;
-	bool ucsi_write_acked;
-	bool usbc_read_acked;
-	bool ucsi_notify_seen;
-	bool ucsi_prewarmed;
-	u32 ucsi_notification;
-	u32 ucsi_read_return_code;
-	u32 ucsi_write_return_code;
-	u32 usbc_read_return_code;
-	u8 ucsi_read_buffer[UCSI_BUFFER_SIZE];
-	u8 usbc_read_buffer[USBC_READ_BUFFER_SIZE];
-	struct qpg_notify_debug notify;
-};
-
-static struct qpg qpg_session;
-static bool qpg_session_ready;
-static struct qcom_pmic_glink_altmode qpg_cached_altmode;
-static bool qpg_cached_altmode_valid;
-static struct qcom_pmic_glink_altmode_state qpg_cached_state;
-static int qpg_last_adsp_boot_ret;
-static int qpg_last_ucsi_prewarm_ret;
+	return dev_get_priv(dev);
+}
 
 /**
  * qpg_mbox_from_glink() - Get IPCC mailbox channel from glink-edge DT node.
@@ -470,104 +121,7 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 	return 0;
 }
 
-static enum qcom_pmic_glink_orientation qpg_orientation(u8 orientation)
-{
-	/*
-	 * ADSP PAN orientation is USBPD_PIN_ASSIGNMENT_ORIENTATION_*:
-	 * 0 = normal/CC1, 1 = flip/CC2, 2 = invalid/open.
-	 */
-	if (orientation == 0)
-		return QCOM_PMIC_GLINK_ORIENTATION_NORMAL;
-	if (orientation == 1)
-		return QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
-
-	return QCOM_PMIC_GLINK_ORIENTATION_NONE;
-}
-
-static const char *qpg_typec_state_name(enum qpg_typec_state state)
-{
-	switch (state) {
-	case QPG_TYPEC_SAFE:
-		return "safe";
-	case QPG_TYPEC_USB:
-		return "usb";
-	case QPG_TYPEC_DP:
-		return "dp";
-	default:
-		return "unknown";
-	}
-}
-
-static enum qcom_pmic_glink_typec_state
-qpg_public_typec_state(enum qpg_typec_state state)
-{
-	switch (state) {
-	case QPG_TYPEC_SAFE:
-		return QPG_TYPEC_STATE_SAFE;
-	case QPG_TYPEC_USB:
-		return QPG_TYPEC_STATE_USB;
-	case QPG_TYPEC_DP:
-		return QPG_TYPEC_STATE_DP;
-	default:
-		return QPG_TYPEC_STATE_UNKNOWN;
-	}
-}
-
-static const char *
-qpg_public_typec_state_name(enum qcom_pmic_glink_typec_state state)
-{
-	switch (state) {
-	case QPG_TYPEC_STATE_SAFE:
-		return "safe";
-	case QPG_TYPEC_STATE_USB:
-		return "usb";
-	case QPG_TYPEC_STATE_DP:
-		return "dp";
-	default:
-		return "unknown";
-	}
-}
-
-static void qpg_update_cached_state(struct qpg *pg,
-				    struct qcom_pmic_glink_altmode *altmode,
-				    enum qpg_typec_state state)
-{
-	if (!altmode)
-		return;
-
-	qpg_cached_altmode = *altmode;
-	qpg_cached_altmode_valid = true;
-
-	qpg_cached_state.service_started = qpg_session_ready;
-	qpg_cached_state.notify_seen = true;
-	qpg_cached_state.dp_seen |= state == QPG_TYPEC_DP;
-	qpg_cached_state.hpd = altmode->hpd;
-	qpg_cached_state.hpd_irq = altmode->hpd_irq;
-	qpg_cached_state.port = altmode->port;
-	qpg_cached_state.orientation_raw = pg->notify.raw_orientation;
-	qpg_cached_state.orientation = altmode->orientation;
-	qpg_cached_state.mux = pg->notify.mux;
-	qpg_cached_state.dpam_raw = pg->notify.dpam;
-	qpg_cached_state.linux_mux_mode = pg->notify.linux_mux_mode;
-	qpg_cached_state.dp_pin_assignment = pg->notify.dp_pin_assignment;
-	qpg_cached_state.pin_assignment = altmode->pin_assignment;
-	qpg_cached_state.svid = pg->notify.svid;
-	qpg_cached_state.typec_state = qpg_public_typec_state(state);
-	qpg_cached_state.last_notify_ms = get_timer(0);
-
-	log_warning("qpg: service started=%u pan=%u notify_seen=%u dp_seen=%u hpd=%u raw_dpam=%u linux_mode=%u dp_pin=%u age_ms=%lu\n",
-		    qpg_cached_state.service_started,
-		    qpg_cached_state.pan_enabled,
-		    qpg_cached_state.notify_seen,
-		    qpg_cached_state.dp_seen,
-		    qpg_cached_state.hpd,
-		    qpg_cached_state.dpam_raw,
-		    qpg_cached_state.linux_mux_mode,
-		    qpg_cached_state.dp_pin_assignment,
-		    get_timer(qpg_cached_state.last_notify_ms));
-}
-
-static bool qpg_env_bool(const char *name)
+bool qpg_env_bool(const char *name)
 {
 	const char *value = env_get(name);
 
@@ -575,97 +129,6 @@ static bool qpg_env_bool(const char *name)
 			 !strcmp(value, "true") ||
 			 !strcmp(value, "yes") ||
 			 !strcmp(value, "on"));
-}
-
-static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
-				enum qpg_typec_state state)
-{
-	bool invert_select = qpg_env_bool("tachyon_dp_invert_sbu_select");
-	bool invert_enable = qpg_env_bool("tachyon_dp_invert_sbu_enable");
-	struct gpio_desc sbu_enable = {};
-	struct gpio_desc sbu_select = {};
-	bool dp_active = state == QPG_TYPEC_DP;
-	ofnode mux;
-	int select;
-	int enable;
-	int ret;
-
-	mux = ofnode_path("/usb1-sbu-mux");
-	if (!ofnode_valid(mux))
-		return;
-
-	ret = gpio_request_by_name_nodev(mux, "select-gpios", 0,
-					 &sbu_select, GPIOD_IS_OUT);
-	if (ret) {
-		log_warning("pmic-glink: SBU select request ret=%d\n", ret);
-		return;
-	}
-
-	ret = gpio_request_by_name_nodev(mux, "enable-gpios", 0,
-					 &sbu_enable, GPIOD_IS_OUT);
-	if (ret) {
-		log_warning("pmic-glink: SBU enable request ret=%d\n", ret);
-		dm_gpio_free(NULL, &sbu_select);
-		return;
-	}
-
-	select = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
-	if (invert_select)
-		select = !select;
-
-	enable = dp_active ? 1 : 0;
-	if (invert_enable)
-		enable = !enable;
-
-	dm_gpio_set_value(&sbu_select, select);
-	udelay(1000);
-	dm_gpio_set_value(&sbu_enable, enable);
-
-	log_warning("pmic-glink: SBU mux %s orientation=%u enable=%d select=%d\n",
-		    qpg_typec_state_name(state), orientation,
-		    dm_gpio_get_value(&sbu_enable),
-		    dm_gpio_get_value(&sbu_select));
-
-	dm_gpio_free(NULL, &sbu_enable);
-	dm_gpio_free(NULL, &sbu_select);
-}
-
-static void qpg_program_qmp_typec(enum qcom_pmic_glink_orientation orientation,
-				  enum qpg_typec_state state,
-				  u8 pin_assignment)
-{
-	bool dp_svid = state == QPG_TYPEC_DP;
-	bool reverse;
-	int ret;
-
-	if (orientation == QCOM_PMIC_GLINK_ORIENTATION_NONE)
-		return;
-
-	reverse = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
-	ret = qcom_qmp_combo_typec_set(reverse, dp_svid, pin_assignment);
-	log_warning("pmic-glink: QMP Type-C provider ret=%d state=%s dp_svid=%d orientation=%u pin=%u\n",
-		    ret, qpg_typec_state_name(state), dp_svid,
-		    orientation, pin_assignment);
-}
-
-static void qpg_apply_typec_state(enum qcom_pmic_glink_orientation orientation,
-				  enum qpg_typec_state state,
-				  u8 pin_assignment)
-{
-	bool reverse = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
-	bool sbu_en;
-	bool sbu_sel = reverse;
-
-	if (state == QPG_TYPEC_DP && !pin_assignment)
-		state = QPG_TYPEC_SAFE;
-
-	qpg_program_sbu_mux(orientation, state);
-	qpg_program_qmp_typec(orientation, state, pin_assignment);
-
-	sbu_en = state == QPG_TYPEC_DP;
-	log_warning("qpg: apply state=%s sbu_en=%u sbu_sel=%u qmp_mode=%s reverse=%u pin=%u ret=%d\n",
-		    qpg_typec_state_name(state), sbu_en, sbu_sel,
-		    qpg_typec_state_name(state), reverse, pin_assignment, 0);
 }
 
 static size_t qpg_rx_avail(struct qpg *pg)
@@ -906,24 +369,6 @@ static int qpg_send_rx_done_for(struct qpg *pg, u16 cid, u32 liid)
 }
 
 static int qpg_wait_riid(struct qpg *pg);
-static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg);
-static int qpg_send_ucsi_read(struct qpg *pg);
-static int qpg_send_usbc_read(struct qpg *pg,
-			      struct qcom_pmic_glink_altmode *altmode);
-static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port);
-static int qpg_drain_until(struct qpg *pg,
-			   struct qcom_pmic_glink_altmode *altmode,
-			   bool (*done)(struct qpg *,
-					struct qcom_pmic_glink_altmode *),
-			   u32 timeout_ms);
-static bool qpg_done_pan_ack(struct qpg *pg,
-			     struct qcom_pmic_glink_altmode *altmode);
-static bool qpg_done_ucsi_read(struct qpg *pg,
-			       struct qcom_pmic_glink_altmode *altmode);
-static bool qpg_done_ucsi_write(struct qpg *pg,
-				struct qcom_pmic_glink_altmode *altmode);
-static bool qpg_done_usbc_read(struct qpg *pg,
-			       struct qcom_pmic_glink_altmode *altmode);
 static int qpg_service_ipcrtr(struct qpg *pg);
 
 static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
@@ -950,7 +395,7 @@ static int qpg_send_data_for(struct qpg *pg, u16 lcid, u32 riid,
 	return ret;
 }
 
-static int qpg_send_data(struct qpg *pg, const void *data, size_t len)
+int qpg_send_data(struct qpg *pg, const void *data, size_t len)
 {
 	int ret;
 
@@ -1201,218 +646,6 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 		}
 		return;
 	}
-}
-
-static bool qpg_parse_sc8280xp_notify(struct qpg *pg,
-				      struct qcom_pmic_glink_altmode *altmode,
-				      const void *data, size_t len,
-				      u32 *portp)
-{
-	const struct qpg_usbc_notify *notify = data;
-	enum qcom_pmic_glink_orientation orientation;
-	u8 linux_mode;
-	u8 mode;
-	u8 port;
-	u16 svid;
-
-	log_warning("pmic-glink: SC8280XP notify len=%zu expected=%zu\n",
-		    len, sizeof(*notify));
-
-	if (len != sizeof(*notify))
-		return false;
-
-	port = notify->payload[0];
-	*portp = port;
-	svid = le32_to_cpu(notify->hdr.opcode) >> 16;
-	log_warning("pmic-glink: SC8280XP port=%u orientation=%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
-		    port, notify->payload[1],
-		    notify->payload[2], svid,
-		    notify->payload[8] & SC8280XP_DPAM_MASK,
-		    !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK),
-		    !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK));
-
-	orientation = qpg_orientation(notify->payload[1]);
-	pg->notify.seen = true;
-	pg->notify.port = port;
-	pg->notify.raw_orientation = notify->payload[1];
-	pg->notify.orientation = orientation;
-	pg->notify.mux = notify->payload[2];
-	pg->notify.svid = svid;
-	pg->notify.dpam = notify->payload[8] & SC8280XP_DPAM_MASK;
-	pg->notify.linux_mux_mode = pg->notify.dpam - DPAM_HPD_A;
-	pg->notify.dp_pin_assignment = 0;
-	pg->notify.hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
-	pg->notify.hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-		    le32_to_cpu(notify->hdr.opcode), svid, port,
-		    pg->notify.raw_orientation, orientation, pg->notify.mux,
-		    pg->notify.dpam, pg->notify.linux_mux_mode,
-		    pg->notify.dp_pin_assignment, pg->notify.hpd,
-		    pg->notify.hpd_irq);
-
-	if (svid != USB_TYPEC_DP_SID) {
-		altmode->port = port;
-		altmode->orientation = orientation;
-		altmode->hpd = false;
-		altmode->hpd_irq = false;
-		altmode->dp = false;
-		altmode->pin_assignment = 0;
-		pg->altmode_notify_seen = true;
-		qpg_apply_typec_state(orientation, QPG_TYPEC_USB, 0);
-		qpg_update_cached_state(pg, altmode, QPG_TYPEC_USB);
-		return true;
-	}
-
-	altmode->port = port;
-	altmode->orientation = orientation;
-	altmode->hpd = pg->notify.hpd;
-	altmode->hpd_irq = pg->notify.hpd_irq;
-	pg->altmode_notify_seen = true;
-	mode = pg->notify.dpam;
-	linux_mode = pg->notify.linux_mux_mode;
-	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
-		    notify->payload[1], orientation);
-	if (linux_mode == 0xff) {
-		altmode->dp = false;
-		altmode->pin_assignment = 0;
-		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
-		qpg_update_cached_state(pg, altmode, QPG_TYPEC_SAFE);
-		log_warning("pmic-glink: DP notify safe/no-DP mux=%u raw_dpam=%u linux_mode=%u\n",
-			    notify->payload[2], mode, linux_mode);
-		return true;
-	}
-
-	pg->notify.dp_pin_assignment = linux_mode;
-	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u dp_pin_assignment=%u\n",
-		    mode, linux_mode, pg->notify.dp_pin_assignment);
-
-	altmode->pin_assignment = pg->notify.dp_pin_assignment;
-	altmode->dp = true;
-	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
-			      altmode->pin_assignment);
-	qpg_update_cached_state(pg, altmode, QPG_TYPEC_DP);
-
-	return true;
-}
-
-static bool qpg_parse_sc8180x_notify(struct qpg *pg,
-				     struct qcom_pmic_glink_altmode *altmode,
-				     const void *data, size_t len,
-				     u32 *portp)
-{
-	const struct qpg_usbc_sc8180x_notify *msg = data;
-	enum qcom_pmic_glink_orientation orientation;
-	u32 notification;
-	u8 mode;
-	u8 mux;
-	u8 raw_orientation;
-	u8 port;
-	u16 svid;
-
-	log_warning("pmic-glink: SC8180X notify len=%zu expected=%zu\n",
-		    len, sizeof(*msg));
-
-	if (len != sizeof(*msg))
-		return false;
-
-	notification = le32_to_cpu(msg->notification);
-	port = notification & SC8180X_PORT_MASK;
-	*portp = port;
-	raw_orientation = (notification & SC8180X_ORIENTATION_MASK) >> 8;
-	mux = (notification & SC8180X_MUX_MASK) >> 16;
-	mode = (notification & SC8180X_MODE_MASK) >> 24;
-	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
-	log_warning("pmic-glink: SC8180X notification=%08x port=%u orientation=%u mux=%u mode=%u hpd=%u irq=%u\n",
-		    notification, port, raw_orientation, mux, mode,
-		    !!(notification & SC8180X_HPD_STATE_MASK),
-		    !!(notification & SC8180X_HPD_IRQ_MASK));
-	orientation = qpg_orientation(raw_orientation);
-	pg->notify.seen = true;
-	pg->notify.port = port;
-	pg->notify.raw_orientation = raw_orientation;
-	pg->notify.orientation = orientation;
-	pg->notify.mux = mux;
-	pg->notify.svid = svid;
-	pg->notify.dpam = mode;
-	pg->notify.linux_mux_mode = mode;
-	pg->notify.dp_pin_assignment = 0;
-	pg->notify.hpd = !!(notification & SC8180X_HPD_STATE_MASK);
-	pg->notify.hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-		    le32_to_cpu(msg->hdr.opcode), svid, port,
-		    pg->notify.raw_orientation, orientation, pg->notify.mux,
-		    pg->notify.dpam, pg->notify.linux_mux_mode,
-		    pg->notify.dp_pin_assignment, pg->notify.hpd,
-		    pg->notify.hpd_irq);
-
-	altmode->port = port;
-	altmode->orientation = orientation;
-	altmode->hpd = pg->notify.hpd;
-	altmode->hpd_irq = pg->notify.hpd_irq;
-	pg->altmode_notify_seen = true;
-	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
-		    raw_orientation, orientation);
-	if (svid != USB_TYPEC_DP_SID) {
-		altmode->dp = false;
-		altmode->pin_assignment = 0;
-		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, QPG_TYPEC_USB, 0);
-		qpg_update_cached_state(pg, altmode, QPG_TYPEC_USB);
-		log_warning("pmic-glink: SC8180X notify USB/no-DP mux=%u mode=%u\n",
-			    mux, mode);
-		return true;
-	}
-
-	if (mode == 0xff) {
-		altmode->dp = false;
-		altmode->pin_assignment = 0;
-		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
-		qpg_update_cached_state(pg, altmode, QPG_TYPEC_SAFE);
-		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
-			    mux, mode);
-		return true;
-	}
-
-	pg->notify.dp_pin_assignment = mode;
-	log_warning("pmic-glink: SC8180X DP active linux_mode=%u dp_pin_assignment=%u\n",
-		    mode, pg->notify.dp_pin_assignment);
-
-	altmode->pin_assignment = pg->notify.dp_pin_assignment;
-	altmode->dp = true;
-	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
-			      altmode->pin_assignment);
-	qpg_update_cached_state(pg, altmode, QPG_TYPEC_DP);
-
-	return true;
-}
-
-static int qpg_send_notify_pan_ack(struct qpg *pg,
-				   struct qcom_pmic_glink_altmode *altmode,
-				   u32 port)
-{
-	int ret;
-
-	log_warning("pmic-glink: send ALTMODE_PAN_ACK port=%u\n", port);
-
-	pg->pan_acked = false;
-	ret = qpg_send_altmode_req(pg, ALTMODE_PAN_ACK, port);
-	log_warning("pmic-glink: send ALTMODE_PAN_ACK ret=%d port=%u\n",
-		    ret, port);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(pg, altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
-		    ret, pg->pan_acked);
-	log_warning("qpg: PAN_ACK state=%s ret=%d\n",
-		    qpg_public_typec_state_name(qpg_cached_state.typec_state),
-		    ret);
-
-	return ret;
 }
 
 static bool qpg_parse_pmic(struct qpg *pg,
@@ -1807,7 +1040,7 @@ static int qpg_rx_packet_len(struct qpg *pg, size_t avail, u16 cmd,
 	return 0;
 }
 
-static int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
+int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 {
 	struct qpg_msg msg;
 	__le32 raw[4] = {};
@@ -2046,7 +1279,7 @@ static int qpg_service_ipcrtr(struct qpg *pg)
 	return 0;
 }
 
-static int qpg_drain_until(struct qpg *pg,
+int qpg_drain_until(struct qpg *pg,
 			   struct qcom_pmic_glink_altmode *altmode,
 			   bool (*done)(struct qpg *,
 					struct qcom_pmic_glink_altmode *),
@@ -2094,25 +1327,25 @@ static bool qpg_done_riid(struct qpg *pg,
 	return pg->riid_avail;
 }
 
-static bool qpg_done_pan_ack(struct qpg *pg,
+bool qpg_done_pan_ack(struct qpg *pg,
 			     struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->pan_acked;
 }
 
-static bool qpg_done_ucsi_read(struct qpg *pg,
+bool qpg_done_ucsi_read(struct qpg *pg,
 			       struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->ucsi_read_acked;
 }
 
-static bool qpg_done_ucsi_write(struct qpg *pg,
+bool qpg_done_ucsi_write(struct qpg *pg,
 				struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->ucsi_write_acked;
 }
 
-static bool qpg_done_usbc_read(struct qpg *pg,
+bool qpg_done_usbc_read(struct qpg *pg,
 			       struct qcom_pmic_glink_altmode *altmode)
 {
 	return pg->usbc_read_acked;
@@ -2134,65 +1367,7 @@ static int qpg_wait_riid(struct qpg *pg)
 	return ret;
 }
 
-static bool qpg_done_battmgr(struct qpg *pg,
-			     struct qcom_pmic_glink_altmode *altmode)
-{
-	return pg->battmgr_acked;
-}
-
-/*
- * Register the battery-manager (CHARGER, owner 32778) client over the same
- * GLINK channel: SET_OPERATIONAL_MODE(normal) then SET_NOTIFICATION_CRITERIA.
- * On this platform the ADSP "battman" firmware hosts both the charger AND the
- * USB Type-C/PD/alt-mode stack; this mirrors what Linux's qcom_battmgr does on
- * glink-up. Best-effort: failures here must not break the altmode session.
- */
-static int qpg_register_battmgr(struct qpg *pg)
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	struct qpg_battmgr_opmode_req opmode = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_CHARGER),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(BATT_MNGR_SET_OPERATIONAL_MODE_REQ),
-		.operational_mode = cpu_to_le32(1), /* normal mode */
-	};
-	struct qpg_battmgr_notify_crit_req crit = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_CHARGER),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(BATT_MNGR_SET_NOTIFICATION_CRITERIA_REQ),
-		.battery_id = 0,
-		.power_state = cpu_to_le32(0xf),
-		.low_capacity = 0,
-		.high_capacity = cpu_to_le32(100),
-	};
-	int ret;
-
-	log_warning("pmic-glink: BATTMGR register: SET_OPERATIONAL_MODE\n");
-	pg->battmgr_acked = false;
-	ret = qpg_send_data(pg, &opmode, sizeof(opmode));
-	if (ret) {
-		log_warning("pmic-glink: BATTMGR opmode send ret=%d\n", ret);
-		return ret;
-	}
-	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
-	log_warning("pmic-glink: BATTMGR opmode ack ret=%d acked=%d\n",
-		    ret, pg->battmgr_acked);
-
-	log_warning("pmic-glink: BATTMGR register: SET_NOTIFICATION_CRITERIA\n");
-	pg->battmgr_acked = false;
-	ret = qpg_send_data(pg, &crit, sizeof(crit));
-	if (ret) {
-		log_warning("pmic-glink: BATTMGR crit send ret=%d\n", ret);
-		return ret;
-	}
-	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
-	log_warning("pmic-glink: BATTMGR crit ack ret=%d acked=%d\n",
-		    ret, pg->battmgr_acked);
-
-	return 0;
-}
-
-static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
+int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 {
 	struct qpg_usbc_write_req req = {
 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USBC_PAN),
@@ -2208,841 +1383,6 @@ static int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 	return qpg_send_data(pg, &req, sizeof(req));
 }
 
-static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
-					  struct qcom_pmic_glink_altmode *altmode,
-					  const u8 *pin, const char *source)
-{
-	enum qcom_pmic_glink_orientation orientation;
-	u8 raw_orientation = pin[1];
-	u8 mux = pin[2];
-	u16 vid = get_unaligned_le16(pin + 4);
-	u16 svid_le = get_unaligned_le16(pin + 6);
-	u16 svid_be = ((u16)pin[6] << 8) | pin[7];
-	u8 mode = pin[8] & SC8280XP_DPAM_MASK;
-	u8 linux_mode = mode - DPAM_HPD_A;
-	bool hpd = !!(pin[8] & SC8280XP_HPD_STATE_MASK);
-	bool hpd_irq = !!(pin[8] & SC8280XP_HPD_IRQ_MASK);
-	bool dp_svid = svid_le == USB_TYPEC_DP_SID ||
-		       svid_be == USB_TYPEC_DP_SID;
-	bool dp_active = mode >= DPAM_HPD_A &&
-			 (dp_svid || mux == 2 || mux == 3);
-	u8 port = pin[0];
-
-	orientation = qpg_orientation(raw_orientation);
-	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid_le=%04x svid_be=%04x svid_raw=%02x%02x dpam=%02x hpd=%u irq=%u\n",
-		    source, port, raw_orientation, orientation, mux, vid,
-		    svid_le, svid_be, pin[6], pin[7], mode, hpd, hpd_irq);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-		    (u32)(dp_svid ? USB_TYPEC_DP_SID : svid_le) << 16,
-		    dp_svid ? USB_TYPEC_DP_SID : svid_le, port,
-		    raw_orientation, orientation, mux, mode, linux_mode, 0,
-		    hpd, hpd_irq);
-
-	pg->notify.seen = true;
-	pg->notify.port = port;
-	pg->notify.raw_orientation = raw_orientation;
-	pg->notify.orientation = orientation;
-	pg->notify.mux = mux;
-	pg->notify.svid = dp_svid ? USB_TYPEC_DP_SID : svid_le;
-	pg->notify.dpam = mode;
-	pg->notify.linux_mux_mode = linux_mode;
-	pg->notify.dp_pin_assignment = 0;
-	pg->notify.hpd = hpd;
-	pg->notify.hpd_irq = hpd_irq;
-
-	altmode->port = port;
-	altmode->orientation = orientation;
-	altmode->hpd = hpd;
-	altmode->hpd_irq = hpd_irq;
-	pg->altmode_notify_seen = true;
-
-	if (!dp_active) {
-		enum qpg_typec_state state = dp_svid ? QPG_TYPEC_SAFE :
-						    QPG_TYPEC_USB;
-
-		altmode->dp = false;
-		altmode->pin_assignment = 0;
-		pg->altmode_no_dp = true;
-		qpg_apply_typec_state(orientation, state, 0);
-		qpg_update_cached_state(pg, altmode, state);
-		log_warning("pmic-glink: %s %s/no-DP mux=%u dpam=%u dp_svid=%u\n",
-			    source, qpg_typec_state_name(state), mux, mode,
-			    dp_svid);
-		return;
-	}
-
-	pg->notify.dp_pin_assignment = linux_mode;
-	altmode->pin_assignment = pg->notify.dp_pin_assignment;
-	altmode->dp = true;
-	pg->altmode_no_dp = false;
-	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
-			      altmode->pin_assignment);
-	qpg_update_cached_state(pg, altmode, QPG_TYPEC_DP);
-	log_warning("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u dp_pin_assignment=%u\n",
-		    source, mode, linux_mode, altmode->pin_assignment);
-}
-
-static void qpg_log_usbc_read(struct qpg *pg,
-			      struct qcom_pmic_glink_altmode *altmode)
-{
-	const u8 *buf = pg->usbc_read_buffer;
-	u32 data_type = get_unaligned_le32(buf);
-
-	log_warning("pmic-glink: USBC READ decoded ret=%u data_type=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-		    pg->usbc_read_return_code, data_type,
-		    buf[0], buf[1], buf[2], buf[3],
-		    buf[4], buf[5], buf[6], buf[7],
-		    buf[8], buf[9], buf[10], buf[11],
-		    buf[12], buf[13], buf[14], buf[15]);
-
-	if (data_type == USBC_READ_DATA_PIN_ASSIGNMENT)
-		qpg_apply_usbc_pin_assignment(pg, altmode, buf + 4,
-					      "USBC READ");
-}
-
-static int qpg_send_usbc_read(struct qpg *pg,
-			      struct qcom_pmic_glink_altmode *altmode)
-{
-	struct qpg_usbc_read_req req = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USBC_PAN),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(USBC_CMD_READ_REQ),
-	};
-	int ret;
-
-	pg->usbc_read_acked = false;
-	pg->usbc_read_return_code = 0xffffffff;
-
-	log_warning("pmic-glink: owner=%u channel=%s USBC_READ_REQ\n",
-		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME);
-
-	ret = qpg_send_data(pg, &req, sizeof(req));
-	log_warning("pmic-glink: send USBC_READ_REQ ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(pg, altmode, qpg_done_usbc_read, 1000);
-	log_warning("pmic-glink: wait USBC_READ ret=%d ack=%d\n",
-		    ret, pg->usbc_read_acked);
-	if (!ret)
-		qpg_log_usbc_read(pg, altmode);
-
-	return ret;
-}
-
-static int qpg_send_usbc_read_select(struct qpg *pg, u32 read_sel)
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	int ret;
-
-	pg->pan_acked = false;
-	ret = qpg_send_altmode_req(pg, ALTMODE_READ_SEL, read_sel);
-	log_warning("pmic-glink: send READ_SEL ret=%d sel=%u\n", ret, read_sel);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(pg, &altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait READ_SEL_ACK ret=%d pan_acked=%d\n",
-		    ret, pg->pan_acked);
-
-	return ret;
-}
-
-static int qpg_refresh_usbc_pin_assignment(struct qpg *pg,
-					   struct qcom_pmic_glink_altmode *altmode)
-{
-	int ret;
-
-	ret = qpg_send_usbc_read_select(pg, USBC_READ_SEL_PIN_ASSIGNMENT);
-	if (ret)
-		return ret;
-
-	return qpg_send_usbc_read(pg, altmode);
-}
-
-static int qpg_send_ucsi_read(struct qpg *pg)
-{
-	struct qpg_ucsi_read_buffer_req req = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USB_TYPE_C),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(UCSI_READ_BUFFER_REQ),
-	};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int ret;
-
-	pg->ucsi_read_acked = false;
-
-	log_warning("pmic-glink: owner=%u channel=%s UCSI_READ_BUFFER_REQ\n",
-		    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME);
-
-	ret = qpg_send_data(pg, &req, sizeof(req));
-	log_warning("pmic-glink: send UCSI_READ_BUFFER_REQ ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(pg, &altmode, qpg_done_ucsi_read, 1000);
-	log_warning("pmic-glink: wait UCSI_READ_BUFFER ret=%d ack=%d\n",
-		    ret, pg->ucsi_read_acked);
-
-	return ret;
-}
-
-static void qpg_log_ucsi_raw(struct qpg *pg, const char *label)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u32 cci = get_unaligned_le32(buf + 4);
-	u8 len = (cci & UCSI_CCI_DATA_LENGTH_MASK) >> UCSI_CCI_DATA_LENGTH_SHIFT;
-
-	log_warning("pmic-glink: UCSI %s ret=%u cci=%08x len=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-		    label, pg->ucsi_read_return_code, cci, len,
-		    buf[16], buf[17], buf[18], buf[19],
-		    buf[20], buf[21], buf[22], buf[23],
-		    buf[24], buf[25], buf[26], buf[27],
-		    buf[28], buf[29], buf[30], buf[31]);
-}
-
-static void qpg_log_ucsi_connector_status(struct qpg *pg, u8 port)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u32 cci = get_unaligned_le32(buf + 4);
-	u32 status = get_unaligned_le32(buf + 16);
-	u32 rdo = get_unaligned_le32(buf + 20);
-	u8 power_opmode = (status >> 16) & 0x7;
-	bool connected = status & BIT(19);
-	bool power_direction = status & BIT(20);
-	bool partner_usb = status & BIT(21);
-	bool partner_altmode = status & BIT(22);
-	u8 partner_type = (status >> 29) & 0x7;
-
-	log_warning("pmic-glink: UCSI connector%u ret=%u cci=%08x status=%08x connected=%u pwr_dir=%u usb=%u altmode=%u partner=%u opmode=%u rdo=%08x\n",
-		    port + 1, pg->ucsi_read_return_code, cci, status,
-		    connected, power_direction, partner_usb,
-		    partner_altmode, partner_type, power_opmode, rdo);
-	qpg_log_ucsi_raw(pg, "CONNECTOR_STATUS");
-}
-
-static void qpg_log_ucsi_capability(struct qpg *pg)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u32 attr = get_unaligned_le32(buf + 16);
-	u64 cap = get_unaligned_le64(buf + 16);
-	u8 connectors = (cap >> 32) & 0x7f;
-	u32 optional = (cap >> 40) & 0xffffff;
-	u8 altmodes = buf[24];
-
-	log_warning("pmic-glink: UCSI CAPABILITY attr=%08x connectors=%u optional=%06x altmodes=%u\n",
-		    attr, connectors, optional, altmodes);
-	qpg_log_ucsi_raw(pg, "CAPABILITY");
-}
-
-static void qpg_log_ucsi_connector_capability(struct qpg *pg, u8 port)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u8 opmode = buf[16];
-	bool provider = buf[17] & BIT(0);
-	bool consumer = buf[17] & BIT(1);
-
-	log_warning("pmic-glink: UCSI connector%u CAP opmode=%02x altmode=%u usb3=%u usb2=%u drp=%u provider=%u consumer=%u\n",
-		    port + 1, opmode, !!(opmode & BIT(7)), !!(opmode & BIT(6)),
-		    !!(opmode & BIT(5)), !!(opmode & BIT(2)), provider,
-		    consumer);
-	qpg_log_ucsi_raw(pg, "CONNECTOR_CAP");
-}
-
-static void qpg_log_ucsi_cam_supported(struct qpg *pg, u8 port)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u32 bitmap = get_unaligned_le32(buf + 16);
-
-	log_warning("pmic-glink: UCSI connector%u CAM_SUPPORTED bitmap=%08x\n",
-		    port + 1, bitmap);
-	qpg_log_ucsi_raw(pg, "CAM_SUPPORTED");
-}
-
-static void qpg_log_ucsi_current_cam(struct qpg *pg, u8 port)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-
-	log_warning("pmic-glink: UCSI connector%u CURRENT_CAM=%02x\n",
-		    port + 1, buf[16]);
-	qpg_log_ucsi_raw(pg, "CURRENT_CAM");
-}
-
-static void qpg_log_ucsi_alternate_mode(struct qpg *pg, u8 port, u8 offset)
-{
-	const u8 *buf = pg->ucsi_read_buffer;
-	u32 cci = get_unaligned_le32(buf + 4);
-	u8 len = (cci & UCSI_CCI_DATA_LENGTH_MASK) >> UCSI_CCI_DATA_LENGTH_SHIFT;
-	u16 svid0 = get_unaligned_le16(buf + 16);
-	u32 mid0 = get_unaligned_le32(buf + 18);
-	u16 svid1 = get_unaligned_le16(buf + 22);
-	u32 mid1 = get_unaligned_le32(buf + 24);
-
-	log_warning("pmic-glink: UCSI connector%u ALT_MODE off=%u len=%u mode0=svid:%04x mid:%08x mode1=svid:%04x mid:%08x\n",
-		    port + 1, offset, len, svid0, mid0, svid1, mid1);
-	qpg_log_ucsi_raw(pg, "ALT_MODE");
-}
-
-static int qpg_send_ucsi_write(struct qpg *pg, const u8 *write_buffer)
-{
-	struct qpg_ucsi_write_buffer_req req = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_USB_TYPE_C),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(UCSI_WRITE_BUFFER_REQ),
-	};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int ret;
-
-	memcpy(req.write_buffer, write_buffer, UCSI_BUFFER_SIZE);
-	pg->ucsi_write_acked = false;
-	pg->ucsi_write_return_code = 0xffffffff;
-
-	if (req.write_buffer[8] == UCSI_CMD_SET_NOTIFICATION_ENABLE) {
-		log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u notify_mask=%04x\n",
-			    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
-			    req.write_buffer[8],
-			    get_unaligned_le16(req.write_buffer + 10));
-	} else {
-		log_warning("pmic-glink: owner=%u channel=%s UCSI_WRITE_BUFFER_REQ cmd=%u b10=%u b11=%u b12=%u b13=%u\n",
-			    PMIC_GLINK_OWNER_USB_TYPE_C, QPG_CHANNEL_NAME,
-			    req.write_buffer[8], req.write_buffer[10],
-			    req.write_buffer[11], req.write_buffer[12],
-			    req.write_buffer[13]);
-	}
-
-	ret = qpg_send_data(pg, &req, sizeof(req));
-	log_warning("pmic-glink: send UCSI_WRITE_BUFFER_REQ ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_drain_until(pg, &altmode, qpg_done_ucsi_write, 1000);
-	log_warning("pmic-glink: wait UCSI_WRITE_BUFFER ret=%d ack=%d code=%u\n",
-		    ret, pg->ucsi_write_acked, pg->ucsi_write_return_code);
-
-	return ret;
-}
-
-static u32 qpg_ucsi_cci(struct qpg *pg)
-{
-	return get_unaligned_le32(pg->ucsi_read_buffer + 4);
-}
-
-static u16 qpg_ucsi_version(struct qpg *pg)
-{
-	return get_unaligned_le16(pg->ucsi_read_buffer + 0);
-}
-
-static int qpg_ucsi_send_control(struct qpg *pg, u64 control)
-{
-	u8 write_buffer[UCSI_BUFFER_SIZE] = {};
-
-	put_unaligned_le64(control, write_buffer + 8);
-	return qpg_send_ucsi_write(pg, write_buffer);
-}
-
-static u8 qpg_ucsi_connector_change(struct qpg *pg)
-{
-	return (qpg_ucsi_cci(pg) & UCSI_CCI_CONNECTOR_CHANGE_MASK) >>
-	       UCSI_CCI_CONNECTOR_CHANGE_SHIFT;
-}
-
-static int qpg_wait_ucsi_cci(struct qpg *pg, u32 old_cci, u32 timeout_ms)
-{
-	ulong start = get_timer(0);
-	u32 cci;
-	int ret;
-
-	do {
-		ret = qpg_send_ucsi_read(pg);
-		if (ret)
-			return ret;
-
-		cci = qpg_ucsi_cci(pg);
-		if (cci != old_cci &&
-		    (cci & (UCSI_CCI_COMMAND_COMPLETE |
-			    UCSI_CCI_ERROR |
-			    UCSI_CCI_NOT_SUPPORTED |
-			    UCSI_CCI_RESET_COMPLETE))) {
-			log_warning("pmic-glink: UCSI command CCI ready cci=%08x notify_seen=%d notify=%08x\n",
-				    cci, pg->ucsi_notify_seen,
-				    pg->ucsi_notification);
-			return 0;
-		}
-
-		mdelay(20);
-	} while (get_timer(start) < timeout_ms);
-
-	cci = qpg_ucsi_cci(pg);
-	log_warning("pmic-glink: UCSI command CCI timeout cci=%08x notify_seen=%d notify=%08x\n",
-		    cci, pg->ucsi_notify_seen, pg->ucsi_notification);
-
-	return -ETIMEDOUT;
-}
-
-static int qpg_send_ucsi_ack_cc_ci(struct qpg *pg, bool connector_change,
-				   bool command_complete)
-{
-	u16 d2 = 0;
-	ulong start;
-	u32 cci;
-	int ret;
-
-	if (connector_change)
-		d2 |= UCSI_ACK_CC_CI_CONNECTOR_CHANGE;
-	if (command_complete)
-		d2 |= UCSI_ACK_CC_CI_COMMAND_COMPLETE;
-
-	ret = qpg_ucsi_send_control(pg,
-		UCSI_CTRL_D2(UCSI_CMD_ACK_CC_CI, d2));
-	log_warning("pmic-glink: UCSI ACK_CC_CI ret=%d connector=%d command=%d\n",
-		    ret, connector_change, command_complete);
-	if (ret)
-		return ret;
-
-	/*
-	 * Linux parity: block until ACK_COMPLETE appears in CCI.
-	 * ucsi_acknowledge() in Linux uses sync_control which waits
-	 * for command completion.  Use 5000 ms.
-	 */
-	start = get_timer(0);
-	do {
-		mdelay(20);
-		if (get_timer(start) >= 5000)
-			break;
-		ret = qpg_send_ucsi_read(pg);
-		if (ret)
-			return ret;
-		cci = qpg_ucsi_cci(pg);
-		if (cci & UCSI_CCI_ACK_COMPLETE) {
-			log_warning("pmic-glink: UCSI ACK_CC_CI complete cci=%08x\n",
-				    cci);
-			return 0;
-		}
-	} while (1);
-
-	log_warning("pmic-glink: UCSI ACK_CC_CI timeout cci=%08x\n",
-		    qpg_ucsi_cci(pg));
-	return -ETIMEDOUT;
-}
-
-static int qpg_send_ucsi_command(struct qpg *pg, u8 command, u8 port,
-				 u16 arg16, bool ack)
-{
-	u64 control = UCSI_CTRL_CMD(command);
-	u32 old_cci = qpg_ucsi_cci(pg);
-	int ret;
-
-	if (command == UCSI_CMD_GET_CONNECTOR_CAPABILITY ||
-	    command == UCSI_CMD_GET_CONNECTOR_STATUS)
-		control |= (u64)(port + 1) << 16;
-	else if (command == UCSI_CMD_GET_CAM_SUPPORTED ||
-		 command == UCSI_CMD_GET_CURRENT_CAM)
-		control |= (u64)(port + 1) << 16;
-	else if (command == UCSI_CMD_SET_NOTIFICATION_ENABLE)
-		control |= (u64)arg16 << 16;
-
-	pg->ucsi_notify_seen = false;
-	pg->ucsi_notification = 0;
-
-	ret = qpg_ucsi_send_control(pg, control);
-	if (ret)
-		return ret;
-
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
-	if (ret)
-		return ret;
-
-	if (ack) {
-		ret = qpg_send_ucsi_ack_cc_ci(pg,
-					      qpg_ucsi_connector_change(pg),
-					      true);
-		if (ret)
-			return ret;
-	}
-
-	return ret;
-}
-
-static int qpg_send_ucsi_ppm_reset(struct qpg *pg)
-{
-	ulong start;
-	u32 cci;
-	int ret;
-
-	/*
-	 * Linux parity: if RESET_COMPLETE is already set, clear stale
-	 * state by sending SET_NOTIFICATION_ENABLE with no mask before
-	 * issuing a fresh reset (ucsi_reset_ppm() in Linux).
-	 */
-	ret = qpg_send_ucsi_read(pg);
-	if (ret)
-		return ret;
-	cci = qpg_ucsi_cci(pg);
-	if (cci & UCSI_CCI_RESET_COMPLETE) {
-		ret = qpg_ucsi_send_control(pg,
-			UCSI_CTRL_CMD(UCSI_CMD_SET_NOTIFICATION_ENABLE));
-		if (ret)
-			return ret;
-
-		start = get_timer(0);
-		do {
-			mdelay(20);
-			ret = qpg_send_ucsi_read(pg);
-			if (ret)
-				return ret;
-			cci = qpg_ucsi_cci(pg);
-			if (cci & UCSI_CCI_COMMAND_COMPLETE)
-				break;
-		} while (get_timer(start) < 10000);
-
-		if (!(cci & UCSI_CCI_COMMAND_COMPLETE)) {
-			log_warning("pmic-glink: UCSI stale-reset-clear timeout cci=%08x\n",
-				    cci);
-			return -ETIMEDOUT;
-		}
-		/* ACK the completion, then proceed to new reset */
-		ret = qpg_ucsi_send_control(pg,
-			UCSI_CTRL_D2(UCSI_CMD_ACK_CC_CI,
-				     UCSI_ACK_CC_CI_COMMAND_COMPLETE));
-		if (ret)
-			return ret;
-	}
-
-	/* Issue PPM_RESET */
-	ret = qpg_ucsi_send_control(pg, UCSI_CTRL_CMD(UCSI_CMD_PPM_RESET));
-	if (ret)
-		return ret;
-
-	/*
-	 * Linux-aligned: 10000 ms timeout, 20 ms poll interval.
-	 * Does NOT require cci != old_cci — only waits for RESET_COMPLETE.
-	 * If CCI has non-reset bits while pending, reissue PPM_RESET
-	 * (ucsi_reset_ppm() in Linux reissues on spurious CCI).
-	 */
-	start = get_timer(0);
-	for (;;) {
-		mdelay(20);
-		ret = qpg_send_ucsi_read(pg);
-		if (ret)
-			return ret;
-		cci = qpg_ucsi_cci(pg);
-
-		if (cci & UCSI_CCI_RESET_COMPLETE) {
-			log_warning("pmic-glink: UCSI PPM_RESET complete cci=%08x\n",
-				    cci);
-			return 0;
-		}
-
-		/* CCI has non-reset bits — reissue PPM_RESET (Linux parity) */
-		if (cci & ~UCSI_CCI_RESET_COMPLETE) {
-			log_warning("pmic-glink: UCSI PPM_RESET reissue cci=%08x\n",
-				    cci);
-			ret = qpg_ucsi_send_control(pg,
-				UCSI_CTRL_CMD(UCSI_CMD_PPM_RESET));
-			if (ret)
-				return ret;
-		}
-
-		if (get_timer(start) >= 10000) {
-			log_warning("pmic-glink: UCSI PPM_RESET timeout cci=%08x\n",
-				    cci);
-			return -ETIMEDOUT;
-		}
-	}
-}
-
-static int qpg_send_ucsi_get_capability(struct qpg *pg)
-{
-	int ret;
-
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CAPABILITY, 0, 0, true);
-	if (!ret)
-		qpg_log_ucsi_capability(pg);
-
-	return ret;
-}
-
-static int qpg_send_ucsi_get_connector_capability(struct qpg *pg, u8 port)
-{
-	int ret;
-
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CONNECTOR_CAPABILITY,
-				    port, 0, true);
-	if (!ret)
-		qpg_log_ucsi_connector_capability(pg, port);
-
-	return ret;
-}
-
-static int qpg_send_ucsi_get_cam_supported(struct qpg *pg, u8 port)
-{
-	int ret;
-
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CAM_SUPPORTED, port,
-				    0, true);
-	if (!ret)
-		qpg_log_ucsi_cam_supported(pg, port);
-
-	return ret;
-}
-
-static int qpg_send_ucsi_get_current_cam(struct qpg *pg, u8 port)
-{
-	int ret;
-
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CURRENT_CAM, port,
-				    0, true);
-	if (!ret)
-		qpg_log_ucsi_current_cam(pg, port);
-
-	return ret;
-}
-
-static int qpg_send_ucsi_get_alternate_mode(struct qpg *pg, u8 port,
-					    u8 offset, u8 count)
-{
-	/*
-	 * Byte layout matches the original ad-hoc write:
-	 *   byte 10 = recipient (connector=0)
-	 *   byte 11 = connector number (port+1)
-	 *   byte 12 = alternate mode offset
-	 *   byte 13 = number of alternate modes - 1
-	 * d2 bits 16-23 = byte 10, bits 24-31 = byte 11
-	 * d4 bits 32-39 = byte 12, bits 40-47 = byte 13
-	 */
-	u16 d2 = (u16)(port + 1) << 8;
-	u32 d4 = (u32)offset | ((u32)(count ? count - 1 : 0) << 8);
-	u64 control = UCSI_CTRL_D2_D4(UCSI_CMD_GET_ALTERNATE_MODE, d2, d4);
-	u32 old_cci = qpg_ucsi_cci(pg);
-	int ret;
-
-	pg->ucsi_notify_seen = false;
-	pg->ucsi_notification = 0;
-
-	ret = qpg_ucsi_send_control(pg, control);
-	if (ret)
-		return ret;
-
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
-	if (ret)
-		return ret;
-
-	ret = qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
-	if (ret)
-		return ret;
-
-	qpg_log_ucsi_alternate_mode(pg, port, offset);
-
-	return 0;
-}
-
-static int qpg_send_ucsi_get_connector_status(struct qpg *pg, u8 port)
-{
-	int ret;
-
-	ret = qpg_send_ucsi_command(pg, UCSI_CMD_GET_CONNECTOR_STATUS, port,
-				    0, true);
-	if (!ret)
-		qpg_log_ucsi_connector_status(pg, port);
-
-	return ret;
-}
-
-/*
- * UCSI CONNECTOR_RESET (command 0x03).  The control word byte 2 holds the
- * connector number in bits[0:6] and the Hard Reset flag in bit[7], i.e.
- * d2 (bits 16-31 of the LE control u64) = (connector | hard<<7).
- *
- * On this platform the Type-C/PD policy engine and the DisplayPort Enter_Mode
- * VDM run autonomously on the ADSP; there is no AP "enter DP" opcode.  A
- * connector reset is the one AP-driven lever that forces the partner to
- * re-attach so the ADSP re-runs PD negotiation + alt-mode discovery + DP
- * Enter_Mode, this time with PAN notifications enabled and ACKed.
- */
-static int qpg_send_ucsi_connector_reset(struct qpg *pg, u8 port, bool hard)
-{
-	u16 d2 = (u16)((port + 1) & 0x7f) | (hard ? 0x80 : 0);
-	u64 control = UCSI_CTRL_D2(UCSI_CMD_CONNECTOR_RESET, d2);
-	u32 old_cci = qpg_ucsi_cci(pg);
-	int ret;
-
-	log_warning("pmic-glink: UCSI CONNECTOR_RESET connector=%u hard=%d\n",
-		    port + 1, hard);
-
-	pg->ucsi_notify_seen = false;
-	pg->ucsi_notification = 0;
-
-	ret = qpg_ucsi_send_control(pg, control);
-	if (ret)
-		return ret;
-
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
-	log_warning("pmic-glink: UCSI CONNECTOR_RESET cci ret=%d cci=%08x\n",
-		    ret, qpg_ucsi_cci(pg));
-	if (ret)
-		return ret;
-
-	return qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
-}
-
-/*
- * UCSI SET_UOR (command 0x09) — set USB Operation Role.  Control byte layout
- * (per the ADSP ucsi.h): ConnectorNumber bits[22:16], USBOpRoleDFP bit[23],
- * USBOpRoleUFP bit[24], USBOpRoleDualRole bit[25].  So d2 (bits 16-31 of the
- * LE control u64) = connector | (DFP?0x80:UFP?0x100).
- *
- * Why: the connector status reports partner_type=1 (a DFP is attached), i.e.
- * the Tachyon is operating as the UFP/device.  A UFP never initiates the
- * DisplayPort Enter_Mode VDM — only a DFP (host) drives DP to a sink.  This
- * requests a data-role swap to DFP so the ADSP DPM will run DP alt-mode.
- */
-static int qpg_send_ucsi_set_uor(struct qpg *pg, u8 port, bool dfp)
-{
-	/*
-	 * SET_UOR command word (the >>16 D2 half): bit[0:6]=connector,
-	 * bit7=DFP role, bit8=UFP role, bit9=ACCEPT_ROLE_SWAPS.
-	 *
-	 * Linux ALWAYS ORs in ACCEPT_ROLE_SWAPS (ucsi.c
-	 * UCSI_SET_UOR_ACCEPT_ROLE_SWAPS = BIT(25) = bit9 of this word).  That
-	 * is the crux of Linux's sink-side data-role path: as a power sink we
-	 * attach UFP, and the dock (a downstream hub = UFP partner) drives the
-	 * DR_Swap to make us DFP — but the PD engine only completes it if we've
-	 * said we accept role swaps.  Our old SET_UOR set the target role but
-	 * NOT the accept bit, so the swap never stuck, DataRole stayed UFP, and
-	 * the ADSP DP-discovery gate (pe_snk.c: PD SUCCESS && DataRole==DFP &&
-	 * ContractState==TBD) never fired.  Match Linux: always accept swaps.
-	 */
-	u16 d2 = (u16)((port + 1) & 0x7f) | (dfp ? 0x80 : 0x100) | 0x200;
-	u64 control = UCSI_CTRL_D2(UCSI_CMD_SET_UOR, d2);
-	u32 old_cci = qpg_ucsi_cci(pg);
-	int ret;
-
-	log_warning("pmic-glink: UCSI SET_UOR connector=%u role=%s\n",
-		    port + 1, dfp ? "DFP" : "UFP");
-
-	pg->ucsi_notify_seen = false;
-	pg->ucsi_notification = 0;
-
-	ret = qpg_ucsi_send_control(pg, control);
-	if (ret)
-		return ret;
-
-	ret = qpg_wait_ucsi_cci(pg, old_cci, 5000);
-	log_warning("pmic-glink: UCSI SET_UOR cci ret=%d cci=%08x\n",
-		    ret, qpg_ucsi_cci(pg));
-	if (ret)
-		return ret;
-
-	return qpg_send_ucsi_ack_cc_ci(pg, qpg_ucsi_connector_change(pg), true);
-}
-
-/*
- * Service a pending UCSI connector-change notification by reading connector
- * status (which ACKs the change via ACK_CC_CI).  If the AP never drains and
- * ACKs connector-changes the PPM stays busy with the change pending and the
- * ADSP can stop emitting further alt-mode (DP) updates, so this must run
- * whenever we are waiting for DP to come up.  Returns true if serviced.
- */
-static bool qpg_service_ucsi_change(struct qpg *pg)
-{
-	if (!pg->ucsi_notify_seen)
-		return false;
-
-	pg->ucsi_notify_seen = false;
-	log_warning("pmic-glink: UCSI connector-change cci=%08x; reading status\n",
-		    pg->ucsi_notification);
-	qpg_send_ucsi_get_connector_status(pg, 0);
-
-	return true;
-}
-
-static int qpg_enable_ucsi_notifications_phase2(struct qpg *pg)
-{
-	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase2 mask=%04x\n",
-		    QPG_UCSI_NTFY_ALL);
-	return qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
-				     QPG_UCSI_NTFY_ALL, true);
-}
-
-static int qpg_enable_ucsi_notifications(struct qpg *pg)
-{
-	u16 phase1_mask;
-
-	phase1_mask = QPG_UCSI_NTFY_CMD_COMPLETE | QPG_UCSI_NTFY_ERROR;
-	log_warning("pmic-glink: UCSI SET_NOTIFICATION_ENABLE phase1 mask=%04x\n",
-		    phase1_mask);
-	return qpg_send_ucsi_command(pg, UCSI_CMD_SET_NOTIFICATION_ENABLE, 0,
-				     phase1_mask, true);
-}
-
-static int qpg_ucsi_prewarm(struct qpg *pg)
-{
-	u16 version;
-	int ret;
-
-	if (pg->ucsi_prewarmed)
-		return 0;
-
-	if (qpg_env_bool("qpg_skip_ucsi_prewarm")) {
-		log_warning("pmic-glink: UCSI prewarm skipped by env\n");
-		return 0;
-	}
-
-	log_warning("pmic-glink: UCSI prewarm begin\n");
-
-	/* Read UCSI version first (Linux parity: ucsi_register does this) */
-	ret = qpg_send_ucsi_read(pg);
-	if (!ret) {
-		version = qpg_ucsi_version(pg);
-		log_warning("pmic-glink: UCSI version = 0x%04x\n", version);
-	}
-
-	ret = qpg_send_ucsi_ppm_reset(pg);
-	log_warning("pmic-glink: UCSI prewarm PPM_RESET ret=%d\n", ret);
-	if (ret) {
-		/*
-		 * Non-fatal during bring-up: continue with diagnostic UCSI
-		 * init so we can see whether later commands succeed after
-		 * a reset timeout.
-		 */
-		log_warning("pmic-glink: PPM_RESET failed, continuing diagnostic UCSI init\n");
-	}
-
-	ret = qpg_enable_ucsi_notifications(pg);
-	log_warning("pmic-glink: UCSI prewarm notifications phase1 ret=%d\n",
-		    ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_send_ucsi_get_capability(pg);
-	log_warning("pmic-glink: UCSI prewarm capability ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_send_ucsi_get_connector_capability(pg, 0);
-	log_warning("pmic-glink: UCSI prewarm connector capability ret=%d\n",
-		    ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_send_ucsi_get_connector_status(pg, 0);
-	log_warning("pmic-glink: UCSI prewarm connector status ret=%d\n",
-		    ret);
-	if (ret)
-		return ret;
-
-	ret = qpg_enable_ucsi_notifications_phase2(pg);
-	log_warning("pmic-glink: UCSI prewarm notifications phase2 ret=%d\n",
-		    ret);
-	if (ret)
-		return ret;
-
-	pg->ucsi_prewarmed = true;
-	log_warning("pmic-glink: UCSI prewarm complete\n");
-
-	return 0;
-}
-
 static int qpg_init(struct qpg *pg)
 {
 	ofnode adsp;
@@ -3054,7 +1394,17 @@ static int qpg_init(struct qpg *pg)
 	bool tx_exists;
 	int ret;
 
-	qpg_last_adsp_boot_ret = -EINPROGRESS;
+	/*
+	 * Hard dependency: the GLINK transport must never open without the ADSP
+	 * remoteproc running.  The board boots the ADSP independently at boot
+	 * (board_late_init() -> qcom_adsp_pas_boot()); this call *ensures* it is
+	 * up before we touch GLINK and refuses to proceed otherwise.
+	 * qcom_adsp_pas_boot() is idempotent (returns 0 immediately when the ADSP
+	 * is already booted), so in the normal flow this is just the dependency
+	 * guard, but it also covers the case where the early boot was skipped or
+	 * failed.
+	 */
+	pg->last_adsp_boot_ret = -EINPROGRESS;
 
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
 	log_warning("pmic-glink: smem lookup ret=%d smem=%p\n",
@@ -3063,8 +1413,8 @@ static int qpg_init(struct qpg *pg)
 		return ret;
 
 	ret = qcom_adsp_pas_boot();
-	qpg_last_adsp_boot_ret = ret;
-	log_warning("pmic-glink: ADSP PAS boot ret=%d\n", ret);
+	pg->last_adsp_boot_ret = ret;
+	log_warning("pmic-glink: ADSP dependency ensure ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -3165,12 +1515,16 @@ static int qpg_init(struct qpg *pg)
 	return 0;
 }
 
-static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
+int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 			    int *adsp_boot_retp, int *glink_open_retp,
 			    int *pan_en_retp)
 {
 	u32 liid;
 	int ret;
+	struct qpg *pg = qpg_session_get();
+
+	if (!pg)
+		return -ENODEV;
 
 	if (adsp_boot_retp)
 		*adsp_boot_retp = -EINPROGRESS;
@@ -3179,13 +1533,13 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	if (pan_en_retp)
 		*pan_en_retp = -EINPROGRESS;
 
-	if (qpg_session_ready) {
+	if (pg->session_ready) {
 		log_warning("pmic-glink: reusing session lcid=%u rcid=%u rx_tail=%08x rx_head=%08x\n",
-			    qpg_session.lcid, qpg_session.rcid,
-			    le32_to_cpu(*qpg_session.rx_tail),
-			    le32_to_cpu(*qpg_session.rx_head));
-		qpg_cached_state.service_started = true;
-		qpg_cached_state.pan_enabled = true;
+			    pg->lcid, pg->rcid,
+			    le32_to_cpu(*pg->rx_tail),
+			    le32_to_cpu(*pg->rx_head));
+		pg->cached_state.service_started = true;
+		pg->cached_state.pan_enabled = true;
 		if (adsp_boot_retp)
 			*adsp_boot_retp = 0;
 		if (glink_open_retp)
@@ -3195,21 +1549,37 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 		return 0;
 	}
 
-	memset(&qpg_session, 0, sizeof(qpg_session));
-	memset(&qpg_cached_state, 0, sizeof(qpg_cached_state));
-	qpg_last_ucsi_prewarm_ret = -EINPROGRESS;
+	/*
+	 * Reset the transport/session state for a fresh open, but PRESERVE the
+	 * cached alt-mode result across the (re)open. Before the session statics
+	 * were folded into struct qpg, qpg_cached_altmode/_valid were file-scope
+	 * statics that the open path never cleared, so a DP notify parsed during
+	 * a previous (possibly failed) open survived into a retry. The whole-
+	 * struct memset would otherwise discard it -- save and restore to keep
+	 * the original behavior on the failed-open-then-retry path.
+	 */
+	{
+		struct qcom_pmic_glink_altmode saved_altmode = pg->cached_altmode;
+		bool saved_altmode_valid = pg->cached_altmode_valid;
 
-	ret = qpg_init(&qpg_session);
+		memset(pg, 0, sizeof(*pg));
+		pg->cached_altmode = saved_altmode;
+		pg->cached_altmode_valid = saved_altmode_valid;
+	}
+	memset(&pg->cached_state, 0, sizeof(pg->cached_state));
+	pg->last_ucsi_prewarm_ret = -EINPROGRESS;
+
+	ret = qpg_init(pg);
 	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
 	if (adsp_boot_retp)
-		*adsp_boot_retp = qpg_last_adsp_boot_ret;
+		*adsp_boot_retp = pg->last_adsp_boot_ret;
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
 		return ret;
 	}
 
-	ret = qpg_send_version(&qpg_session);
+	ret = qpg_send_version(pg);
 	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
 	if (ret) {
 		if (glink_open_retp)
@@ -3217,9 +1587,9 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 		return ret;
 	}
 
-	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_version, 1000);
+	ret = qpg_drain_until(pg, altmode, qpg_done_version, 1000);
 	log_warning("pmic-glink: wait VERSION_ACK ret=%d version_acked=%d\n",
-		    ret, qpg_session.version_acked);
+		    ret, pg->version_acked);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
@@ -3237,39 +1607,39 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	 * We never send local OPEN before the remote has advertised the
 	 * channel.
 	 */
-	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_remote_opened,
+	ret = qpg_drain_until(pg, altmode, qpg_done_remote_opened,
 			      2000);
 	log_warning("pmic-glink: wait remote OPEN ret=%d remote_opened=%d rcid=%u\n",
-		    ret, qpg_session.remote_opened, qpg_session.rcid);
+		    ret, pg->remote_opened, pg->rcid);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
 		return ret;
 	}
 
-	ret = qpg_service_pmic_open(&qpg_session);
+	ret = qpg_service_pmic_open(pg);
 	log_warning("pmic-glink: service PMIC OPEN ret=%d local_sent=%d remote_acked=%d\n",
-		    ret, qpg_session.local_open_sent,
-		    qpg_session.remote_open_acked);
+		    ret, pg->local_open_sent,
+		    pg->remote_open_acked);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
 		return ret;
 	}
 
-	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_open, 2000);
+	ret = qpg_drain_until(pg, altmode, qpg_done_open, 2000);
 	log_warning("pmic-glink: wait local OPEN_ACK ret=%d open_acked=%d\n",
-		    ret, qpg_session.open_acked);
+		    ret, pg->open_acked);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
 		return ret;
 	}
 
-	liid = qpg_alloc_liid(&qpg_session);
-	ret = qpg_send_rx_intent_for(&qpg_session, qpg_session.lcid, liid);
+	liid = qpg_alloc_liid(pg);
+	ret = qpg_send_rx_intent_for(pg, pg->lcid, liid);
 	log_warning("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
-		    ret, qpg_session.lcid, liid);
+		    ret, pg->lcid, liid);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
@@ -3290,18 +1660,18 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	 * qpg_no_prewarm=1 skips it for experiments.
 	 */
 	if (!qpg_env_bool("qpg_no_prewarm")) {
-		ret = qpg_ucsi_prewarm(&qpg_session);
-		qpg_last_ucsi_prewarm_ret = ret;
+		ret = qpg_ucsi_prewarm(pg);
+		pg->last_ucsi_prewarm_ret = ret;
 		if (ret)
 			log_warning("pmic-glink: UCSI prewarm failed ret=%d; continuing PAN\n",
 				    ret);
 	} else {
-		qpg_last_ucsi_prewarm_ret = -ENOENT;
+		pg->last_ucsi_prewarm_ret = -ENOENT;
 		log_warning("pmic-glink: UCSI prewarm SKIPPED (qpg_no_prewarm set)\n");
 	}
 
-	qpg_session.pan_acked = false;
-	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
+	pg->pan_acked = false;
+	ret = qpg_send_altmode_req(pg, ALTMODE_PAN_EN, 0);
 	log_warning("pmic-glink: send PAN_EN ret=%d\n", ret);
 	if (ret) {
 		if (pan_en_retp)
@@ -3309,9 +1679,9 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 		return ret;
 	}
 
-	ret = qpg_drain_until(&qpg_session, altmode, qpg_done_pan_ack, 1000);
+	ret = qpg_drain_until(pg, altmode, qpg_done_pan_ack, 1000);
 	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
-		    ret, qpg_session.pan_acked);
+		    ret, pg->pan_acked);
 	if (pan_en_retp)
 		*pan_en_retp = ret;
 	if (ret)
@@ -3324,763 +1694,85 @@ static int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	 * see whether this unblocks DP alt-mode entry.
 	 */
 	if (qpg_env_bool("qpg_enable_battmgr"))
-		qpg_register_battmgr(&qpg_session);
+		qpg_register_battmgr(pg);
 
-	qpg_session_ready = true;
-	qpg_cached_state.service_started = true;
-	qpg_cached_state.pan_enabled = true;
+	/*
+	 * Second, post-PAN UCSI sequence — the same one the manual `qpg ucsi`
+	 * command ran after opening the session. Prewarm (above, before PAN_EN)
+	 * is required but not sufficient: this post-PAN pass is what actually
+	 * drives the ADSP to enter DisplayPort alt mode. Best-effort, so a
+	 * hiccup here does not tear down an otherwise-open session. Disable with
+	 * qpg_no_ucsi_discover=1 for experiments.
+	 */
+	if (!qpg_env_bool("qpg_no_ucsi_discover")) {
+		int disc = qpg_ucsi_discover(pg);
 
-	return 0;
-}
+		log_warning("pmic-glink: UCSI discover ret=%d\n", disc);
+	}
 
-int qcom_pmic_glink_altmode_start(void)
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	int ret;
-
-	log_warning("qpg: service start\n");
-
-	ret = qpg_open_session(&altmode, NULL, NULL, NULL);
-	log_warning("qpg: service start ret=%d\n", ret);
-	if (ret)
-		return ret;
-
-	qpg_cached_state.service_started = true;
-	qpg_cached_state.pan_enabled = true;
+	pg->session_ready = true;
+	pg->cached_state.service_started = true;
+	pg->cached_state.pan_enabled = true;
 
 	return 0;
 }
 
-int qcom_pmic_glink_altmode_poll(struct qcom_pmic_glink_altmode_state *state,
-				 uint timeout_ms)
+static int qcom_pmic_glink_probe(struct udevice *dev)
 {
-	struct qcom_pmic_glink_altmode altmode = {};
-	ulong start;
-	bool progressed = false;
+	return 0;
+}
+
+static int qcom_pmic_glink_bind(struct udevice *dev)
+{
+	struct udevice *child;
 	int ret;
 
-	if (!qpg_session_ready)
-		return -ENODEV;
-
-	start = get_timer(0);
-	for (;;) {
-		ret = qpg_poll(&qpg_session, &altmode);
-		if (!ret) {
-			progressed = true;
-			continue;
-		}
-		if (ret != -EAGAIN)
+	if (IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE)) {
+		ret = device_bind_driver(dev, "qcom_pmic_glink_altmode",
+					 "pmic_glink_altmode", &child);
+		if (ret)
 			return ret;
-
-		if (progressed || !timeout_ms)
-			break;
-
-		if (get_timer(start) >= timeout_ms) {
-			if (state)
-				*state = qpg_cached_state;
-			return qpg_cached_state.notify_seen ? 0 : -ETIMEDOUT;
-		}
-
-		udelay(1000);
 	}
 
-	qpg_cached_state.service_started = qpg_session_ready;
-	if (state)
-		*state = qpg_cached_state;
+	if (IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_UCSI)) {
+		ret = device_bind_driver(dev, "qcom_pmic_glink_ucsi",
+					 "pmic_glink_ucsi", &child);
+		if (ret)
+			return ret;
+	}
+
+	if (IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_BATTMGR)) {
+		ret = device_bind_driver(dev, "qcom_pmic_glink_battmgr",
+					 "pmic_glink_battmgr", &child);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
 
-const struct qcom_pmic_glink_altmode_state *
-qcom_pmic_glink_altmode_get_state(void)
-{
-	qpg_cached_state.service_started = qpg_session_ready;
+static const struct udevice_id qcom_pmic_glink_ids[] = {
+	{ .compatible = "qcom,pmic-glink" },
+	{ }
+};
 
-	return &qpg_cached_state;
-}
+U_BOOT_DRIVER(qcom_pmic_glink) = {
+	.name		= "qcom_pmic_glink",
+	.id		= UCLASS_PMIC_GLINK,
+	.of_match	= qcom_pmic_glink_ids,
+	.bind		= qcom_pmic_glink_bind,
+	.probe		= qcom_pmic_glink_probe,
+	.priv_auto	= sizeof(struct qpg),
+};
 
-bool qcom_pmic_glink_altmode_hpd_asserted(void)
-{
-	return qpg_cached_state.hpd;
-}
-
-int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
-{
-	int refresh_ret;
-	int ret;
-
-	if (!altmode)
-		return -EINVAL;
-
-	memset(altmode, 0, sizeof(*altmode));
-
-	log_warning("pmic-glink: get_altmode start\n");
-
-	ret = qcom_pmic_glink_altmode_start();
-	if (ret)
-		return ret;
-
-	ret = qcom_pmic_glink_altmode_poll(NULL, 0);
-	if (ret && ret != -ETIMEDOUT)
-		return ret;
-
-	if (!qpg_cached_altmode_valid) {
-		refresh_ret = qpg_refresh_usbc_pin_assignment(&qpg_session,
-							      altmode);
-		log_warning("pmic-glink: USBC pin refresh ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
-			    refresh_ret, altmode->dp, altmode->orientation,
-			    altmode->pin_assignment, altmode->hpd,
-			    altmode->hpd_irq);
-		if (refresh_ret)
-			return refresh_ret;
-	}
-
-	if (qpg_cached_altmode_valid)
-		*altmode = qpg_cached_altmode;
-
-	log_warning("pmic-glink: get_altmode ret=0 dp=%d orientation=%u pin=%u hpd=%d irq=%d state=%s\n",
-		    altmode->dp, altmode->orientation,
-		    altmode->pin_assignment, altmode->hpd,
-		    altmode->hpd_irq,
-		    qpg_public_typec_state_name(qpg_cached_state.typec_state));
-
-	return qpg_cached_altmode_valid ? 0 : -EAGAIN;
-}
+UCLASS_DRIVER(pmic_glink) = {
+	.name		= "pmic_glink",
+	.id		= UCLASS_PMIC_GLINK,
+};
 
 /*
- * E1 (audit): autonomous data-role swap to DFP for the cold DP path.
- *
- * Linux's sink path reaches DFP because the dock (a UFP/hub partner) drives the
- * DR_Swap and we accept it (now that SET_UOR carries ACCEPT_ROLE_SWAPS); if the
- * dock does NOT self-initiate, the host must request DFP itself.  The ADSP only
- * starts DP VDM discovery once DataRole==DFP.  So: if a DFP
- * partner is attached (we are UFP), issue ONE SET_UOR(DFP) and watch for the DP
- * notify — no PPM_RESET / connector-reset churn.  Returns 1 if DP entered.
- *
- * Called from the autonomous DP probe so `tachyon dp start` no longer requires a
- * manual `qpg bounce`.  Gate with tachyon_dp_auto_dfp=0 to keep it pure-passive.
+ * The client child drivers (altmode / UCSI / battmgr, UCLASS_MISC) live in
+ * pmic_glink_altmode.c / pmic_glink_ucsi.c / pmic_glink_battmgr.c. They are
+ * bound by name from qcom_pmic_glink_bind() above and reach the GLINK
+ * transport through this core via the shared struct qpg session.
  */
-int qcom_pmic_glink_request_dfp(u32 settle_ms)
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	struct qcom_pmic_glink_altmode_state state = {};
-	ulong start, last_notify_ms = 0;
-	u32 status;
-	u8 partner_type;
-	bool connected;
-	int ret;
-
-	ret = qpg_open_session(&altmode, NULL, NULL, NULL);
-	if (ret)
-		return ret;
-
-	/* Read the current connector role (partner_type bits [31:29]). */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	status = get_unaligned_le32(qpg_session.ucsi_read_buffer + 16);
-	connected = status & BIT(19);
-	partner_type = (status >> 29) & 0x7;
-	log_warning("qpg: auto-DFP connected=%u partner_type=%u (1=DFP attached, we are UFP)\n",
-		    connected, partner_type);
-
-	if (!connected || partner_type != 1) {
-		log_warning("qpg: auto-DFP skipped (no DFP partner to swap against)\n");
-		return 0;
-	}
-
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
-	log_warning("qpg: auto-DFP SET_UOR(DFP) ret=%d\n", ret);
-
-	if (!settle_ms)
-		settle_ms = 4000;
-	start = get_timer(0);
-	while (get_timer(start) < settle_ms) {
-		ret = qcom_pmic_glink_altmode_poll(&state, 20);
-		if (ret && ret != -ETIMEDOUT)
-			break;
-		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
-			last_notify_ms = state.last_notify_ms;
-			log_warning("qpg: auto-DFP notify mux=%u dpam=%02x hpd=%u dp_seen=%u\n",
-				    state.mux, state.dpam_raw, state.hpd,
-				    state.dp_seen);
-		}
-		if (state.dp_seen || state.mux == 3) {
-			log_warning("qpg: auto-DFP entered DP (mux=%u hpd=%u)\n",
-				    state.mux, state.hpd);
-			return 1;
-		}
-	}
-
-	log_warning("qpg: auto-DFP done dp_seen=%u mux=%u\n",
-		    state.dp_seen, state.mux);
-	return 0;
-}
-
-static int do_qpg_service(struct cmd_tbl *cmdtp, int flag, int argc,
-			  char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	ulong start;
-	ulong last_notify_ms = 0;
-	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2)
-		timeout_ms = simple_strtoul(argv[1], NULL, 0);
-	if (!timeout_ms)
-		timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
-
-	printf("qpg: service start\n");
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-
-	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
-	printf("qpg: GLINK open ret=%d\n", open_ret);
-	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
-	printf("qpg: PAN_EN ret=%d\n", pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	start = get_timer(0);
-	while (get_timer(start) < timeout_ms) {
-		ret = qcom_pmic_glink_altmode_poll(&state, 20);
-		if (ret && ret != -ETIMEDOUT)
-			break;
-
-		/* Keep the PPM unstuck so the ADSP keeps emitting updates. */
-		qpg_service_ucsi_change(&qpg_session);
-
-		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
-			last_notify_ms = state.last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-			       get_timer(start),
-			       qpg_public_typec_state_name(state.typec_state),
-			       state.svid, state.orientation_raw, state.mux,
-			       state.dpam_raw, state.linux_mux_mode,
-			       state.dp_pin_assignment, state.hpd,
-			       state.hpd_irq);
-			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
-			       get_timer(start), state.port, state.orientation,
-			       state.pin_assignment, state.dp_seen);
-		}
-	}
-
-	if (ret && ret != -ETIMEDOUT)
-		printf("qpg: service fatal ret=%d\n", ret);
-	else
-		printf("qpg: service timeout after %u ms\n", timeout_ms);
-
-	return ret && ret != -ETIMEDOUT ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-}
-
-static int do_qpg_reset(struct cmd_tbl *cmdtp, int flag, int argc,
-			char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	ulong start;
-	ulong last_notify_ms = 0;
-	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
-	bool hard = false;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2) {
-		if (!strcmp(argv[1], "hard"))
-			hard = true;
-		else
-			return CMD_RET_USAGE;
-	}
-
-	printf("qpg: reset start hard=%d\n", hard);
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
-	printf("qpg: GLINK open ret=%d\n", open_ret);
-	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
-	printf("qpg: PAN_EN ret=%d\n", pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	/* Snapshot connector state before the reset. */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, hard);
-	printf("qpg: CONNECTOR_RESET ret=%d hard=%d\n", ret, hard);
-
-	/*
-	 * After the reset the partner re-attaches and the ADSP re-runs PD
-	 * negotiation + alt-mode discovery + DP Enter_Mode.  Drain and ACK
-	 * altmode notifications while servicing UCSI connector-changes, and
-	 * watch for a DP notify (mux=DP/dpam=pin/hpd=1).
-	 */
-	start = get_timer(0);
-	while (get_timer(start) < timeout_ms) {
-		ret = qcom_pmic_glink_altmode_poll(&state, 20);
-		if (ret && ret != -ETIMEDOUT)
-			break;
-
-		qpg_service_ucsi_change(&qpg_session);
-
-		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
-			last_notify_ms = state.last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-			       get_timer(start),
-			       qpg_public_typec_state_name(state.typec_state),
-			       state.svid, state.orientation_raw, state.mux,
-			       state.dpam_raw, state.linux_mux_mode,
-			       state.dp_pin_assignment, state.hpd,
-			       state.hpd_irq);
-			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
-			       get_timer(start), state.port, state.orientation,
-			       state.pin_assignment, state.dp_seen);
-		}
-	}
-
-	/* Final connector + alt-mode snapshot. */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	qpg_send_ucsi_get_current_cam(&qpg_session, 0);
-
-	printf("qpg: reset done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
-	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
-
-	return CMD_RET_SUCCESS;
-}
-
-static int do_qpg_dfp(struct cmd_tbl *cmdtp, int flag, int argc,
-		      char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	ulong start;
-	ulong last_notify_ms = 0;
-	u32 timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2)
-		timeout_ms = simple_strtoul(argv[1], NULL, 0);
-	if (!timeout_ms)
-		timeout_ms = QPG_ALTMODE_TIMEOUT_MS;
-
-	printf("qpg: dfp start (request data-role swap to DFP/host)\n");
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
-	printf("qpg: GLINK open ret=%d\n", open_ret);
-	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
-	printf("qpg: PAN_EN ret=%d\n", pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	/* Snapshot connector role before the swap. */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
-	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
-
-	/* Confirm the swap took effect (partner should now read as UFP). */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	/*
-	 * The DPM runs DisplayPort VDM discovery at attach-as-DFP, not after a
-	 * mid-session role swap.  With the DFP preference now set, force a
-	 * fresh re-attach so the ADSP re-runs PD + alt-mode discovery as the
-	 * DFP/host and (hopefully) enters DP.
-	 */
-	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, false);
-	printf("qpg: CONNECTOR_RESET-after-DFP ret=%d\n", ret);
-	/* Re-assert DFP preference in case the re-attach reverted it. */
-	qpg_send_ucsi_set_uor(&qpg_session, 0, true);
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	start = get_timer(0);
-	while (get_timer(start) < timeout_ms) {
-		ret = qcom_pmic_glink_altmode_poll(&state, 20);
-		if (ret && ret != -ETIMEDOUT)
-			break;
-
-		qpg_service_ucsi_change(&qpg_session);
-
-		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
-			last_notify_ms = state.last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
-			       get_timer(start),
-			       qpg_public_typec_state_name(state.typec_state),
-			       state.svid, state.orientation_raw, state.mux,
-			       state.dpam_raw, state.linux_mux_mode,
-			       state.dp_pin_assignment, state.hpd,
-			       state.hpd_irq);
-			printf("t=%05lu state port=%u orient=%u pin=%u dp_seen=%u\n",
-			       get_timer(start), state.port, state.orientation,
-			       state.pin_assignment, state.dp_seen);
-		}
-	}
-
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	printf("qpg: dfp done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
-	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
-
-	return CMD_RET_SUCCESS;
-}
-
-static int do_qpg_ucsi(struct cmd_tbl *cmdtp, int flag, int argc,
-		       char *const argv[])
-{
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	int ret;
-
-	if (argc != 1)
-		return CMD_RET_USAGE;
-
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-
-	printf("ADSP boot: ret=%d\n", adsp_ret);
-	printf("GLINK open: ret=%d\n", open_ret);
-	printf("UCSI prewarm: ret=%d\n", qpg_last_ucsi_prewarm_ret);
-	printf("PAN_EN: ret=%d\n", pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_ppm_reset(&qpg_session);
-	printf("UCSI PPM_RESET: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_enable_ucsi_notifications(&qpg_session);
-	printf("UCSI notifications phase1: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_capability(&qpg_session);
-	printf("UCSI capability: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_connector_capability(&qpg_session, 0);
-	printf("UCSI connector capability: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	printf("UCSI connector status: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_cam_supported(&qpg_session, 0);
-	printf("UCSI CAM_SUPPORTED: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_current_cam(&qpg_session, 0);
-	printf("UCSI CURRENT_CAM: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_send_ucsi_get_alternate_mode(&qpg_session, 0, 0, 2);
-	printf("UCSI ALT_MODE: ret=%d\n", ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	ret = qpg_enable_ucsi_notifications_phase2(&qpg_session);
-	printf("UCSI notifications phase2: ret=%d\n", ret);
-
-	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-}
-
-/*
- * Settle helper: drain + ACK altmode notifications (and keep the UCSI PPM
- * unstuck) for ms milliseconds, printing any new notify.  Mirrors the passive
- * "sleep" windows in the userspace dp-renegotiate script.
- */
-static void qpg_bounce_settle(struct qcom_pmic_glink_altmode_state *state,
-			      ulong *last_notify_ms, u32 ms)
-{
-	ulong start = get_timer(0);
-
-	while (get_timer(start) < ms) {
-		int ret = qcom_pmic_glink_altmode_poll(state, 20);
-
-		if (ret && ret != -ETIMEDOUT)
-			break;
-
-		qpg_service_ucsi_change(&qpg_session);
-
-		if (state->notify_seen && state->last_notify_ms != *last_notify_ms) {
-			*last_notify_ms = state->last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u dp_seen=%u\n",
-			       get_timer(start),
-			       qpg_public_typec_state_name(state->typec_state),
-			       state->svid, state->mux, state->dpam_raw,
-			       state->linux_mux_mode, state->dp_pin_assignment,
-			       state->hpd, state->dp_seen);
-		}
-	}
-}
-
-/*
- * do_qpg_bounce: faithful replica of the working Linux userspace
- * dp-renegotiate "data-role bounce".  Empirically (journal + kprobe trace) this
- * is what makes the ADSP actually enter DisplayPort alt mode: the ADSP does NOT
- * enter DP autonomously even under Linux; a UCSI SET_UOR bounce UFP -> (settle)
- * -> DFP kicks the DPM into running the DP VDM.  Unlike "qpg dfp" this does NOT
- * issue a CONNECTOR_RESET (which reverts the role to UFP and defeats the bounce).
- */
-static int do_qpg_bounce(struct cmd_tbl *cmdtp, int flag, int argc,
-			 char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	ulong last_notify_ms = 0;
-	u32 settle_ms = 6000;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2)
-		settle_ms = simple_strtoul(argv[1], NULL, 0);
-	if (!settle_ms)
-		settle_ms = 6000;
-
-	printf("qpg: bounce start (data-role UFP->DFP, mirrors dp-renegotiate)\n");
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-	printf("qpg: ADSP boot ret=%d\n", adsp_ret);
-	printf("qpg: GLINK open ret=%d\n", open_ret);
-	printf("qpg: UCSI prewarm ret=%d\n", qpg_last_ucsi_prewarm_ret);
-	printf("qpg: PAN_EN ret=%d\n", pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	/*
-	 * Let the IPCRTR/qrtr HELLO + servreg REGISTER_LISTENER handshake for
-	 * charger_pd complete BEFORE the data-role bounce (mirrors Linux: servreg
-	 * is up at boot, dp-renegotiate bounces later).
-	 */
-	qpg_bounce_settle(&state, &last_notify_ms, 4000);
-	printf("qpg: servreg notifier_seen=%d registered=%d state=%u\n",
-	       qpg_session.servreg_notifier_seen, qpg_session.servreg_registered,
-	       qpg_session.servreg_last_state);
-
-	/* Snapshot connector role before the bounce. */
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	/* echo device > data_role  : SET_UOR(UFP) */
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, false);
-	printf("qpg: SET_UOR(UFP) ret=%d\n", ret);
-	qpg_bounce_settle(&state, &last_notify_ms, 1200);
-
-	/* echo host > data_role  : SET_UOR(DFP), then wait for DP to come up */
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
-	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
-	qpg_bounce_settle(&state, &last_notify_ms, settle_ms);
-
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	printf("qpg: bounce done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
-	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
-
-	return CMD_RET_SUCCESS;
-}
-
-/*
- * do_qpg_vdm: replicate the EXACT Linux UCSI "echo host" sequence that a live
- * kprobe trace showed actually re-enters DP, which our plain SET_UOR bounce does
- * NOT reproduce.  The ADSP only runs the DP Enter/Configure VDM when its policy
- * engine reaches DFP, and that field resets
- * ONLY on a fresh Type-C attach.  Linux's data-role swap to host triggers
- * PPM_RESET -> SET_NOTIFICATION_ENABLE (via the UCSI reinit) -> a HARD
- * CONNECTOR_RESET, which forces a full re-attach (the dock re-enumerates on USB)
- * discovery re-runs -> DP.  Crucially the PPM_RESET here
- * is MID-SESSION (after SET_UOR(UFP), before the connector reset) - prior tests
- * only ran PPM_RESET in the session prewarm.  PAN must be re-armed after the
- * reset (PPM_RESET clears bPANEn).
- */
-static int do_qpg_vdm(struct cmd_tbl *cmdtp, int flag, int argc,
-		      char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0, open_ret = 0, pan_ret = 0;
-	ulong last_notify_ms = 0;
-	u32 settle_ms = 6000;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2)
-		settle_ms = simple_strtoul(argv[1], NULL, 0);
-	if (!settle_ms)
-		settle_ms = 6000;
-
-	printf("qpg: vdm start (Linux echo-host: UFP -> PPM_RESET -> reinit -> CONNECTOR_RESET hard -> DFP)\n");
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-	printf("qpg: ADSP boot ret=%d GLINK ret=%d prewarm ret=%d PAN_EN ret=%d\n",
-	       adsp_ret, open_ret, qpg_last_ucsi_prewarm_ret, pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	/* servreg handshake (mirrors Linux: servreg up before the swap) */
-	qpg_bounce_settle(&state, &last_notify_ms, 4000);
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-
-	/* echo device > data_role : SET_UOR(UFP) */
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, false);
-	printf("qpg: SET_UOR(UFP) ret=%d\n", ret);
-	qpg_bounce_settle(&state, &last_notify_ms, 1200);
-
-	/* echo host > data_role, as the Linux UCSI core actually does it: */
-	ret = qpg_ucsi_prewarm(&qpg_session);	/* PPM_RESET + SET_NOTIFICATION + reinit */
-	printf("qpg: mid-session PPM_RESET/reinit ret=%d\n", ret);
-
-	ret = qpg_send_altmode_req(&qpg_session, ALTMODE_PAN_EN, 0);
-	printf("qpg: re-arm PAN_EN ret=%d\n", ret);
-	qpg_cached_state.pan_enabled = !ret;
-
-	ret = qpg_send_ucsi_connector_reset(&qpg_session, 0, true);
-	printf("qpg: CONNECTOR_RESET(hard) ret=%d\n", ret);
-	qpg_bounce_settle(&state, &last_notify_ms, 2000);
-
-	/* swap to DFP/host on the freshly re-attached connector, then wait for DP */
-	ret = qpg_send_ucsi_set_uor(&qpg_session, 0, true);
-	printf("qpg: SET_UOR(DFP) ret=%d\n", ret);
-	qpg_bounce_settle(&state, &last_notify_ms, settle_ms);
-
-	qpg_send_ucsi_get_connector_status(&qpg_session, 0);
-	printf("qpg: vdm done dp_seen=%u hpd=%u mux=%u dpam=%02x\n",
-	       state.dp_seen, state.hpd, state.mux, state.dpam_raw);
-
-	return CMD_RET_SUCCESS;
-}
-
-/*
- * do_qpg_listen: PASSIVE DP-entry listener, faithful to Linux's
- * pmic_glink_altmode — which ONLY subscribes (PAN_EN) and receives
- * USBC_NOTIFY_IND, never issuing UCSI / PPM_RESET / SET_UOR / CONNECTOR_RESET
- * on the DP path.  Opens the GLINK session (prewarm auto-skipped unless
- * qpg_prewarm=1), sends PAN_EN, then ONLY receives + auto-acks notifications
- * for the window — zero UCSI churn.  Attach the
- * dock FRESH during the window so the ADSP + dock complete the
- * data-role-swap-to-DFP + DP Enter-Mode VDM autonomously 
- * (PD SUCCESS && DataRole==DFP && ContractState==TBD).
- */
-static int do_qpg_listen(struct cmd_tbl *cmdtp, int flag, int argc,
-			 char *const argv[])
-{
-	struct qcom_pmic_glink_altmode_state state = {};
-	struct qcom_pmic_glink_altmode altmode = {};
-	int adsp_ret = 0;
-	int open_ret = 0;
-	int pan_ret = 0;
-	ulong start;
-	ulong last_notify_ms = 0;
-	u32 window_ms = 30000;
-	int ret;
-
-	if (argc > 2)
-		return CMD_RET_USAGE;
-	if (argc == 2)
-		window_ms = simple_strtoul(argv[1], NULL, 0);
-	if (!window_ms)
-		window_ms = 30000;
-
-	printf("qpg: listen PASSIVE (PAN_EN + receive only, like Linux pmic_glink_altmode)\n");
-
-	ret = qpg_open_session(&altmode, &adsp_ret, &open_ret, &pan_ret);
-	qpg_cached_state.service_started = !ret;
-	qpg_cached_state.pan_enabled = !ret;
-	printf("qpg: ADSP boot ret=%d GLINK ret=%d prewarm ret=%d PAN_EN ret=%d\n",
-	       adsp_ret, open_ret, qpg_last_ucsi_prewarm_ret, pan_ret);
-	if (ret)
-		return CMD_RET_FAILURE;
-
-	printf("qpg: >>> ATTACH THE DOCK NOW (fresh USB-C plug); waiting %u ms for mux=3 <<<\n",
-	       window_ms);
-
-	start = get_timer(0);
-	while (get_timer(start) < window_ms) {
-		ret = qcom_pmic_glink_altmode_poll(&state, 20);
-		if (ret && ret != -ETIMEDOUT)
-			break;
-
-		/*
-		 * PASSIVE: deliberately do NOT call qpg_service_ucsi_change()
-		 * here — no UCSI traffic at all, just receive + auto-ack PAN.
-		 */
-		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
-			last_notify_ms = state.last_notify_ms;
-			printf("t=%05lu notify %s svid=%04x orient_raw=%u mux=%u dpam=%02x dp_pin=%u hpd=%u dp_seen=%u\n",
-			       get_timer(start),
-			       qpg_public_typec_state_name(state.typec_state),
-			       state.svid, state.orientation_raw, state.mux,
-			       state.dpam_raw, state.dp_pin_assignment,
-			       state.hpd, state.dp_seen);
-			if (state.dp_seen || state.mux == 3)
-				printf("qpg: *** DP ENTERED PASSIVELY (mux=%u hpd=%u) — now run 'tachyon dp start' ***\n",
-				       state.mux, state.hpd);
-		}
-	}
-
-	printf("qpg: listen done dp_seen=%u mux=%u hpd=%u dpam=%02x\n",
-	       state.dp_seen, state.mux, state.hpd, state.dpam_raw);
-
-	return CMD_RET_SUCCESS;
-}
-
-static int do_qpg(struct cmd_tbl *cmdtp, int flag, int argc,
-		  char *const argv[])
-{
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "listen"))
-		return do_qpg_listen(cmdtp, flag, argc - 1, argv + 1);
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "vdm"))
-		return do_qpg_vdm(cmdtp, flag, argc - 1, argv + 1);
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "service"))
-		return do_qpg_service(cmdtp, flag, argc - 1, argv + 1);
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "reset"))
-		return do_qpg_reset(cmdtp, flag, argc - 1, argv + 1);
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "dfp"))
-		return do_qpg_dfp(cmdtp, flag, argc - 1, argv + 1);
-	if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "bounce"))
-		return do_qpg_bounce(cmdtp, flag, argc - 1, argv + 1);
-	if (argc == 2 && !strcmp(argv[1], "ucsi"))
-		return do_qpg_ucsi(cmdtp, flag, argc - 1, argv + 1);
-
-	return CMD_RET_USAGE;
-}
-
-U_BOOT_CMD(
-	qpg, 3, 1, do_qpg,
-	"Qualcomm PMIC-GLINK diagnostics",
-	"listen [ms] - PASSIVE (Linux-style): PAN_EN + receive only, no UCSI/reset; fresh-attach dock to enter DP\n"
-	"service [timeout_ms] - keep PMIC-GLINK altmode service alive and print notifications\n"
-	"reset [hard] - UCSI connector reset to force re-attach + DP alt-mode re-entry\n"
-	"dfp [timeout_ms] - UCSI SET_UOR data-role swap to DFP/host, then watch for DP\n"
-	"bounce [settle_ms] - data-role bounce UFP->DFP (mirrors dp-renegotiate) to enter DP\n"
-	"vdm [settle_ms] - full Linux echo-host seq (PPM_RESET+CONNECTOR_RESET hard) to force DP re-entry\n"
-	"ucsi - run UCSI reset/discovery diagnostics"
-);

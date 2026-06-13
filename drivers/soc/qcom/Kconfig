@@ -58,4 +58,32 @@ config QCOM_PMIC_GLINK
 	  GLINK-SMEM edge. This is used during early boot to query USB-C
 	  DisplayPort Alt Mode policy before initializing the display path.
 
+config QCOM_PMIC_GLINK_ALTMODE
+	bool "Type-C/DisplayPort alt-mode client for PMIC GLINK"
+	depends on QCOM_PMIC_GLINK
+	select QCOM_PMIC_GLINK_UCSI
+	default y
+	help
+	  Bind the PMIC-GLINK altmode child device that parses USB-C alt-mode
+	  notifications and drives the DisplayPort entry path. Provides the
+	  qcom_pmic_glink_altmode_*() API consumed by the Tachyon DP driver.
+	  Required for USB-C DisplayPort output.
+
+config QCOM_PMIC_GLINK_UCSI
+	bool "UCSI client for PMIC GLINK"
+	depends on QCOM_PMIC_GLINK
+	default y
+	help
+	  Bind the PMIC-GLINK UCSI child device used for connector status and
+	  the data-role swap (SET_UOR) needed to enter DisplayPort alt mode.
+
+config QCOM_PMIC_GLINK_BATTMGR
+	bool "Battery manager client for PMIC GLINK"
+	depends on QCOM_PMIC_GLINK
+	default n
+	help
+	  Bind the optional PMIC-GLINK battery-manager child device. Not needed
+	  for the USB-C/DisplayPort path; enable only if battery telemetry over
+	  PMIC-GLINK is required.
+
 endif # SOC_QCOM

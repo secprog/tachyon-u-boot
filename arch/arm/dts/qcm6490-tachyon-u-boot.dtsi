@@ -157,3 +157,9 @@
 &{/usb1-sbu-mux} {
 	bootph-all;
 };
+
+/* Bind the PMIC-GLINK core (UCLASS_PMIC_GLINK) early so the Type-C/DP path
+ * can reach the GLINK transport in whatever phase it probes. */
+&{/pmic-glink} {
+	bootph-all;
+};

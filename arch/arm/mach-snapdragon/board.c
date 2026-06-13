@@ -32,6 +32,7 @@
 #include <usb.h>
 #include <sort.h>
 #include <time.h>
+#include <soc/qcom/qcom_adsp_pas.h>
 
 #include "qcom-priv.h"
 
@@ -454,6 +455,21 @@ int board_late_init(void)
 
 	configure_env();
 	qcom_late_init();
+
+	/*
+	 * Bring up the ADSP remoteproc independently of pmic-glink so the
+	 * Type-C/DisplayPort GLINK path finds it already running.  Best-effort:
+	 * a boot failure must not abort U-Boot (the rest of the system still
+	 * boots, just without Type-C/DP).  qcom_adsp_pas_boot() is a no-op stub
+	 * when CONFIG_QCOM_ADSP_PAS is disabled.
+	 */
+	if (IS_ENABLED(CONFIG_QCOM_ADSP_PAS)) {
+		int adsp_ret = qcom_adsp_pas_boot();
+
+		if (adsp_ret)
+			log_warning("%s: ADSP PAS boot ret=%d (Type-C/DP unavailable)\n",
+				    __func__, adsp_ret);
+	}
 
 	/* Configure the dfu_string for capsule updates */
 	qcom_configure_capsule_updates();
