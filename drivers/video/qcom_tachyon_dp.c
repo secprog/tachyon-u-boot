@@ -7011,25 +7011,14 @@ static void tachyon_dp_quiesce(struct tachyon_dp_priv *priv)
 	tachyon_dp_disable_clocks(priv);
 }
 
-static int tachyon_dp_remove(struct udevice *dev)
-{
-	struct tachyon_dp_priv *priv = dev_get_priv(dev);
-
-	/*
-	 * Clean teardown at OS handoff.  A "seamless" handoff that leaves the DP
-	 * link live for the OS was tried and DISPROVEN on HW: Linux's msm_dpu
-	 * then fails its modeset ("Cannot find any crtc or sizes", DP-1 stays
-	 * disabled) and the dock is black for the whole boot.  And an early dock
-	 * log via earlycon=efifb is not possible here anyway -- booting through
-	 * GRUB loses the GOP linear-fb base, so the kernel registers efifb0 with
-	 * lfb_base=0 ("efifb0 at I/O port 0x0").  So tear DP down cleanly and let
-	 * msm_dpu bring DP-1 up itself; the kernel log then shows on the dock
-	 * (via console=tty0 / fbcon) once msm_dpu sets the mode.
-	 */
-	tachyon_dp_quiesce(priv);
-
-	return 0;
-}
+/*
+ * No .remove handler: DP is intentionally NOT torn down at ExitBootServices.
+ * The link is left trained and the framebuffer scanning out so Windows (which
+ * has no native Qualcomm DP/DPU driver) keeps a live GOP display across the
+ * handoff.  This intentionally breaks the Linux clean handoff (msm_dpu fails
+ * modeset "Cannot find any crtc or sizes", dock black on Linux boot) -- accepted.
+ * The err_quiesce path in the bringup code still quiesces on a failed train.
+ */
 
 static bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv);
 
@@ -8448,11 +8437,10 @@ U_BOOT_DRIVER(tachyon_dp) = {
 	.of_match	= tachyon_dp_ids,
 	.bind		= tachyon_dp_bind,
 	.probe		= tachyon_dp_probe,
-	.remove		= tachyon_dp_remove,
 	.ops		= &tachyon_dp_ops,
 	.priv_auto	= sizeof(struct tachyon_dp_priv),
 	.plat_auto	= sizeof(struct video_uc_plat),
-	.flags		= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE |
+	.flags		= DM_FLAG_PRE_RELOC |
 			  DM_FLAG_DEFAULT_PD_CTRL_OFF |
 			  DM_FLAG_DEFAULT_CLKS_OFF,
 };
