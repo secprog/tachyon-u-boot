@@ -49,7 +49,7 @@ int qpg_register_battmgr(struct qpg *pg)
 	};
 	int ret;
 
-	log_warning("pmic-glink: BATTMGR register: SET_OPERATIONAL_MODE\n");
+	log_debug("pmic-glink: BATTMGR register: SET_OPERATIONAL_MODE\n");
 	pg->battmgr_acked = false;
 	ret = qpg_send_data(pg, &opmode, sizeof(opmode));
 	if (ret) {
@@ -57,10 +57,10 @@ int qpg_register_battmgr(struct qpg *pg)
 		return ret;
 	}
 	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
-	log_warning("pmic-glink: BATTMGR opmode ack ret=%d acked=%d\n",
+	log_debug("pmic-glink: BATTMGR opmode ack ret=%d acked=%d\n",
 		    ret, pg->battmgr_acked);
 
-	log_warning("pmic-glink: BATTMGR register: SET_NOTIFICATION_CRITERIA\n");
+	log_debug("pmic-glink: BATTMGR register: SET_NOTIFICATION_CRITERIA\n");
 	pg->battmgr_acked = false;
 	ret = qpg_send_data(pg, &crit, sizeof(crit));
 	if (ret) {
@@ -68,7 +68,7 @@ int qpg_register_battmgr(struct qpg *pg)
 		return ret;
 	}
 	ret = qpg_drain_until(pg, &altmode, qpg_done_battmgr, 1000);
-	log_warning("pmic-glink: BATTMGR crit ack ret=%d acked=%d\n",
+	log_debug("pmic-glink: BATTMGR crit ack ret=%d acked=%d\n",
 		    ret, pg->battmgr_acked);
 
 	return 0;

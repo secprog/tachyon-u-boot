@@ -49,7 +49,7 @@ void tachyon_dp_mainlink_disable(struct tachyon_dp_priv *priv)
 	val &= ~(DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_CTRL_RESET);
 	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
 
-	log_warning("DP mainlink disable: MAINLINK_CTRL=%08x\n",
+	log_debug("DP mainlink disable: MAINLINK_CTRL=%08x\n",
 		    readl(priv->link + REG_DP_MAINLINK_CTRL));
 }
 
@@ -70,7 +70,7 @@ static void tachyon_dp_mainlink_enable_training(struct tachyon_dp_priv *priv)
 	       DP_MAINLINK_CTRL_FLUSH_MODE;
 	writel(val, priv->link + REG_DP_MAINLINK_CTRL);
 
-	log_warning("DP mainlink enable linux-seq: MAINLINK_CTRL=%08x MAINLINK_READY=%08x STATE_CTRL=%08x\n",
+	log_debug("DP mainlink enable linux-seq: MAINLINK_CTRL=%08x MAINLINK_READY=%08x STATE_CTRL=%08x\n",
 		    readl(priv->link + REG_DP_MAINLINK_CTRL),
 		    readl(priv->link + REG_DP_MAINLINK_READY),
 		    readl(priv->link + REG_DP_STATE_CTRL));
@@ -83,7 +83,7 @@ void tachyon_dp_configure_source_link(struct tachyon_dp_priv *priv)
 	writel(priv->lane_map, priv->link + REG_DP_LOGICAL2PHYSICAL_LANE_MAPPING);
 	writel(cfg, priv->link + REG_DP_CONFIGURATION_CTRL);
 
-	log_warning("DP source link cfg: rate=%u bw=%02x lanes=%u enhanced=%u lane_map=%08x cfg=%08x\n",
+	log_debug("DP source link cfg: rate=%u bw=%02x lanes=%u enhanced=%u lane_map=%08x cfg=%08x\n",
 		    priv->rate, tachyon_dp_bw_code(priv->rate), priv->lanes,
 		    priv->caps.enhanced ? 1 : 0, priv->lane_map, cfg);
 }
@@ -101,7 +101,7 @@ static int tachyon_dp_set_pattern_state_bit(struct tachyon_dp_priv *priv,
 	state = BIT(state_bit - 1);
 	ready_bit = state << DP_MAINLINK_READY_LINK_TRAINING_SHIFT;
 
-	log_warning("DP source pattern %u select: STATE_CTRL=%08x ready_bit=%08x\n",
+	log_debug("DP source pattern %u select: STATE_CTRL=%08x ready_bit=%08x\n",
 		    state_bit, state, ready_bit);
 
 	writel(0, priv->link + REG_DP_STATE_CTRL);
@@ -122,7 +122,7 @@ static int tachyon_dp_set_pattern_state_bit(struct tachyon_dp_priv *priv,
 		return ret;
 	}
 
-	log_warning("DP source pattern %u ready: MAINLINK_READY=%08x ready_bit=%08x\n",
+	log_debug("DP source pattern %u ready: MAINLINK_READY=%08x ready_bit=%08x\n",
 		    state_bit, readl(priv->link + REG_DP_MAINLINK_READY),
 		    ready_bit);
 
@@ -158,7 +158,7 @@ static int tachyon_dp_program_training_set(struct tachyon_dp_priv *priv)
 		return ret;
 	}
 
-	log_warning("DP DPCD lane set verify: lane0=%02x lane1=%02x lane2=%02x lane3=%02x\n",
+	log_debug("DP DPCD lane set verify: lane0=%02x lane1=%02x lane2=%02x lane3=%02x\n",
 		    rb[0], rb[1], rb[2], rb[3]);
 
 	for (i = 0; i < priv->lanes; i++) {
@@ -181,21 +181,21 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 
 #if TACHYON_DP_FORCE_TRAIN_RBR_X4
 	if (rate != DP_LINK_RATE_RBR || lanes != 4)
-		log_warning("DP force RBR x4 overrides requested %u kHz x %u lanes\n",
+		log_debug("DP force RBR x4 overrides requested %u kHz x %u lanes\n",
 			    rate, lanes);
 	rate = DP_LINK_RATE_RBR;
 	lanes = 4;
 #endif
 #if TACHYON_DP_FORCE_TRAIN_RBR_X2
 	if (rate != DP_LINK_RATE_RBR || lanes != 2)
-		log_warning("DP force RBR x2 overrides requested %u kHz x %u lanes\n",
+		log_debug("DP force RBR x2 overrides requested %u kHz x %u lanes\n",
 			    rate, lanes);
 	rate = DP_LINK_RATE_RBR;
 	lanes = 2;
 #endif
 #if TACHYON_DP_FORCE_TRAIN_RBR_X1
 	if (rate != DP_LINK_RATE_RBR || lanes != 1)
-		log_warning("DP force RBR x1 overrides requested %u kHz x %u lanes\n",
+		log_debug("DP force RBR x1 overrides requested %u kHz x %u lanes\n",
 			    rate, lanes);
 	rate = DP_LINK_RATE_RBR;
 	lanes = 1;
@@ -209,10 +209,10 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	memset(priv->swing, 0, sizeof(priv->swing));
 	memset(priv->pre, 0, sizeof(priv->pre));
 
-	log_warning("DP training: rate=%u kHz lanes=%u\n",
+	log_debug("DP training: rate=%u kHz lanes=%u\n",
 		    priv->rate, priv->lanes);
 
-	log_warning("DP TRAIN STEP: disable mainlink\n");
+	log_debug("DP TRAIN STEP: disable mainlink\n");
 	tachyon_dp_mainlink_disable(priv);
 	tachyon_dp_dump_link_state(priv, "after mainlink disable");
 
@@ -220,7 +220,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	if (ret)
 		return ret;
 
-	log_warning("DP orientation summary: orientation=%u TYPEC=%02x PHY_MODE=%02x SBU_EN=%d SBU_SEL=%d lane_count=%u\n",
+	log_debug("DP orientation summary: orientation=%u TYPEC=%02x PHY_MODE=%02x SBU_EN=%d SBU_SEL=%d lane_count=%u\n",
 		    priv->orientation,
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
@@ -230,24 +230,24 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 			    dm_gpio_get_value(&priv->sbu_select) : -1,
 		    priv->lanes);
 
-	log_warning("DP TRAIN STEP: mainlink training enable\n");
+	log_debug("DP TRAIN STEP: mainlink training enable\n");
 	tachyon_dp_mainlink_enable_training(priv);
 	tachyon_dp_dump_link_state(priv, "after mainlink training enable");
 
-	log_warning("DP TRAIN STEP: source link config\n");
+	log_debug("DP TRAIN STEP: source link config\n");
 	tachyon_dp_configure_source_link(priv);
 	tachyon_dp_dump_link_state(priv, "after source link config");
 
 	link[0] = tachyon_dp_bw_code(priv->rate);
 	link[1] = priv->lanes |
 		  (priv->caps.enhanced ? DP_ENHANCED_FRAME_CAP : 0);
-	log_warning("DP TRAIN STEP: sink link config\n");
+	log_debug("DP TRAIN STEP: sink link config\n");
 	tachyon_dp_dump_link_state(priv, "before DPCD link cfg");
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_LINK_BW_SET, link,
 				   sizeof(link));
 	if (ret)
 		return ret;
-	log_warning("DP DPCD link cfg: rate=%u lanes=%u enhanced=%u lane_count_reg=%02x\n",
+	log_debug("DP DPCD link cfg: rate=%u lanes=%u enhanced=%u lane_count_reg=%02x\n",
 		    priv->rate, priv->lanes, priv->caps.enhanced, link[1]);
 	tachyon_dp_dump_link_state(priv, "after DPCD link cfg");
 
@@ -255,7 +255,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   sizeof(rb));
 	if (ret)
 		return ret;
-	log_warning("DP DPCD link cfg verify: bw=%02x lane_count=%02x expected_bw=%02x expected_lane=%02x\n",
+	log_debug("DP DPCD link cfg verify: bw=%02x lane_count=%02x expected_bw=%02x expected_lane=%02x\n",
 		    rb[0], rb[1], link[0], link[1]);
 	if (memcmp(rb, link, sizeof(link)))
 		return -EIO;
@@ -269,7 +269,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   &pattern_rb, 1);
 	if (ret)
 		return ret;
-	log_warning("DP DPCD downspread verify: downspread=%02x expected=%02x\n",
+	log_debug("DP DPCD downspread verify: downspread=%02x expected=%02x\n",
 		    pattern_rb, pattern);
 	if (pattern_rb != pattern)
 		return -EIO;
@@ -285,17 +285,17 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   &pattern_rb, 1);
 	if (ret)
 		return ret;
-	log_warning("DP DPCD coding verify: coding=%02x expected=%02x\n",
+	log_debug("DP DPCD coding verify: coding=%02x expected=%02x\n",
 		    pattern_rb, pattern);
 	if (pattern_rb != pattern)
 		return -EIO;
 
-	log_warning("DP TRAIN STEP: source TP1 select\n");
+	log_debug("DP TRAIN STEP: source TP1 select\n");
 	ret = tachyon_dp_set_pattern_state_bit(priv, 1);
 	if (ret)
 		return ret;
 
-	log_warning("DP TRAIN STEP: sink TP1 select\n");
+	log_debug("DP TRAIN STEP: sink TP1 select\n");
 	pattern = DP_TRAINING_PATTERN_1 | DP_LINK_SCRAMBLING_DISABLE;
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
 				   &pattern, 1);
@@ -305,7 +305,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   &pattern_rb, 1);
 	if (ret)
 		return ret;
-	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+	log_debug("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
 		    pattern_rb, pattern);
 	if (pattern_rb != pattern)
 		return -EIO;
@@ -317,7 +317,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		if (ret)
 			return ret;
 		udelay(10000);
-		log_warning("DP TRAIN STEP: lane status read\n");
+		log_debug("DP TRAIN STEP: lane status read\n");
 		tachyon_dp_dump_link_state(priv, "before CR status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
@@ -326,7 +326,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				    ret, tries);
 			return ret;
 		}
-		log_warning("DP CR try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x cr_done=%d\n",
+		log_debug("DP CR try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x cr_done=%d\n",
 			    tries, status[0], status[1], status[2],
 			    status[4], status[5],
 			    tachyon_dp_cr_done(status, lanes));
@@ -347,12 +347,12 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		 tries + 1, status[0], status[1], status[2]);
 
 	/* --- Training Pattern 2 (channel equalization) --- */
-	log_warning("DP TRAIN STEP: source TP2 select\n");
+	log_debug("DP TRAIN STEP: source TP2 select\n");
 	ret = tachyon_dp_set_pattern_state_bit(priv, 2);
 	if (ret)
 		return ret;
 
-	log_warning("DP TRAIN STEP: sink TP2 select\n");
+	log_debug("DP TRAIN STEP: sink TP2 select\n");
 	pattern = DP_TRAINING_PATTERN_2 | DP_LINK_SCRAMBLING_DISABLE;
 	ret = tachyon_dp_aux_retry(priv, false, false, DP_TRAINING_PATTERN_SET,
 				   &pattern, 1);
@@ -362,7 +362,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   &pattern_rb, 1);
 	if (ret)
 		return ret;
-	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+	log_debug("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
 		    pattern_rb, pattern);
 	if (pattern_rb != pattern)
 		return -EIO;
@@ -373,7 +373,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 		if (ret)
 			return ret;
 		udelay(10000);
-		log_warning("DP TRAIN STEP: lane status read\n");
+		log_debug("DP TRAIN STEP: lane status read\n");
 		tachyon_dp_dump_link_state(priv, "before EQ status read");
 		ret = tachyon_dp_aux_retry(priv, false, true,
 					   DP_LANE0_1_STATUS, status, 6);
@@ -382,7 +382,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				    ret, tries);
 			return ret;
 		}
-		log_warning("DP EQ try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x eq_done=%d\n",
+		log_debug("DP EQ try%d: l01=%02x l23=%02x align=%02x adj01=%02x adj23=%02x eq_done=%d\n",
 			    tries, status[0], status[1], status[2],
 			    status[4], status[5],
 			    tachyon_dp_eq_done(status, lanes));
@@ -413,7 +413,7 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 				   &pattern_rb, 1);
 	if (ret)
 		return ret;
-	log_warning("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
+	log_debug("DP DPCD TP verify: pattern_set=%02x expected=%02x\n",
 		    pattern_rb, pattern);
 	if (pattern_rb != pattern)
 		return -EIO;
@@ -434,7 +434,7 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	u8 policy_lanes = priv->lanes;
 	int r, l, ret = -EIO;
 
-	log_warning("DP train policy: typec=altmode orientation=%u pin=%u sink_lanes=%u graph_lanes=%u pin_lanes=%u policy_lanes=%u max_rate=%u lane_map=%02x\n",
+	log_debug("DP train policy: typec=altmode orientation=%u pin=%u sink_lanes=%u graph_lanes=%u pin_lanes=%u policy_lanes=%u max_rate=%u lane_map=%02x\n",
 		    priv->orientation, priv->pin_assignment,
 		    priv->caps.lanes, priv->graph_lanes,
 		    tachyon_dp_pin_assignment_lanes(priv), policy_lanes,
@@ -461,7 +461,7 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	if (!tachyon_dp_env_bool("tachyon_dp_no_hpd_wait")) {
 		uint hpd_ms = tachyon_dp_env_u32("tachyon_dp_hpd_wait_ms", 8000);
 
-		log_warning("DP link train: PMIC HPD %s before training\n",
+		log_debug("DP link train: PMIC HPD %s before training\n",
 			    tachyon_dp_wait_pmic_hpd(priv, hpd_ms) ?
 				    "asserted" : "wait timed out, training anyway");
 	}
@@ -472,7 +472,7 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	 * Only try RBR x4 to isolate "second configure after lock"
 	 * vs. "non-RBR or reduced-lane specific" failures.
 	 */
-	log_warning("DP force RBR x4 training test\n");
+	log_debug("DP force RBR x4 training test\n");
 	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 4);
 	if (!ret) {
 		log_info("DP link trained at RBR x4 (forced)\n");
@@ -482,7 +482,7 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	return ret;
 #endif
 #if TACHYON_DP_FORCE_TRAIN_RBR_X2
-	log_warning("DP force RBR x2 training test\n");
+	log_debug("DP force RBR x2 training test\n");
 	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 2);
 	if (!ret) {
 		log_info("DP link trained at RBR x2 (forced)\n");
@@ -492,7 +492,7 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	return ret;
 #endif
 #if TACHYON_DP_FORCE_TRAIN_RBR_X1
-	log_warning("DP force RBR x1 training test\n");
+	log_debug("DP force RBR x1 training test\n");
 	ret = tachyon_dp_link_train_at(priv, DP_LINK_RATE_RBR, 1);
 	if (!ret) {
 		log_info("DP link trained at RBR x1 (forced)\n");
@@ -508,11 +508,11 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 		for (l = 0; l < ARRAY_SIZE(lane_counts); l++) {
 			if (lane_counts[l] > policy_lanes)
 				continue;
-			log_warning("DP link train attempt: rate=%u lanes=%u\n",
+			log_debug("DP link train attempt: rate=%u lanes=%u\n",
 				    rates[r], lane_counts[l]);
 			ret = tachyon_dp_link_train_at(priv, rates[r],
 						       lane_counts[l]);
-			log_warning("DP link train attempt rate=%u lanes=%u ret=%d\n",
+			log_debug("DP link train attempt rate=%u lanes=%u ret=%d\n",
 				    rates[r], lane_counts[l], ret);
 			if (!ret) {
 				log_info("DP link trained at %u kHz x %u lanes\n",
@@ -586,7 +586,7 @@ static void tachyon_dp_program_pixel_clock(struct tachyon_dp_priv *priv)
 	long ret;
 
 	if (!rate || !priv->has_pixel_clk) {
-		log_warning("DP pixel clock SKIPPED: rate=%u has_pixel_clk=%d\n",
+		log_debug("DP pixel clock SKIPPED: rate=%u has_pixel_clk=%d\n",
 			    rate, priv->has_pixel_clk);
 		return;
 	}
@@ -607,17 +607,17 @@ static void tachyon_dp_program_pixel_clock(struct tachyon_dp_priv *priv)
 	dispcc_input_khz = ((unsigned long)priv->rate * 10) / pixel_div;
 	tachyon_dp_pixel_mn(dispcc_input_khz, pixel_khz, &m, &n);
 	sc7280_dispcc_set_dp_pixel_mn(m, n);
-	log_warning("DP pixel clk M/N: link=%u input_khz=%lu pixel_khz=%u -> M=%u N=%u\n",
+	log_debug("DP pixel clk M/N: link=%u input_khz=%lu pixel_khz=%u -> M=%u N=%u\n",
 		    priv->rate, dispcc_input_khz, pixel_khz, m, n);
 
 	ret = clk_set_rate(&priv->pixel_clk, rate);
-	log_warning("DP pixel clock set_rate %u Hz -> ret=%ld\n", rate, ret);
+	log_debug("DP pixel clock set_rate %u Hz -> ret=%ld\n", rate, ret);
 
 	if (priv->pixel_clk_enabled)
 		return;
 
 	ret = clk_enable(&priv->pixel_clk);
-	log_warning("DP pixel clock enable ret=%ld\n", ret);
+	log_debug("DP pixel clock enable ret=%ld\n", ret);
 	if (ret >= 0)
 		priv->pixel_clk_enabled = true;
 }
@@ -678,7 +678,7 @@ static void tachyon_dp_program_msa_clock(struct tachyon_dp_priv *priv)
 	 */
 	writel(DP_MISC0_SYNCHRONOUS_CLK | (1 << DP_MISC0_TEST_BITS_DEPTH_SHIFT),
 	       priv->link + REG_DP_MISC1_MISC0);
-	log_warning("DP MSA: mvid=%u nvid=%u misc0=%08x pclk_khz=%llu rate=%u\n",
+	log_debug("DP MSA: mvid=%u nvid=%u misc0=%08x pclk_khz=%llu rate=%u\n",
 		    mvid, nvid, readl(priv->link + REG_DP_MISC1_MISC0),
 		    pclk_khz, priv->rate);
 }
@@ -1567,7 +1567,7 @@ static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
 	writel(vb_reg, priv->link + REG_DP_VALID_BOUNDARY);
 	writel(vb2_reg, priv->link + REG_DP_VALID_BOUNDARY_2);
 
-	log_warning("DP TU: %ux%u lanes=%u TU=%02x VB=%08x VB2=%08x (tu_size=%u valid=%u delay=%u mod=%u)\n",
+	log_debug("DP TU: %ux%u lanes=%u TU=%02x VB=%08x VB2=%08x (tu_size=%u valid=%u delay=%u mod=%u)\n",
 		    t->hactive.typ, t->vactive.typ, priv->lanes,
 		    tu_reg, vb_reg, vb2_reg, tut.tu_size_minus1 + 1,
 		    tut.valid_boundary_link, tut.delay_start_link,
@@ -1639,7 +1639,7 @@ static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
 	       priv->p0 + MMSS_DP_TPG_VIDEO_CONFIG);
 	writel(DP_BIST_ENABLE_DPBIST_EN, priv->p0 + MMSS_DP_BIST_ENABLE);
 	writel(DP_TIMING_ENGINE_EN_EN, priv->p0 + MMSS_DP_TIMING_ENGINE_EN);
-	log_warning("DP TPG checkered pattern ON (p0 timing engine + BIST)\n");
+	log_debug("DP TPG checkered pattern ON (p0 timing engine + BIST)\n");
 }
 
 void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
@@ -1656,7 +1656,7 @@ void tachyon_dp_controller_quiesce(struct tachyon_dp_priv *priv)
 	if (!priv->dp_core_clocks_enabled)
 		return;
 
-	log_warning("DP controller quiesce before OS handoff\n");
+	log_debug("DP controller quiesce before OS handoff\n");
 
 	/*
 	 * Only tear down the link/mainlink if it was actually brought up.

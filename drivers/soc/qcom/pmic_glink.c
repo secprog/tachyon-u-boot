@@ -115,7 +115,7 @@ static int qpg_mbox_from_glink(ofnode glink, struct mbox_chan *chan)
 		return ret;
 	}
 
-	log_warning("pmic-glink: IPCC mbox chan dev=%s id=%08lx\n",
+	log_debug("pmic-glink: IPCC mbox chan dev=%s id=%08lx\n",
 		    ipcc_dev->name, chan->id);
 
 	return 0;
@@ -253,19 +253,19 @@ static int qpg_send_simple(struct qpg *pg, u16 cmd, u16 param1, u32 param2)
 	int ret;
 
 	if (cmd == GLINK_CMD_OPEN_ACK)
-		log_warning("pmic-glink: send OPEN_ACK begin\n");
+		log_debug("pmic-glink: send OPEN_ACK begin\n");
 
 	ret = qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
 
 	if (cmd == GLINK_CMD_OPEN_ACK)
-		log_warning("pmic-glink: send OPEN_ACK end ret=%d\n", ret);
+		log_debug("pmic-glink: send OPEN_ACK end ret=%d\n", ret);
 
 	return ret;
 }
 
 static int qpg_send_open_ack(struct qpg *pg, u16 rcid, const char *name)
 {
-	log_warning("pmic-glink: send OPEN_ACK channel='%s' rcid=%u\n",
+	log_debug("pmic-glink: send OPEN_ACK channel='%s' rcid=%u\n",
 		    name ? name : "<unknown>", rcid);
 
 	return qpg_send_simple(pg, GLINK_CMD_OPEN_ACK, rcid, 0);
@@ -293,7 +293,7 @@ static int qpg_send_open_for(struct qpg *pg, u16 lcid, const char *name)
 	req.msg.param2 = cpu_to_le32(name_len);
 	strcpy(req.name, name);
 
-	log_warning("pmic-glink: send OPEN channel='%s' lcid=%u\n",
+	log_debug("pmic-glink: send OPEN channel='%s' lcid=%u\n",
 		    name, lcid);
 
 	return qpg_tx(pg, &req, ALIGN(sizeof(req.msg) + name_len, 8), NULL, 0);
@@ -329,7 +329,7 @@ static int qpg_send_rx_intent_for_size(struct qpg *pg, u16 cid, u32 liid,
 		.liid = cpu_to_le32(liid),
 	};
 
-	log_warning("pmic-glink: send RX_INTENT cid=%u liid=%u size=%u\n",
+	log_debug("pmic-glink: send RX_INTENT cid=%u liid=%u size=%u\n",
 		    cid, liid, size);
 
 	return qpg_tx(pg, &msg, sizeof(msg), NULL, 0);
@@ -344,7 +344,7 @@ static int qpg_send_rx_intent_for(struct qpg *pg, u16 cid, u32 liid)
 static int qpg_send_rx_intent_req_ack_for(struct qpg *pg, u16 cid,
 					  bool granted)
 {
-	log_warning("pmic-glink: send RX_INTENT_REQ_ACK cid=%u granted=%d\n",
+	log_debug("pmic-glink: send RX_INTENT_REQ_ACK cid=%u granted=%d\n",
 		    cid, granted);
 
 	return qpg_send_simple(pg, GLINK_CMD_RX_INTENT_REQ_ACK, cid,
@@ -463,7 +463,7 @@ static int qpg_qrtr_send_hello(struct qpg *pg)
 	ctrl.cmd = cpu_to_le32(QRTR_TYPE_HELLO);
 	ret = qpg_qrtr_send(pg, QRTR_TYPE_HELLO, QRTR_PORT_CTRL,
 			    pg->ipcrtr_node, QRTR_PORT_CTRL, &ctrl, sizeof(ctrl));
-	log_warning("pmic-glink: IPCRTR sent HELLO -> node=%u ret=%d\n",
+	log_debug("pmic-glink: IPCRTR sent HELLO -> node=%u ret=%d\n",
 		    pg->ipcrtr_node, ret);
 	return ret;
 }
@@ -493,7 +493,7 @@ static int qpg_servreg_register(struct qpg *pg)
 
 	ret = qpg_qrtr_send(pg, QRTR_TYPE_DATA, QPG_SERVREG_PORT,
 			    pg->servreg_node, pg->servreg_port, msg, p - msg);
-	log_warning("pmic-glink: servreg REGISTER_LISTENER -> %u:%u path=%s ret=%d\n",
+	log_debug("pmic-glink: servreg REGISTER_LISTENER -> %u:%u path=%s ret=%d\n",
 		    pg->servreg_node, pg->servreg_port, QPG_CHARGER_PD_PATH, ret);
 	return ret;
 }
@@ -524,7 +524,7 @@ static int qpg_servreg_send_ack(struct qpg *pg, u16 ind_txn)
 
 	ret = qpg_qrtr_send(pg, QRTR_TYPE_DATA, QPG_SERVREG_PORT,
 			    pg->servreg_node, pg->servreg_port, msg, p - msg);
-	log_warning("pmic-glink: servreg SET_ACK ind_txn=%u ret=%d\n",
+	log_debug("pmic-glink: servreg SET_ACK ind_txn=%u ret=%d\n",
 		    ind_txn, ret);
 	return ret;
 }
@@ -579,7 +579,7 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 	dst_port = le32_to_cpu(hdr->dst_port);
 	size = le32_to_cpu(hdr->size);
 
-	log_warning("pmic-glink: IPCRTR qrtr type=%u src=%u:%08x dst=%u:%08x size=%u len=%zu bytes=[%s]\n",
+	log_debug("pmic-glink: IPCRTR qrtr type=%u src=%u:%08x dst=%u:%08x size=%u len=%zu bytes=[%s]\n",
 		    type, src_node, src_port,
 		    le32_to_cpu(hdr->dst_node), dst_port, size, len, hex);
 
@@ -598,7 +598,7 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 			pg->servreg_port = le32_to_cpu(c->port);
 			pg->servreg_notifier_seen = true;
 			pg->servreg_register_pending = true;
-			log_warning("pmic-glink: servreg NOTIFIER found svc=0x%x inst=0x%x @ %u:%u\n",
+			log_debug("pmic-glink: servreg NOTIFIER found svc=0x%x inst=0x%x @ %u:%u\n",
 				    svc, le32_to_cpu(c->instance),
 				    pg->servreg_node, pg->servreg_port);
 		}
@@ -615,7 +615,7 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 		u16 vlen = 0;
 		const u8 *v;
 
-		log_warning("pmic-glink: servreg QMI type=%u msg_id=0x%x len=%u\n",
+		log_debug("pmic-glink: servreg QMI type=%u msg_id=0x%x len=%u\n",
 			    qh->type, msg_id, le16_to_cpu(qh->msg_len));
 
 		if (qh->type == QMI_TYPE_RESPONSE &&
@@ -626,7 +626,7 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 			if (v && vlen >= 4)
 				pg->servreg_last_state = v[0] | (v[1] << 8) |
 					(v[2] << 16) | (v[3] << 24);
-			log_warning("pmic-glink: servreg REGISTER ack state=%u\n",
+			log_debug("pmic-glink: servreg REGISTER ack state=%u\n",
 				    pg->servreg_last_state);
 		} else if (qh->type == QMI_TYPE_INDICATION &&
 			   msg_id == SERVREG_STATE_UPDATED_IND) {
@@ -641,7 +641,7 @@ static void qpg_qrtr_rx(struct qpg *pg, const u8 *data, size_t len)
 				itxn = v[0] | (v[1] << 8);
 			pg->servreg_ack_txn = itxn;
 			pg->servreg_ack_pending = true;
-			log_warning("pmic-glink: servreg STATE_UPDATED state=%u txn=%u -> ack\n",
+			log_debug("pmic-glink: servreg STATE_UPDATED state=%u txn=%u -> ack\n",
 				    pg->servreg_last_state, itxn);
 		}
 		return;
@@ -688,7 +688,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 					le32_to_cpu(resp->return_code);
 				memcpy(pg->ucsi_read_buffer, resp->read_buffer,
 				       sizeof(pg->ucsi_read_buffer));
-				log_warning("pmic-glink: UCSI READ_BUFFER ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				log_debug("pmic-glink: UCSI READ_BUFFER ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 					    le32_to_cpu(resp->return_code),
 					    buf[0], buf[1], buf[2], buf[3],
 					    buf[4], buf[5], buf[6], buf[7],
@@ -704,7 +704,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 			if (len >= sizeof(*write_resp)) {
 				pg->ucsi_write_return_code =
 					le32_to_cpu(write_resp->return_code);
-				log_warning("pmic-glink: UCSI WRITE_BUFFER ret=%u\n",
+				log_debug("pmic-glink: UCSI WRITE_BUFFER ret=%u\n",
 					    pg->ucsi_write_return_code);
 			} else {
 				log_warning("pmic-glink: UCSI WRITE_BUFFER short len=%zu expected=%zu\n",
@@ -716,7 +716,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 			if (len >= sizeof(*notify)) {
 				pg->ucsi_notification =
 					le32_to_cpu(notify->notification);
-				log_warning("pmic-glink: UCSI notify cci=%08x receiver=%u len=%zu\n",
+				log_debug("pmic-glink: UCSI notify cci=%08x receiver=%u len=%zu\n",
 					    pg->ucsi_notification,
 					    le32_to_cpu(notify->receiver), len);
 			} else {
@@ -725,7 +725,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 			}
 			break;
 		default:
-			log_warning("pmic-glink: USB Type-C owner opcode=%02x len=%zu\n",
+			log_debug("pmic-glink: USB Type-C owner opcode=%02x len=%zu\n",
 				    opcode, len);
 			break;
 		}
@@ -735,7 +735,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 
 	if (owner == PMIC_GLINK_OWNER_CHARGER) {
 		pg->battmgr_acked = true;
-		log_warning("pmic-glink: BATTMGR msg type=%u opcode=%02x len=%zu\n",
+		log_debug("pmic-glink: BATTMGR msg type=%u opcode=%02x len=%zu\n",
 			    type, opcode, len);
 		return false;
 	}
@@ -758,7 +758,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 				le32_to_cpu(resp->return_code);
 			memcpy(pg->usbc_read_buffer, resp->read_buffer,
 			       sizeof(pg->usbc_read_buffer));
-			log_warning("pmic-glink: USBC READ ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			log_debug("pmic-glink: USBC READ ret=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 				    pg->usbc_read_return_code,
 				    buf[0], buf[1], buf[2], buf[3],
 				    buf[4], buf[5], buf[6], buf[7],
@@ -772,7 +772,7 @@ static bool qpg_parse_pmic(struct qpg *pg,
 	}
 	case USBC_CMD_WRITE_REQ:
 		pg->pan_acked = true;
-		log_warning("pmic-glink: PAN ACK received\n");
+		log_debug("pmic-glink: PAN ACK received\n");
 		break;
 	case USBC_NOTIFY_IND:
 		ack_notify = qpg_parse_sc8280xp_notify(pg, altmode, data, len,
@@ -868,7 +868,7 @@ static int qpg_handle_intent_req(struct qpg *pg, u16 cid, u32 size)
 	int ack_ret;
 	int ret = 0;
 
-	log_warning("pmic-glink: RX_INTENT_REQ rcid=%u size=%u\n", cid, size);
+	log_debug("pmic-glink: RX_INTENT_REQ rcid=%u size=%u\n", cid, size);
 
 	/* IPCRTR (qrtr) channel: grant an intent on our IPCRTR lcid so the
 	 * ADSP can push qrtr/servreg packets to us. */
@@ -914,7 +914,7 @@ ack:
 	if (ack_ret)
 		return ack_ret;
 
-	log_warning("pmic-glink: RX_INTENT_REQ done granted=%d liid=%u ret=%d\n",
+	log_debug("pmic-glink: RX_INTENT_REQ done granted=%d liid=%u ret=%d\n",
 		    granted, liid, ret);
 
 	return 0;
@@ -930,7 +930,7 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 		pg->riid_size = le32_to_cpu(intent->size);
 		pg->riid = le32_to_cpu(intent->iid);
 		pg->riid_avail = pg->riid_size > 0;
-		log_warning("pmic-glink: RIID channel=raw rcid=%u riid=%u size=%u avail=%d\n",
+		log_debug("pmic-glink: RIID channel=raw rcid=%u riid=%u size=%u avail=%d\n",
 			    cid, pg->riid, pg->riid_size, pg->riid_avail);
 	} else if (pg->ipcrtr_seen && cid == pg->ipcrtr_rcid) {
 		/* remote intent on IPCRTR: queue it so we can send qrtr packets */
@@ -955,7 +955,7 @@ static int qpg_handle_intent(struct qpg *pg, u16 cid, u32 count,
 static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 			   u32 name_len)
 {
-	log_warning("pmic-glink: RX remote OPEN rcid=%u name_len=%u name='%s'%s\n",
+	log_debug("pmic-glink: RX remote OPEN rcid=%u name_len=%u name='%s'%s\n",
 		    rcid, name_len, name,
 		    name_len >= 32 ? " truncated" : "");
 
@@ -963,13 +963,13 @@ static int qpg_handle_open(struct qpg *pg, u16 rcid, const char *name,
 		pg->rcid = rcid;
 		pg->remote_opened = true;
 		pg->remote_open_ack_pending = !pg->remote_open_acked;
-		log_warning("pmic-glink: PMIC remote OPEN recorded rcid=%u lcid=%u\n",
+		log_debug("pmic-glink: PMIC remote OPEN recorded rcid=%u lcid=%u\n",
 			    pg->rcid, pg->lcid);
 	} else if (!strcmp(name, QPG_IPCRTR_NAME)) {
 		pg->ipcrtr_rcid = rcid;
 		pg->ipcrtr_seen = true;
 		pg->ipcrtr_open_ack_pending = true;
-		log_warning("pmic-glink: IPCRTR remote OPEN recorded rcid=%u lcid=%u\n",
+		log_debug("pmic-glink: IPCRTR remote OPEN recorded rcid=%u lcid=%u\n",
 			    rcid, QPG_IPCRTR_LCID);
 	}
 
@@ -1113,11 +1113,11 @@ int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
 		if (param1 == pg->lcid) {
 			pg->open_acked = true;
-			log_warning("pmic-glink: raw OPEN_ACK complete lcid=%u\n",
+			log_debug("pmic-glink: raw OPEN_ACK complete lcid=%u\n",
 				    pg->lcid);
 		} else if (param1 == QPG_IPCRTR_LCID) {
 			pg->ipcrtr_open_acked = true;
-			log_warning("pmic-glink: IPCRTR OPEN_ACK complete lcid=%u\n",
+			log_debug("pmic-glink: IPCRTR OPEN_ACK complete lcid=%u\n",
 				    QPG_IPCRTR_LCID);
 		}
 		break;
@@ -1152,7 +1152,7 @@ int qpg_poll(struct qpg *pg, struct qcom_pmic_glink_altmode *altmode)
 		break;
 	case GLINK_CMD_RX_INTENT_REQ_ACK:
 		qpg_rx_advance(pg, ALIGN(sizeof(msg), 8));
-		log_warning("pmic-glink: RX_INTENT_REQ_ACK cid=%u granted=%u\n",
+		log_debug("pmic-glink: RX_INTENT_REQ_ACK cid=%u granted=%u\n",
 			    param1, param2);
 		break;
 	case GLINK_CMD_READ_NOTIF:
@@ -1181,10 +1181,10 @@ static int qpg_service_pmic_open(struct qpg *pg)
 		return 0;
 
 	if (pg->remote_open_ack_pending) {
-		log_warning("pmic-glink: service PMIC OPEN_ACK begin rcid=%u\n",
+		log_debug("pmic-glink: service PMIC OPEN_ACK begin rcid=%u\n",
 			    pg->rcid);
 		ret = qpg_send_open_ack(pg, pg->rcid, QPG_CHANNEL_NAME);
-		log_warning("pmic-glink: service PMIC OPEN_ACK end ret=%d\n",
+		log_debug("pmic-glink: service PMIC OPEN_ACK end ret=%d\n",
 			    ret);
 		if (ret)
 			return ret;
@@ -1194,10 +1194,10 @@ static int qpg_service_pmic_open(struct qpg *pg)
 	}
 
 	if (!pg->local_open_sent) {
-		log_warning("pmic-glink: service PMIC local OPEN begin lcid=%u\n",
+		log_debug("pmic-glink: service PMIC local OPEN begin lcid=%u\n",
 			    pg->lcid);
 		ret = qpg_send_open(pg);
-		log_warning("pmic-glink: service PMIC local OPEN end ret=%d\n",
+		log_debug("pmic-glink: service PMIC local OPEN end ret=%d\n",
 			    ret);
 		if (ret)
 			return ret;
@@ -1223,7 +1223,7 @@ static int qpg_service_ipcrtr(struct qpg *pg)
 
 	if (pg->ipcrtr_open_ack_pending) {
 		ret = qpg_send_open_ack(pg, pg->ipcrtr_rcid, QPG_IPCRTR_NAME);
-		log_warning("pmic-glink: IPCRTR OPEN_ACK sent rcid=%u ret=%d\n",
+		log_debug("pmic-glink: IPCRTR OPEN_ACK sent rcid=%u ret=%d\n",
 			    pg->ipcrtr_rcid, ret);
 		if (ret)
 			return ret;
@@ -1232,7 +1232,7 @@ static int qpg_service_ipcrtr(struct qpg *pg)
 
 	if (!pg->ipcrtr_local_open_sent) {
 		ret = qpg_send_open_for(pg, QPG_IPCRTR_LCID, QPG_IPCRTR_NAME);
-		log_warning("pmic-glink: IPCRTR local OPEN sent lcid=%u ret=%d\n",
+		log_debug("pmic-glink: IPCRTR local OPEN sent lcid=%u ret=%d\n",
 			    QPG_IPCRTR_LCID, ret);
 		if (ret)
 			return ret;
@@ -1244,7 +1244,7 @@ static int qpg_service_ipcrtr(struct qpg *pg)
 		ret = qpg_send_rx_intent_for_size(pg, QPG_IPCRTR_LCID,
 						  pg->ipcrtr_liid,
 						  QPG_IPCRTR_INTENT_SIZE);
-		log_warning("pmic-glink: IPCRTR post RX intent lcid=%u liid=%u ret=%d\n",
+		log_debug("pmic-glink: IPCRTR post RX intent lcid=%u liid=%u ret=%d\n",
 			    QPG_IPCRTR_LCID, pg->ipcrtr_liid, ret);
 		if (ret)
 			return ret;
@@ -1377,7 +1377,7 @@ int qpg_send_altmode_req(struct qpg *pg, u32 cmd, u32 arg)
 		.arg = cpu_to_le32(arg),
 	};
 
-	log_warning("pmic-glink: owner=%u channel=%s altmode_cmd=%u arg=%u\n",
+	log_debug("pmic-glink: owner=%u channel=%s altmode_cmd=%u arg=%u\n",
 		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME, cmd, arg);
 
 	return qpg_send_data(pg, &req, sizeof(req));
@@ -1407,14 +1407,14 @@ static int qpg_init(struct qpg *pg)
 	pg->last_adsp_boot_ret = -EINPROGRESS;
 
 	ret = uclass_first_device_err(UCLASS_SMEM, &pg->smem);
-	log_warning("pmic-glink: smem lookup ret=%d smem=%p\n",
+	log_debug("pmic-glink: smem lookup ret=%d smem=%p\n",
 		    ret, pg->smem);
 	if (ret)
 		return ret;
 
 	ret = qcom_adsp_pas_boot();
 	pg->last_adsp_boot_ret = ret;
-	log_warning("pmic-glink: ADSP dependency ensure ret=%d\n", ret);
+	log_debug("pmic-glink: ADSP dependency ensure ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -1427,7 +1427,7 @@ static int qpg_init(struct qpg *pg)
 				      !strcmp(label, "lpass")))
 				break;
 		}
-	log_warning("pmic-glink: adsp node valid=%d glink node valid=%d\n",
+	log_debug("pmic-glink: adsp node valid=%d glink node valid=%d\n",
 		    ofnode_valid(adsp), ofnode_valid(glink));
 	if (!ofnode_valid(adsp)) {
 		log_warning("pmic-glink: missing qcom,sc7280-adsp-pas node\n");
@@ -1459,13 +1459,13 @@ static int qpg_init(struct qpg *pg)
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 32);
 	desc_exists = ret == -EEXIST;
-	log_warning("pmic-glink: smem_alloc desc ret=%d\n", ret);
+	log_debug("pmic-glink: smem_alloc desc ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
 
 	descs = smem_get(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_DESCRIPTOR,
 			 &size);
-	log_warning("pmic-glink: descs=%p size=%zu\n", descs, size);
+	log_debug("pmic-glink: descs=%p size=%zu\n", descs, size);
 	if (!descs || size != 32)
 		return -EINVAL;
 
@@ -1477,7 +1477,7 @@ static int qpg_init(struct qpg *pg)
 	ret = smem_alloc(pg->smem, pg->remote_pid, QPG_SMEM_XPRT_FIFO_0,
 			 SZ_16K);
 	tx_exists = ret == -EEXIST;
-	log_warning("pmic-glink: smem_alloc tx fifo ret=%d\n", ret);
+	log_debug("pmic-glink: smem_alloc tx fifo ret=%d\n", ret);
 	if (ret && ret != -EEXIST)
 		return ret;
 
@@ -1491,7 +1491,7 @@ static int qpg_init(struct qpg *pg)
 			break;
 		mdelay(20);
 	} while (get_timer(start) < 2000);
-	log_warning("pmic-glink: tx_fifo=%p tx_len=%zu rx_fifo=%p rx_len=%zu\n",
+	log_debug("pmic-glink: tx_fifo=%p tx_len=%zu rx_fifo=%p rx_len=%zu\n",
 		    pg->tx_fifo, pg->tx_len, pg->rx_fifo, pg->rx_len);
 	if (IS_ERR_OR_NULL(pg->tx_fifo) || IS_ERR_OR_NULL(pg->rx_fifo)) {
 		log_warning("pmic-glink: missing GLINK FIFO remote_pid=%u tx_ok=%d rx_ok=%d\n",
@@ -1504,11 +1504,11 @@ static int qpg_init(struct qpg *pg)
 		*pg->rx_tail = 0;
 		*pg->tx_head = 0;
 	} else {
-		log_warning("pmic-glink: preserving existing fifo ptrs\n");
+		log_debug("pmic-glink: preserving existing fifo ptrs\n");
 	}
 
 	pg->lcid = 1;
-	log_warning("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
+	log_debug("pmic-glink: fifo ptrs tx_tail=%08x tx_head=%08x rx_tail=%08x rx_head=%08x\n",
 		    le32_to_cpu(*pg->tx_tail), le32_to_cpu(*pg->tx_head),
 		    le32_to_cpu(*pg->rx_tail), le32_to_cpu(*pg->rx_head));
 
@@ -1534,7 +1534,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 		*pan_en_retp = -EINPROGRESS;
 
 	if (pg->session_ready) {
-		log_warning("pmic-glink: reusing session lcid=%u rcid=%u rx_tail=%08x rx_head=%08x\n",
+		log_debug("pmic-glink: reusing session lcid=%u rcid=%u rx_tail=%08x rx_head=%08x\n",
 			    pg->lcid, pg->rcid,
 			    le32_to_cpu(*pg->rx_tail),
 			    le32_to_cpu(*pg->rx_head));
@@ -1570,7 +1570,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	pg->last_ucsi_prewarm_ret = -EINPROGRESS;
 
 	ret = qpg_init(pg);
-	log_warning("pmic-glink: qpg_init ret=%d\n", ret);
+	log_debug("pmic-glink: qpg_init ret=%d\n", ret);
 	if (adsp_boot_retp)
 		*adsp_boot_retp = pg->last_adsp_boot_ret;
 	if (ret) {
@@ -1580,7 +1580,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	ret = qpg_send_version(pg);
-	log_warning("pmic-glink: send VERSION ret=%d\n", ret);
+	log_debug("pmic-glink: send VERSION ret=%d\n", ret);
 	if (ret) {
 		if (glink_open_retp)
 			*glink_open_retp = ret;
@@ -1588,7 +1588,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	ret = qpg_drain_until(pg, altmode, qpg_done_version, 1000);
-	log_warning("pmic-glink: wait VERSION_ACK ret=%d version_acked=%d\n",
+	log_debug("pmic-glink: wait VERSION_ACK ret=%d version_acked=%d\n",
 		    ret, pg->version_acked);
 	if (ret) {
 		if (glink_open_retp)
@@ -1609,7 +1609,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	 */
 	ret = qpg_drain_until(pg, altmode, qpg_done_remote_opened,
 			      2000);
-	log_warning("pmic-glink: wait remote OPEN ret=%d remote_opened=%d rcid=%u\n",
+	log_debug("pmic-glink: wait remote OPEN ret=%d remote_opened=%d rcid=%u\n",
 		    ret, pg->remote_opened, pg->rcid);
 	if (ret) {
 		if (glink_open_retp)
@@ -1618,7 +1618,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	ret = qpg_service_pmic_open(pg);
-	log_warning("pmic-glink: service PMIC OPEN ret=%d local_sent=%d remote_acked=%d\n",
+	log_debug("pmic-glink: service PMIC OPEN ret=%d local_sent=%d remote_acked=%d\n",
 		    ret, pg->local_open_sent,
 		    pg->remote_open_acked);
 	if (ret) {
@@ -1628,7 +1628,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	ret = qpg_drain_until(pg, altmode, qpg_done_open, 2000);
-	log_warning("pmic-glink: wait local OPEN_ACK ret=%d open_acked=%d\n",
+	log_debug("pmic-glink: wait local OPEN_ACK ret=%d open_acked=%d\n",
 		    ret, pg->open_acked);
 	if (ret) {
 		if (glink_open_retp)
@@ -1638,7 +1638,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 
 	liid = qpg_alloc_liid(pg);
 	ret = qpg_send_rx_intent_for(pg, pg->lcid, liid);
-	log_warning("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
+	log_debug("pmic-glink: send RX_INTENT ret=%d lcid=%u liid=%u\n",
 		    ret, pg->lcid, liid);
 	if (ret) {
 		if (glink_open_retp)
@@ -1672,7 +1672,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 
 	pg->pan_acked = false;
 	ret = qpg_send_altmode_req(pg, ALTMODE_PAN_EN, 0);
-	log_warning("pmic-glink: send PAN_EN ret=%d\n", ret);
+	log_debug("pmic-glink: send PAN_EN ret=%d\n", ret);
 	if (ret) {
 		if (pan_en_retp)
 			*pan_en_retp = ret;
@@ -1680,7 +1680,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	}
 
 	ret = qpg_drain_until(pg, altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+	log_debug("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
 		    ret, pg->pan_acked);
 	if (pan_en_retp)
 		*pan_en_retp = ret;
@@ -1707,7 +1707,7 @@ int qpg_open_session(struct qcom_pmic_glink_altmode *altmode,
 	if (!qpg_env_bool("qpg_no_ucsi_discover")) {
 		int disc = qpg_ucsi_discover(pg);
 
-		log_warning("pmic-glink: UCSI discover ret=%d\n", disc);
+		log_debug("pmic-glink: UCSI discover ret=%d\n", disc);
 	}
 
 	pg->session_ready = true;

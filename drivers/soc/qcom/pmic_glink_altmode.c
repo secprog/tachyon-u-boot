@@ -112,7 +112,7 @@ static void qpg_update_cached_state(struct qpg *pg,
 	pg->cached_state.typec_state = qpg_public_typec_state(state);
 	pg->cached_state.last_notify_ms = get_timer(0);
 
-	log_warning("qpg: service started=%u pan=%u notify_seen=%u dp_seen=%u hpd=%u raw_dpam=%u linux_mode=%u dp_pin=%u age_ms=%lu\n",
+	log_debug("qpg: service started=%u pan=%u notify_seen=%u dp_seen=%u hpd=%u raw_dpam=%u linux_mode=%u dp_pin=%u age_ms=%lu\n",
 		    pg->cached_state.service_started,
 		    pg->cached_state.pan_enabled,
 		    pg->cached_state.notify_seen,
@@ -168,7 +168,7 @@ static void qpg_program_sbu_mux(enum qcom_pmic_glink_orientation orientation,
 	udelay(1000);
 	dm_gpio_set_value(&sbu_enable, enable);
 
-	log_warning("pmic-glink: SBU mux %s orientation=%u enable=%d select=%d\n",
+	log_debug("pmic-glink: SBU mux %s orientation=%u enable=%d select=%d\n",
 		    qpg_typec_state_name(state), orientation,
 		    dm_gpio_get_value(&sbu_enable),
 		    dm_gpio_get_value(&sbu_select));
@@ -190,7 +190,7 @@ static void qpg_program_qmp_typec(enum qcom_pmic_glink_orientation orientation,
 
 	reverse = orientation == QCOM_PMIC_GLINK_ORIENTATION_REVERSE;
 	ret = qcom_qmp_combo_typec_set(reverse, dp_svid, pin_assignment);
-	log_warning("pmic-glink: QMP Type-C provider ret=%d state=%s dp_svid=%d orientation=%u pin=%u\n",
+	log_debug("pmic-glink: QMP Type-C provider ret=%d state=%s dp_svid=%d orientation=%u pin=%u\n",
 		    ret, qpg_typec_state_name(state), dp_svid,
 		    orientation, pin_assignment);
 }
@@ -210,7 +210,7 @@ static void qpg_apply_typec_state(enum qcom_pmic_glink_orientation orientation,
 	qpg_program_qmp_typec(orientation, state, pin_assignment);
 
 	sbu_en = state == QPG_TYPEC_DP;
-	log_warning("qpg: apply state=%s sbu_en=%u sbu_sel=%u qmp_mode=%s reverse=%u pin=%u ret=%d\n",
+	log_debug("qpg: apply state=%s sbu_en=%u sbu_sel=%u qmp_mode=%s reverse=%u pin=%u ret=%d\n",
 		    qpg_typec_state_name(state), sbu_en, sbu_sel,
 		    qpg_typec_state_name(state), reverse, pin_assignment, 0);
 }
@@ -227,7 +227,7 @@ bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	u8 port;
 	u16 svid;
 
-	log_warning("pmic-glink: SC8280XP notify len=%zu expected=%zu\n",
+	log_debug("pmic-glink: SC8280XP notify len=%zu expected=%zu\n",
 		    len, sizeof(*notify));
 
 	if (len != sizeof(*notify))
@@ -236,7 +236,7 @@ bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	port = notify->payload[0];
 	*portp = port;
 	svid = le32_to_cpu(notify->hdr.opcode) >> 16;
-	log_warning("pmic-glink: SC8280XP port=%u orientation=%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
+	log_debug("pmic-glink: SC8280XP port=%u orientation=%u mux=%u svid=%04x dpam=%02x hpd=%u irq=%u\n",
 		    port, notify->payload[1],
 		    notify->payload[2], svid,
 		    notify->payload[8] & SC8280XP_DPAM_MASK,
@@ -255,7 +255,7 @@ bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	pg->notify.dp_pin_assignment = 0;
 	pg->notify.hpd = !!(notify->payload[8] & SC8280XP_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notify->payload[8] & SC8280XP_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+	log_debug("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    le32_to_cpu(notify->hdr.opcode), svid, port,
 		    pg->notify.raw_orientation, orientation, pg->notify.mux,
 		    pg->notify.dpam, pg->notify.linux_mux_mode,
@@ -282,7 +282,7 @@ bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 	pg->altmode_notify_seen = true;
 	mode = pg->notify.dpam;
 	linux_mode = pg->notify.linux_mux_mode;
-	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
+	log_debug("pmic-glink: orientation raw=%u mapped=%u\n",
 		    notify->payload[1], orientation);
 	if (linux_mode == 0xff) {
 		altmode->dp = false;
@@ -290,13 +290,13 @@ bool qpg_parse_sc8280xp_notify(struct qpg *pg,
 		pg->altmode_no_dp = true;
 		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
 		qpg_update_cached_state(pg, altmode, QPG_TYPEC_SAFE);
-		log_warning("pmic-glink: DP notify safe/no-DP mux=%u raw_dpam=%u linux_mode=%u\n",
+		log_debug("pmic-glink: DP notify safe/no-DP mux=%u raw_dpam=%u linux_mode=%u\n",
 			    notify->payload[2], mode, linux_mode);
 		return true;
 	}
 
 	pg->notify.dp_pin_assignment = linux_mode;
-	log_warning("pmic-glink: DPAM raw=%u linux_mode=%u dp_pin_assignment=%u\n",
+	log_debug("pmic-glink: DPAM raw=%u linux_mode=%u dp_pin_assignment=%u\n",
 		    mode, linux_mode, pg->notify.dp_pin_assignment);
 
 	altmode->pin_assignment = pg->notify.dp_pin_assignment;
@@ -323,7 +323,7 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	u8 port;
 	u16 svid;
 
-	log_warning("pmic-glink: SC8180X notify len=%zu expected=%zu\n",
+	log_debug("pmic-glink: SC8180X notify len=%zu expected=%zu\n",
 		    len, sizeof(*msg));
 
 	if (len != sizeof(*msg))
@@ -336,7 +336,7 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	mux = (notification & SC8180X_MUX_MASK) >> 16;
 	mode = (notification & SC8180X_MODE_MASK) >> 24;
 	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
-	log_warning("pmic-glink: SC8180X notification=%08x port=%u orientation=%u mux=%u mode=%u hpd=%u irq=%u\n",
+	log_debug("pmic-glink: SC8180X notification=%08x port=%u orientation=%u mux=%u mode=%u hpd=%u irq=%u\n",
 		    notification, port, raw_orientation, mux, mode,
 		    !!(notification & SC8180X_HPD_STATE_MASK),
 		    !!(notification & SC8180X_HPD_IRQ_MASK));
@@ -352,7 +352,7 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	pg->notify.dp_pin_assignment = 0;
 	pg->notify.hpd = !!(notification & SC8180X_HPD_STATE_MASK);
 	pg->notify.hpd_irq = !!(notification & SC8180X_HPD_IRQ_MASK);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+	log_debug("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    le32_to_cpu(msg->hdr.opcode), svid, port,
 		    pg->notify.raw_orientation, orientation, pg->notify.mux,
 		    pg->notify.dpam, pg->notify.linux_mux_mode,
@@ -364,7 +364,7 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 	altmode->hpd = pg->notify.hpd;
 	altmode->hpd_irq = pg->notify.hpd_irq;
 	pg->altmode_notify_seen = true;
-	log_warning("pmic-glink: orientation raw=%u mapped=%u\n",
+	log_debug("pmic-glink: orientation raw=%u mapped=%u\n",
 		    raw_orientation, orientation);
 	if (svid != USB_TYPEC_DP_SID) {
 		altmode->dp = false;
@@ -372,7 +372,7 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		pg->altmode_no_dp = true;
 		qpg_apply_typec_state(orientation, QPG_TYPEC_USB, 0);
 		qpg_update_cached_state(pg, altmode, QPG_TYPEC_USB);
-		log_warning("pmic-glink: SC8180X notify USB/no-DP mux=%u mode=%u\n",
+		log_debug("pmic-glink: SC8180X notify USB/no-DP mux=%u mode=%u\n",
 			    mux, mode);
 		return true;
 	}
@@ -383,13 +383,13 @@ bool qpg_parse_sc8180x_notify(struct qpg *pg,
 		pg->altmode_no_dp = true;
 		qpg_apply_typec_state(orientation, QPG_TYPEC_SAFE, 0);
 		qpg_update_cached_state(pg, altmode, QPG_TYPEC_SAFE);
-		log_warning("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
+		log_debug("pmic-glink: SC8180X notify safe/no-DP mux=%u mode=%u\n",
 			    mux, mode);
 		return true;
 	}
 
 	pg->notify.dp_pin_assignment = mode;
-	log_warning("pmic-glink: SC8180X DP active linux_mode=%u dp_pin_assignment=%u\n",
+	log_debug("pmic-glink: SC8180X DP active linux_mode=%u dp_pin_assignment=%u\n",
 		    mode, pg->notify.dp_pin_assignment);
 
 	altmode->pin_assignment = pg->notify.dp_pin_assignment;
@@ -408,19 +408,19 @@ int qpg_send_notify_pan_ack(struct qpg *pg,
 {
 	int ret;
 
-	log_warning("pmic-glink: send ALTMODE_PAN_ACK port=%u\n", port);
+	log_debug("pmic-glink: send ALTMODE_PAN_ACK port=%u\n", port);
 
 	pg->pan_acked = false;
 	ret = qpg_send_altmode_req(pg, ALTMODE_PAN_ACK, port);
-	log_warning("pmic-glink: send ALTMODE_PAN_ACK ret=%d port=%u\n",
+	log_debug("pmic-glink: send ALTMODE_PAN_ACK ret=%d port=%u\n",
 		    ret, port);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(pg, altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
+	log_debug("pmic-glink: wait PAN_ACK ret=%d pan_acked=%d\n",
 		    ret, pg->pan_acked);
-	log_warning("qpg: PAN_ACK state=%s ret=%d\n",
+	log_debug("qpg: PAN_ACK state=%s ret=%d\n",
 		    qpg_public_typec_state_name(pg->cached_state.typec_state),
 		    ret);
 
@@ -448,10 +448,10 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	u8 port = pin[0];
 
 	orientation = qpg_orientation(raw_orientation);
-	log_warning("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid_le=%04x svid_be=%04x svid_raw=%02x%02x dpam=%02x hpd=%u irq=%u\n",
+	log_debug("pmic-glink: %s pin port=%u orientation=%u/%u mux=%u vid=%04x svid_le=%04x svid_be=%04x svid_raw=%02x%02x dpam=%02x hpd=%u irq=%u\n",
 		    source, port, raw_orientation, orientation, mux, vid,
 		    svid_le, svid_be, pin[6], pin[7], mode, hpd, hpd_irq);
-	log_warning("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
+	log_debug("qpg: notify raw_opcode=%08x svid=%04x port=%u orient_raw=%u orient=%u mux=%u dpam=%02x linux_mode=%u dp_pin=%u hpd=%u irq=%u\n",
 		    (u32)(dp_svid ? USB_TYPEC_DP_SID : svid_le) << 16,
 		    dp_svid ? USB_TYPEC_DP_SID : svid_le, port,
 		    raw_orientation, orientation, mux, mode, linux_mode, 0,
@@ -484,7 +484,7 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 		pg->altmode_no_dp = true;
 		qpg_apply_typec_state(orientation, state, 0);
 		qpg_update_cached_state(pg, altmode, state);
-		log_warning("pmic-glink: %s %s/no-DP mux=%u dpam=%u dp_svid=%u\n",
+		log_debug("pmic-glink: %s %s/no-DP mux=%u dpam=%u dp_svid=%u\n",
 			    source, qpg_typec_state_name(state), mux, mode,
 			    dp_svid);
 		return;
@@ -497,7 +497,7 @@ static void qpg_apply_usbc_pin_assignment(struct qpg *pg,
 	qpg_apply_typec_state(orientation, QPG_TYPEC_DP,
 			      altmode->pin_assignment);
 	qpg_update_cached_state(pg, altmode, QPG_TYPEC_DP);
-	log_warning("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u dp_pin_assignment=%u\n",
+	log_debug("pmic-glink: %s DP active raw_dpam=%u linux_mode=%u dp_pin_assignment=%u\n",
 		    source, mode, linux_mode, altmode->pin_assignment);
 }
 
@@ -507,7 +507,7 @@ static void qpg_log_usbc_read(struct qpg *pg,
 	const u8 *buf = pg->usbc_read_buffer;
 	u32 data_type = get_unaligned_le32(buf);
 
-	log_warning("pmic-glink: USBC READ decoded ret=%u data_type=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	log_debug("pmic-glink: USBC READ decoded ret=%u data_type=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		    pg->usbc_read_return_code, data_type,
 		    buf[0], buf[1], buf[2], buf[3],
 		    buf[4], buf[5], buf[6], buf[7],
@@ -532,16 +532,16 @@ static int qpg_send_usbc_read(struct qpg *pg,
 	pg->usbc_read_acked = false;
 	pg->usbc_read_return_code = 0xffffffff;
 
-	log_warning("pmic-glink: owner=%u channel=%s USBC_READ_REQ\n",
+	log_debug("pmic-glink: owner=%u channel=%s USBC_READ_REQ\n",
 		    PMIC_GLINK_OWNER_USBC_PAN, QPG_CHANNEL_NAME);
 
 	ret = qpg_send_data(pg, &req, sizeof(req));
-	log_warning("pmic-glink: send USBC_READ_REQ ret=%d\n", ret);
+	log_debug("pmic-glink: send USBC_READ_REQ ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(pg, altmode, qpg_done_usbc_read, 1000);
-	log_warning("pmic-glink: wait USBC_READ ret=%d ack=%d\n",
+	log_debug("pmic-glink: wait USBC_READ ret=%d ack=%d\n",
 		    ret, pg->usbc_read_acked);
 	if (!ret)
 		qpg_log_usbc_read(pg, altmode);
@@ -556,12 +556,12 @@ static int qpg_send_usbc_read_select(struct qpg *pg, u32 read_sel)
 
 	pg->pan_acked = false;
 	ret = qpg_send_altmode_req(pg, ALTMODE_READ_SEL, read_sel);
-	log_warning("pmic-glink: send READ_SEL ret=%d sel=%u\n", ret, read_sel);
+	log_debug("pmic-glink: send READ_SEL ret=%d sel=%u\n", ret, read_sel);
 	if (ret)
 		return ret;
 
 	ret = qpg_drain_until(pg, &altmode, qpg_done_pan_ack, 1000);
-	log_warning("pmic-glink: wait READ_SEL_ACK ret=%d pan_acked=%d\n",
+	log_debug("pmic-glink: wait READ_SEL_ACK ret=%d pan_acked=%d\n",
 		    ret, pg->pan_acked);
 
 	return ret;
@@ -588,10 +588,10 @@ int qcom_pmic_glink_altmode_start(void)
 	if (!pg)
 		return -ENODEV;
 
-	log_warning("qpg: service start\n");
+	log_debug("qpg: service start\n");
 
 	ret = qpg_open_session(&altmode, NULL, NULL, NULL);
-	log_warning("qpg: service start ret=%d\n", ret);
+	log_debug("qpg: service start ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -680,7 +680,7 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 
 	memset(altmode, 0, sizeof(*altmode));
 
-	log_warning("pmic-glink: get_altmode start\n");
+	log_debug("pmic-glink: get_altmode start\n");
 
 	ret = qcom_pmic_glink_altmode_start();
 	if (ret)
@@ -693,7 +693,7 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (!pg->cached_altmode_valid) {
 		refresh_ret = qpg_refresh_usbc_pin_assignment(pg,
 							      altmode);
-		log_warning("pmic-glink: USBC pin refresh ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
+		log_debug("pmic-glink: USBC pin refresh ret=%d dp=%d orientation=%u pin=%u hpd=%d irq=%d\n",
 			    refresh_ret, altmode->dp, altmode->orientation,
 			    altmode->pin_assignment, altmode->hpd,
 			    altmode->hpd_irq);
@@ -704,7 +704,7 @@ int qcom_pmic_glink_get_altmode(struct qcom_pmic_glink_altmode *altmode)
 	if (pg->cached_altmode_valid)
 		*altmode = pg->cached_altmode;
 
-	log_warning("pmic-glink: get_altmode ret=0 dp=%d orientation=%u pin=%u hpd=%d irq=%d state=%s\n",
+	log_debug("pmic-glink: get_altmode ret=0 dp=%d orientation=%u pin=%u hpd=%d irq=%d state=%s\n",
 		    altmode->dp, altmode->orientation,
 		    altmode->pin_assignment, altmode->hpd,
 		    altmode->hpd_irq,
@@ -764,12 +764,12 @@ int qcom_pmic_glink_request_dfp(u32 settle_ms)
 			break;
 		if (state.notify_seen && state.last_notify_ms != last_notify_ms) {
 			last_notify_ms = state.last_notify_ms;
-			log_warning("qpg: DP wait notify mux=%u dpam=%02x hpd=%u dp_seen=%u svid=%04x\n",
+			log_debug("qpg: DP wait notify mux=%u dpam=%02x hpd=%u dp_seen=%u svid=%04x\n",
 				    state.mux, state.dpam_raw, state.hpd,
 				    state.dp_seen, state.svid);
 		}
 		if (state.dp_seen || state.mux == 3) {
-			log_warning("qpg: DP entered (mux=%u hpd=%u)\n",
+			log_debug("qpg: DP entered (mux=%u hpd=%u)\n",
 				    state.mux, state.hpd);
 			return 1;
 		}

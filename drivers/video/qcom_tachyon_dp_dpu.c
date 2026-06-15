@@ -36,24 +36,24 @@ void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv)
 	lm = priv->dpu + DPU_LM_0_BASE;
 	intf = priv->dpu + DPU_INTF_0_BASE;
 
-	log_warning("DPU CTL: FLUSH=%08x INTF_ACTIVE=%08x FETCH_PIPE=%08x LAYER0=%08x TOP=%08x\n",
+	log_debug("DPU CTL: FLUSH=%08x INTF_ACTIVE=%08x FETCH_PIPE=%08x LAYER0=%08x TOP=%08x\n",
 		    readl(ctl + DPU_CTL_FLUSH), readl(ctl + DPU_CTL_INTF_ACTIVE),
 		    readl(ctl + DPU_CTL_FETCH_PIPE_ACTIVE),
 		    readl(ctl + DPU_CTL_LAYER_0), readl(ctl + DPU_CTL_TOP));
-	log_warning("DPU SSPP: SRC0_ADDR=%08x SRC_SIZE=%08x OUT_SIZE=%08x FORMAT=%08x YSTRIDE=%08x CLK=%08x\n",
+	log_debug("DPU SSPP: SRC0_ADDR=%08x SRC_SIZE=%08x OUT_SIZE=%08x FORMAT=%08x YSTRIDE=%08x CLK=%08x\n",
 		    readl(sspp + DPU_SSPP_SRC0_ADDR),
 		    readl(sspp + DPU_SSPP_SRC_SIZE),
 		    readl(sspp + DPU_SSPP_OUT_SIZE),
 		    readl(sspp + DPU_SSPP_SRC_FORMAT),
 		    readl(sspp + DPU_SSPP_SRC_YSTRIDE0),
 		    readl(sspp + DPU_SSPP_CLK_CTRL));
-	log_warning("DPU LM_OUT=%08x INTF_STATUS=%08x INTF_MUX=%08x INTF_UNDERFLOW_COLOR=%08x\n",
+	log_debug("DPU LM_OUT=%08x INTF_STATUS=%08x INTF_MUX=%08x INTF_UNDERFLOW_COLOR=%08x\n",
 		    readl(lm + DPU_LM_OUT_SIZE), readl(intf + DPU_INTF_STATUS),
 		    readl(intf + DPU_INTF_MUX),
 		    readl(intf + DPU_INTF_UNDERFLOW_COLOR));
 
 	/* Confirm the LM-composite + SSPP op-mode config actually latched. */
-	log_warning("DPU LM_OP_MODE=%08x BLEND0_OP=%08x SSPP_OP_MODE=%08x MULTIRECT=%08x\n",
+	log_debug("DPU LM_OP_MODE=%08x BLEND0_OP=%08x SSPP_OP_MODE=%08x MULTIRECT=%08x\n",
 		    readl(lm + DPU_LM_OP_MODE), readl(lm + DPU_LM_BLEND0_OP),
 		    readl(sspp + DPU_SSPP_SRC_OP_MODE),
 		    readl(sspp + DPU_SSPP_MULTIRECT_OPMODE));
@@ -73,7 +73,7 @@ void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv)
 			u32 *fb = (u32 *)(ulong)fb_pa;
 
 			invalidate_dcache_range((ulong)fb, (ulong)fb + 0x2000);
-			log_warning("DPU FB@%08x: x0=%08x x240=%08x x480=%08x x960=%08x x1680=%08x\n",
+			log_debug("DPU FB@%08x: x0=%08x x240=%08x x480=%08x x960=%08x x1680=%08x\n",
 				    fb_pa, fb[0], fb[240], fb[480], fb[960], fb[1680]);
 		}
 	}
@@ -501,7 +501,7 @@ static void tachyon_dp_vote_cx_corner(struct rsc_drv *drv)
 		};
 		int ret = rpmh_rsc_send_data(drv, &msg);
 
-		log_warning("DP: CX corner vote addr=%#x idx=%d ret=%d\n",
+		log_debug("DP: CX corner vote addr=%#x idx=%d ret=%d\n",
 			    addr, idx, ret);
 	}
 }
@@ -545,7 +545,7 @@ static void tachyon_dp_grant_mdp0_bandwidth(void)
 		u32 vy = tachyon_bcm_vote_y(path[i].n, path[i].bw, ib_kbps);
 
 		ret = tachyon_bcm_send(drv, a, BCM_TCS_CMD(1, 1, vx, vy));
-		log_warning("DP: %s bw vote addr=%#x vx=%u vy=%u ret=%d\n",
+		log_debug("DP: %s bw vote addr=%#x vx=%u vy=%u ret=%d\n",
 			    path[i].n, a, vx, vy, ret);
 	}
 
@@ -589,7 +589,7 @@ static void tachyon_dp_fix_mdp_smr(void)
 			writel(want, smmu + 0x800 + 4 * n);	/* NS write   */
 			qcom_scm_io_writel(pa, want);		/* secure write */
 			qcom_scm_io_readl(pa, &sv);
-			log_warning("MDP SMR[%d] mask-fix: was=%08x want=%08x ns_rb=%08x scm_rb=%08x\n",
+			log_debug("MDP SMR[%d] mask-fix: was=%08x want=%08x ns_rb=%08x scm_rb=%08x\n",
 				    n, smr, want, readl(smmu + 0x800 + 4 * n), sv);
 		}
 		break;
@@ -640,7 +640,7 @@ int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
 		writel(0x33333333, priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF0);
 		writel(0x00333333, priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF1);
 
-		log_warning("VBIF xin1 init: HALT1_before=%08x PND=%08x SRC=%08x AMEM0=%08x\n",
+		log_debug("VBIF xin1 init: HALT1_before=%08x PND=%08x SRC=%08x AMEM0=%08x\n",
 			    halt1_before, pnd, src,
 			    readl(priv->vbif + VBIF_OUT_AXI_AMEMTYPE_CONF0));
 	}
@@ -681,7 +681,7 @@ void tachyon_dpu_quiesce(struct tachyon_dp_priv *priv)
 	intf = priv->dpu + DPU_INTF_0_BASE;
 	sspp = priv->dpu + DPU_SSPP_DMA0_BASE;
 
-	log_warning("DPU quiesce before OS handoff\n");
+	log_debug("DPU quiesce before OS handoff\n");
 
 	writel(0, intf + DPU_INTF_TIMING_ENGINE_EN);
 	writel(0, intf + DPU_INTF_FRAME_LINE_COUNT_EN);

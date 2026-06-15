@@ -105,7 +105,7 @@ static void tachyon_dp_aux_reset_linux(struct tachyon_dp_priv *priv)
 {
 	u32 ctrl = readl(priv->aux + REG_DP_AUX_CTRL);
 
-	log_warning("DP AUX reset: ctrl_before=%08x\n", ctrl);
+	log_debug("DP AUX reset: ctrl_before=%08x\n", ctrl);
 
 	ctrl |= DP_AUX_CTRL_RESET;
 	writel(ctrl, priv->aux + REG_DP_AUX_CTRL);
@@ -114,7 +114,7 @@ static void tachyon_dp_aux_reset_linux(struct tachyon_dp_priv *priv)
 	ctrl &= ~DP_AUX_CTRL_RESET;
 	writel(ctrl, priv->aux + REG_DP_AUX_CTRL);
 	mdelay(1);
-	log_warning("DP AUX reset: ctrl_after=%08x\n", ctrl);
+	log_debug("DP AUX reset: ctrl_after=%08x\n", ctrl);
 }
 
 static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
@@ -167,7 +167,7 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	 * idle (non-zero TRANS_CTRL) or STATUS already shows errors,
 	 * the transaction will likely fail before it begins.
 	 */
-	log_warning("AUX start: addr=%x i2c=%d read=%d mot=%d len=%zu ctrl=%08x status=%08x trans=%08x stale_intr=%08x phy_intr=%08x\n",
+	log_debug("AUX start: addr=%x i2c=%d read=%d mot=%d len=%zu ctrl=%08x status=%08x trans=%08x stale_intr=%08x phy_intr=%08x\n",
 		    addr, i2c, read, mot, len,
 		    readl(priv->aux + REG_DP_AUX_CTRL),
 		    readl(priv->aux + REG_DP_AUX_STATUS),
@@ -181,7 +181,7 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 	 * Confirm the GO bit was accepted.  If it doesn't read back as
 	 * set, the controller may be in reset or the clock may be gated.
 	 */
-	log_warning("AUX go: trans=%08x status=%08x intr_raw=%08x\n",
+	log_debug("AUX go: trans=%08x status=%08x intr_raw=%08x\n",
 		    readl(priv->aux + REG_DP_AUX_TRANS_CTRL),
 		    readl(priv->aux + REG_DP_AUX_STATUS),
 		    readl(priv->ctrl + REG_DP_INTR_STATUS));
@@ -215,7 +215,7 @@ static int tachyon_dp_aux_xfer(struct tachyon_dp_priv *priv, bool i2c,
 		return -ETIMEDOUT;
 	}
 
-	log_warning("AUX done: addr=%x i2c=%d read=%d len=%zu intr=%08x phy_intr=%08x status=%08x trans=%08x\n",
+	log_debug("AUX done: addr=%x i2c=%d read=%d len=%zu intr=%08x phy_intr=%08x status=%08x trans=%08x\n",
 		    addr, i2c, read, len,
 		    intr,
 		    readl(priv->aux + REG_DP_PHY_AUX_INTERRUPT_STATUS),

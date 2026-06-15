@@ -89,7 +89,7 @@ static int tachyon_dp_enable_core_clocks(struct tachyon_dp_priv *priv)
 		}
 		if (!ret)
 			priv->dp_clk_enabled[i] = true;
-		log_warning("DP clk %s enable ret=%d\n", names[i], ret);
+		log_debug("DP clk %s enable ret=%d\n", names[i], ret);
 	}
 
 	priv->dp_core_clocks_enabled = true;
@@ -231,7 +231,7 @@ void tachyon_dp_log_typec_resolved(struct tachyon_dp_priv *priv)
 {
 	u8 pin_lanes = tachyon_dp_pin_assignment_lanes(priv);
 
-	log_warning("DP TYPEC RESOLVED: source=altmode orientation=%u pin=%u pin_lanes=%u graph_lanes=%u lane_map=%02x\n",
+	log_debug("DP TYPEC RESOLVED: source=altmode orientation=%u pin=%u pin_lanes=%u graph_lanes=%u lane_map=%02x\n",
 		    priv->orientation, priv->pin_assignment, pin_lanes,
 		    priv->graph_lanes, priv->lane_map & 0xff);
 
@@ -280,7 +280,7 @@ static int tachyon_dp_read_altmode(struct tachyon_dp_priv *priv)
 	int ret;
 
 	ret = qcom_pmic_glink_get_altmode(&glink_altmode);
-	log_warning("DP PMIC-GLINK raw altmode: ret=%d dp=%d port=%u orientation=%u pin=%u hpd=%d hpd_irq=%d\n",
+	log_debug("DP PMIC-GLINK raw altmode: ret=%d dp=%d port=%u orientation=%u pin=%u hpd=%d hpd_irq=%d\n",
 		    ret, glink_altmode.dp, glink_altmode.port,
 		    glink_altmode.orientation, glink_altmode.pin_assignment,
 		    glink_altmode.hpd, glink_altmode.hpd_irq);
@@ -377,18 +377,18 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 	if (!ofnode_valid(mux))
 		return -ENOENT;
 
-	log_warning("SBU mux request start: node=%s\n",
+	log_debug("SBU mux request start: node=%s\n",
 		    ofnode_get_name(mux));
 
 	/* Debug: dump SBU mux node structure */
 	{
 		ofnode ports = ofnode_find_subnode(mux, "ports");
-		log_warning("SBU ports valid=%d name=%s\n",
+		log_debug("SBU ports valid=%d name=%s\n",
 			    ofnode_valid(ports),
 			    ofnode_valid(ports) ? ofnode_get_name(ports) : "<none>");
 		if (ofnode_valid(ports)) {
 			ofnode port0 = ofnode_find_subnode(ports, "port@0");
-			log_warning("SBU port@0 valid=%d\n",
+			log_debug("SBU port@0 valid=%d\n",
 				    ofnode_valid(port0));
 		}
 	}
@@ -404,17 +404,17 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 
 	ret = gpio_request_by_name_nodev(mux, "enable-gpios", 0,
 					 &priv->sbu_enable, GPIOD_IS_OUT);
-	log_warning("SBU enable GPIO request ret=%d\n", ret);
+	log_debug("SBU enable GPIO request ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = gpio_request_by_name_nodev(mux, "select-gpios", 0,
 					 &priv->sbu_select, GPIOD_IS_OUT);
-	log_warning("SBU select GPIO request ret=%d\n", ret);
+	log_debug("SBU select GPIO request ret=%d\n", ret);
 	if (ret)
 		return ret;
 
-	log_warning("SBU mux request done\n");
+	log_debug("SBU mux request done\n");
 
 	return 0;
 }
@@ -426,7 +426,7 @@ static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 	int select;
 	int enable;
 
-	log_warning("SBU mux program start orientation=%u pin=%u invert_select=%d invert_enable=%d\n",
+	log_debug("SBU mux program start orientation=%u pin=%u invert_select=%d invert_enable=%d\n",
 		    priv->orientation, priv->pin_assignment,
 		    invert_select ? 1 : 0,
 		    invert_enable ? 1 : 0);
@@ -447,7 +447,7 @@ static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 	if (dm_gpio_is_valid(&priv->sbu_enable))
 		dm_gpio_set_value(&priv->sbu_enable, enable);
 
-	log_warning("SBU mux program done: enable=%d select=%d\n",
+	log_debug("SBU mux program done: enable=%d select=%d\n",
 		    dm_gpio_is_valid(&priv->sbu_enable) ?
 			    dm_gpio_get_value(&priv->sbu_enable) : -1,
 		    dm_gpio_is_valid(&priv->sbu_select) ?
@@ -514,7 +514,7 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 	priv->phy_dp = (void __iomem *)((u8 __iomem *)priv->phy +
 					offs->dp_phy);
 
-	log_warning("QMP offsets: base=%p com=%p dp_serdes=%p tx0=%p tx1=%p dp_phy=%p\n",
+	log_debug("QMP offsets: base=%p com=%p dp_serdes=%p tx0=%p tx1=%p dp_phy=%p\n",
 		    priv->phy, priv->qmp_com, priv->qmp_dp_serdes,
 		    priv->qmp_dp_tx0, priv->qmp_dp_tx1, priv->phy_dp);
 
@@ -530,7 +530,7 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 		priv->has_qmp_phy = true;
 
 		ret = generic_phy_init(&priv->qmp_phy);
-		log_warning("QMP generic PHY init ret=%d id=%lu\n",
+		log_debug("QMP generic PHY init ret=%d id=%lu\n",
 			    ret, priv->qmp_phy.id);
 		if (ret)
 			return ret;
@@ -664,7 +664,7 @@ static void tachyon_dp_dump_video_state(struct tachyon_dp_priv *priv)
 	void __iomem *intf;
 	u32 frame0 = 0, line0 = 0, frame1 = 0, line1 = 0;
 
-	log_warning("DP MSA regs: TOTAL=%08x ACTIVE=%08x SYNC_START=%08x WIDTH_POL=%08x MISC0=%08x MVID=%08x NVID=%08x\n",
+	log_debug("DP MSA regs: TOTAL=%08x ACTIVE=%08x SYNC_START=%08x WIDTH_POL=%08x MISC0=%08x MVID=%08x NVID=%08x\n",
 		    readl(priv->link + REG_DP_TOTAL_HOR_VER),
 		    readl(priv->link + REG_DP_ACTIVE_HOR_VER),
 		    readl(priv->link + REG_DP_START_HOR_VER_FROM_SYNC),
@@ -672,7 +672,7 @@ static void tachyon_dp_dump_video_state(struct tachyon_dp_priv *priv)
 		    readl(priv->link + REG_DP_MISC1_MISC0),
 		    readl(priv->link + REG_DP_SOFTWARE_MVID),
 		    readl(priv->link + REG_DP_SOFTWARE_NVID));
-	log_warning("DP mode expect: %ux%u htotal=%u vtotal=%u pclk=%u STATE_CTRL=%08x READY=%08x\n",
+	log_debug("DP mode expect: %ux%u htotal=%u vtotal=%u pclk=%u STATE_CTRL=%08x READY=%08x\n",
 		    t->hactive.typ, t->vactive.typ, tachyon_dp_htotal(t),
 		    tachyon_dp_vtotal(t), t->pixelclock.typ,
 		    readl(priv->link + REG_DP_STATE_CTRL),
@@ -685,7 +685,7 @@ static void tachyon_dp_dump_video_state(struct tachyon_dp_priv *priv)
 		mdelay(50);
 		frame1 = readl(intf + DPU_INTF_FRAME_COUNT);
 		line1 = readl(intf + DPU_INTF_LINE_COUNT);
-		log_warning("DPU INTF: TE_EN=%08x frame %u->%u line %u->%u (advancing=%d)\n",
+		log_debug("DPU INTF: TE_EN=%08x frame %u->%u line %u->%u (advancing=%d)\n",
 			    readl(intf + DPU_INTF_TIMING_ENGINE_EN),
 			    frame0, frame1, line0, line1,
 			    (frame1 != frame0) || (line1 != line0));
@@ -709,7 +709,7 @@ static void tachyon_dp_dump_video_state(struct tachyon_dp_priv *priv)
 				     &l23, 1);
 		tachyon_dp_aux_retry(priv, false, true, DPCD_LANE_ALIGN_STATUS,
 				     &align, 1);
-		log_warning("DP post-video link status: LANE0_1=0x%02x LANE2_3=0x%02x ALIGN=0x%02x\n",
+		log_debug("DP post-video link status: LANE0_1=0x%02x LANE2_3=0x%02x ALIGN=0x%02x\n",
 			    l01, l23, align);
 	}
 }
@@ -766,7 +766,7 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 		dto &= ~(DP_P0CLK_DSC_DTO_OVERRIDE_ACK |
 			 DP_P0CLK_DSC_DTO_OVERRIDE_ACK_VALUE);
 		writel(dto, priv->p0 + MMSS_DP_P0CLK_DSC_DTO);
-		log_warning("DP backpressure enabled: DSC_DTO=%08x\n",
+		log_debug("DP backpressure enabled: DSC_DTO=%08x\n",
 			    readl(priv->p0 + MMSS_DP_P0CLK_DSC_DTO));
 	}
 
@@ -786,7 +786,7 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	if (priv->dpu && !tachyon_dp_env_bool("tachyon_dp_tpg")) {
 		writel(1, priv->dpu + DPU_INTF_0_BASE +
 			  DPU_INTF_TIMING_ENGINE_EN);
-		log_warning("DP INTF timing engine ON (after SEND_VIDEO)\n");
+		log_debug("DP INTF timing engine ON (after SEND_VIDEO)\n");
 	} else if (priv->dpu) {
 		/*
 		 * TPG mode: leave the DPU INTF timing engine OFF so the DP
@@ -795,14 +795,14 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 		 * main link + MSA + TU as normal video, so this isolates the
 		 * DPU pixel path from the DP stream.
 		 */
-		log_warning("DP TPG mode: DPU INTF timing engine left OFF\n");
+		log_debug("DP TPG mode: DPU INTF timing engine left OFF\n");
 	}
 
 	{
 		int rdy = tachyon_dp_read_poll(priv->link, REG_DP_MAINLINK_READY,
 					       DP_MAINLINK_READY_FOR_VIDEO,
 					       DP_MAINLINK_READY_FOR_VIDEO, 5000);
-		log_warning("DP mainlink ready-for-video ret=%d MAINLINK_READY=%08x MAINLINK_CTRL=%08x\n",
+		log_debug("DP mainlink ready-for-video ret=%d MAINLINK_READY=%08x MAINLINK_CTRL=%08x\n",
 			    rdy, readl(priv->link + REG_DP_MAINLINK_READY),
 			    readl(priv->link + REG_DP_MAINLINK_CTRL));
 		tachyon_dp_dump_video_state(priv);
@@ -853,26 +853,26 @@ static void tachyon_dp_quiesce(struct tachyon_dp_priv *priv)
 	int ret;
 
 	tachyon_dpu_quiesce(priv);
-	log_warning("DP quiesce: step dpu done\n");
+	log_debug("DP quiesce: step dpu done\n");
 	tachyon_dp_controller_quiesce(priv);
-	log_warning("DP quiesce: step controller done\n");
+	log_debug("DP quiesce: step controller done\n");
 
 	if (priv->phy_dp && (priv->qmp_dp_touched ||
 			     priv->qmp_dp_serdes_programmed ||
 			     priv->qmp_dp_phy_started)) {
 		tachyon_dp_qmp_power_down(priv);
-		log_warning("DP quiesce: step qmp_power_down done\n");
+		log_debug("DP quiesce: step qmp_power_down done\n");
 	}
 
 	if (priv->has_qmp_phy) {
 		ret = generic_phy_power_off(&priv->qmp_phy);
 		if (ret && ret != -ENOSYS)
 			log_warning("QMP PHY power_off failed: %d\n", ret);
-		log_warning("DP quiesce: step phy_power_off done\n");
+		log_debug("DP quiesce: step phy_power_off done\n");
 		ret = generic_phy_exit(&priv->qmp_phy);
 		if (ret && ret != -ENOSYS)
 			log_warning("QMP PHY exit failed: %d\n", ret);
-		log_warning("DP quiesce: step phy_exit done\n");
+		log_debug("DP quiesce: step phy_exit done\n");
 		priv->has_qmp_phy = false;
 	}
 
@@ -898,7 +898,7 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 	struct qcom_pmic_glink_altmode_state altmode_state;
 	int altmode_ret;
 
-	log_warning("DP wait sink: %d tries, %d us interval\n",
+	log_debug("DP wait sink: %d tries, %d us interval\n",
 		    TACHYON_DP_AUX_DEBOUNCE_TRIES, 20000);
 
 	for (i = 0; i < TACHYON_DP_AUX_DEBOUNCE_TRIES; i++) {
@@ -953,7 +953,7 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 
 			ret = tachyon_dp_aux_retry(priv, false, true,
 						   DP_DPCD_REV, &dpcd_rev, 1);
-			log_warning("DPCD_REV 1-byte read ret=%d val=%02x\n",
+			log_debug("DPCD_REV 1-byte read ret=%d val=%02x\n",
 				    ret, dpcd_rev);
 		}
 
@@ -968,7 +968,7 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 			return 0;
 		}
 
-		log_warning("DP sink DPCD try %d/%d failed ret=%d\n",
+		log_debug("DP sink DPCD try %d/%d failed ret=%d\n",
 			    i + 1, TACHYON_DP_AUX_DEBOUNCE_TRIES, ret);
 
 		/*
@@ -996,7 +996,7 @@ static void tachyon_dp_prepare_aux_for_orientation(
 
 	priv->orientation = orientation;
 
-	log_warning("DP prepare AUX orientation=%u pin=%u\n",
+	log_debug("DP prepare AUX orientation=%u pin=%u\n",
 		    priv->orientation, priv->pin_assignment);
 
 	/* Provider owns COM reset; the DP driver only updates orientation/mode. */
@@ -1016,7 +1016,7 @@ static void tachyon_dp_prepare_aux_for_orientation(
 
 	pd_low = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL) & 0xff;
 
-	log_warning("DP AUX orientation state: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x SBU_EN=%d SBU_SEL=%d AUX_CTRL=%08x AUX_STATUS=%08x AUX_TRANS=%08x\n",
+	log_debug("DP AUX orientation state: TYPEC=%02x MODE=%02x PD=%02x STATUS=%02x SBU_EN=%d SBU_SEL=%d AUX_CTRL=%08x AUX_STATUS=%08x AUX_TRANS=%08x\n",
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
 		    pd_low,
@@ -1040,7 +1040,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	bool has_sbu_mux;
 	bool forced_typec = false;
 
-	log_warning("DP probe start\n");
+	log_debug("DP probe start\n");
 
 	priv->typec_source = TACHYON_DP_TYPEC_SOURCE_NONE;
 	priv->typec_valid = false;
@@ -1081,9 +1081,9 @@ static int tachyon_dp_probe(struct udevice *dev)
 		goto err_quiesce;
 
 	/* Print QMP base addresses for offset verification */
-	log_warning("DP QMP base: phy=%p phy_dp=%p\n",
+	log_debug("DP QMP base: phy=%p phy_dp=%p\n",
 		    priv->phy, priv->phy_dp);
-	log_warning("DP QMP offsets: TYPEC_CTRL=%x PHY_MODE_CTRL=%x DP_PD_CTL=%x DP_STATUS=%x\n",
+	log_debug("DP QMP offsets: TYPEC_CTRL=%x PHY_MODE_CTRL=%x DP_PD_CTL=%x DP_STATUS=%x\n",
 		    (u32)QMP_V3_DP_COM_TYPEC_CTRL,
 		    (u32)QMP_V3_DP_COM_PHY_MODE_CTRL,
 		    (u32)(QMP_OFF_DP_PHY + QMP_DP_PHY_PD_CTL),
@@ -1094,7 +1094,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 		int ci;
 
 		for (ci = 0; ci < TACHYON_DP_CORE_CLK_COUNT; ci++)
-			log_warning("DP clk[%d] valid=%d\n",
+			log_debug("DP clk[%d] valid=%d\n",
 				    ci, priv->dp_clk_valid[ci]);
 	}
 
@@ -1125,7 +1125,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 		}
 		tachyon_dp_log_typec_resolved(priv);
 	} else {
-		log_warning("DP Type-C Alt Mode not active yet: ret=%d; continuing DP init while PMIC service polls\n",
+		log_debug("DP Type-C Alt Mode not active yet: ret=%d; continuing DP init while PMIC service polls\n",
 			    altmode_ret);
 
 		/*
@@ -1145,7 +1145,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 				tachyon_dp_env_u32("tachyon_dp_auto_dfp_ms",
 						   20000));
 
-			log_warning("DP auto-DFP ret=%d; re-reading altmode\n",
+			log_debug("DP auto-DFP ret=%d; re-reading altmode\n",
 				    dfp);
 			altmode_ret = tachyon_dp_read_altmode(priv);
 			if (altmode_ret > 0) {
@@ -1169,14 +1169,14 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	has_sbu_mux = dm_gpio_is_valid(&priv->sbu_enable) &&
 		      dm_gpio_is_valid(&priv->sbu_select);
-	log_warning("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
+	log_debug("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
 
 	if (!priv->typec_valid) {
 		const struct qcom_pmic_glink_altmode_state *state;
 
 		state = qcom_pmic_glink_altmode_get_state();
 
-		log_warning("DP Type-C Alt Mode not active before AUX; continuing with PMIC state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x hpd=%u\n",
+		log_debug("DP Type-C Alt Mode not active before AUX; continuing with PMIC state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x hpd=%u\n",
 			    state ? state->typec_state : 0,
 			    state ? state->svid : 0,
 			    state ? state->orientation_raw : 0xff,
@@ -1220,7 +1220,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 			}
 			priv->pin_assignment = forced_pin;
 		}
-		log_warning("DP forced Type-C: orientation=%u pin=%u pin_lanes=%u (override: tachyon_dp_force_pin / _reverse / _lanes / _max_rate)\n",
+		log_debug("DP forced Type-C: orientation=%u pin=%u pin_lanes=%u (override: tachyon_dp_force_pin / _reverse / _lanes / _max_rate)\n",
 			    priv->orientation, priv->pin_assignment,
 			    tachyon_dp_pin_assignment_lanes(priv));
 		tachyon_dp_log_typec_resolved(priv);
@@ -1269,7 +1269,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 			priv->rate = DP_LINK_RATE_HBR;
 			priv->lanes = 2;
 
-			log_warning("DP probe %d/%d: orientation=%u pin=%u pin_lanes=%u\n",
+			log_debug("DP probe %d/%d: orientation=%u pin=%u pin_lanes=%u\n",
 				    ci + 1, ncand, priv->orientation,
 				    priv->pin_assignment,
 				    tachyon_dp_pin_assignment_lanes(priv));
@@ -1279,15 +1279,15 @@ static int tachyon_dp_probe(struct udevice *dev)
 							       priv->orientation);
 
 			ret = tachyon_dp_qmp_program_dp_phy(priv);
-			log_warning("DP probe PHY bring-up ret=%d DP_STATUS=%02x\n",
+			log_debug("DP probe PHY bring-up ret=%d DP_STATUS=%02x\n",
 				    ret, tachyon_dp_qmp_status_low(priv));
 
 			ret = tachyon_dp_read_dpcd_caps(priv);
-			log_warning("DP probe DPCD ret=%d caps.lanes=%u caps.max_rate=%u\n",
+			log_debug("DP probe DPCD ret=%d caps.lanes=%u caps.max_rate=%u\n",
 				    ret, priv->caps.lanes, priv->caps.max_rate);
 
 			if (!ret && priv->caps.lanes && priv->caps.max_rate) {
-				log_warning("DP probe LOCKED orientation=%u pin=%u after %d/%d\n",
+				log_debug("DP probe LOCKED orientation=%u pin=%u after %d/%d\n",
 					    priv->orientation,
 					    priv->pin_assignment, ci + 1, ncand);
 				break;
@@ -1307,17 +1307,17 @@ static int tachyon_dp_probe(struct udevice *dev)
 		priv->rate = priv->max_rate;
 	if (!priv->lanes)
 		priv->lanes = priv->max_lanes;
-	log_warning("DP link budget: max_rate=%u max_lanes=%u rate=%u lanes=%u caps.lanes=%u\n",
+	log_debug("DP link budget: max_rate=%u max_lanes=%u rate=%u lanes=%u caps.lanes=%u\n",
 		    priv->max_rate, priv->max_lanes, priv->rate, priv->lanes,
 		    priv->caps.lanes);
 
-	log_warning("DP wait sink start with derived Type-C orientation=%u\n",
+	log_debug("DP wait sink start with derived Type-C orientation=%u\n",
 		    priv->orientation);
 
 	tachyon_dp_prepare_aux_for_orientation(priv, priv->orientation);
 	ret = tachyon_dp_wait_sink(priv);
 
-	log_warning("DP wait sink done ret=%d orientation=%u\n",
+	log_debug("DP wait sink done ret=%d orientation=%u\n",
 		    ret, priv->orientation);
 
 	if (ret)
@@ -1379,7 +1379,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 						 0x100000000ULL, LMB_NOOVERWRITE);
 
 		if (low) {
-			log_warning("DP relocating FB %lx -> %llx (<4GB for DPU SSPP)\n",
+			log_debug("DP relocating FB %lx -> %llx (<4GB for DPU SSPP)\n",
 				    (ulong)plat->base, (u64)low);
 			plat->base = (ulong)low;
 		} else {
@@ -1416,7 +1416,7 @@ static int tachyon_dp_probe(struct udevice *dev)
 	if (ret)
 		goto err_quiesce;
 
-	log_warning("DP ready: %ux%u fb=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
+	log_debug("DP ready: %ux%u fb=%lx size=%lx aux timeouts=%u nacks=%u retries=%u\n",
 		    width, height, (ulong)plat->base, (ulong)plat->size,
 		    priv->aux_timeouts, priv->aux_nacks, priv->aux_retries);
 

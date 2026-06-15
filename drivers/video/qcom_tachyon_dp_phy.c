@@ -69,7 +69,7 @@ void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv)
 	writel(tachyon_dp_qmp_phy_mode(priv),
 	       priv->qmp_com + QMP_V3_DP_COM_PHY_MODE_CTRL);
 
-	log_warning("QMP COM orientation update: TYPEC=%02x MODE=%02x\n",
+	log_debug("QMP COM orientation update: TYPEC=%02x MODE=%02x\n",
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL));
 }
@@ -111,7 +111,7 @@ void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv)
 
 	after = readl(priv->phy_dp + QMP_DP_PHY_PD_CTL);
 
-	log_warning("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x STATUS=%02x AUX_PWRDN_B=%u CLAMP_EN_B=%u\n",
+	log_debug("QMP AUX force-on: PD_CTL before=%08x after=%08x low=%02x STATUS=%02x AUX_PWRDN_B=%u CLAMP_EN_B=%u\n",
 		    before,
 		    after,
 		    after & 0xff,
@@ -138,7 +138,7 @@ void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv)
 	priv->qmp_dp_serdes_programmed = false;
 	priv->qmp_dp_phy_started = false;
 
-	log_warning("QMP DP power-down: PD=%02x STATUS=%02x\n",
+	log_debug("QMP DP power-down: PD=%02x STATUS=%02x\n",
 		    tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 }
@@ -170,7 +170,7 @@ static void tachyon_dp_qmp_power_up_all_lanes(struct tachyon_dp_priv *priv)
 	udelay(100);
 	priv->qmp_dp_touched = true;
 
-	log_warning("QMP DP power-up lanes=%u reverse=%d: PD_CTL=%02x STATUS=%02x\n",
+	log_debug("QMP DP power-up lanes=%u reverse=%d: PD_CTL=%02x STATUS=%02x\n",
 		    priv->lanes, reverse, tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 }
@@ -200,12 +200,12 @@ static void tachyon_dp_qmp_dump_pll_state(struct tachyon_dp_priv *priv,
 	};
 	int i;
 
-	log_warning("QMP DP PLL %s: PD=%02x DP_STATUS=%02x\n",
+	log_debug("QMP DP PLL %s: PD=%02x DP_STATUS=%02x\n",
 		    tag, tachyon_dp_qmp_pd_low(priv),
 		    tachyon_dp_qmp_status_low(priv));
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++)
-		log_warning("QMP DP PLL %s %-22s +%03x=%02x\n",
+		log_debug("QMP DP PLL %s %-22s +%03x=%02x\n",
 			    tag, regs[i].name, regs[i].off,
 			    readl(serdes + regs[i].off) & 0xff);
 }
@@ -216,18 +216,18 @@ static void tachyon_dp_qmp_dump_lane_power_state(struct tachyon_dp_priv *priv,
 	void __iomem *tx0 = priv->qmp_dp_tx0;
 	void __iomem *tx1 = priv->qmp_dp_tx1;
 
-	log_warning("QMP DP PHY %s: PD_CTL=%02x DP_PHY_CFG=%02x DP_PHY_CFG1=%02x DP_STATUS=%02x\n",
+	log_debug("QMP DP PHY %s: PD_CTL=%02x DP_PHY_CFG=%02x DP_PHY_CFG1=%02x DP_STATUS=%02x\n",
 		    tag,
 		    tachyon_dp_qmp_pd_low(priv),
 		    readl(priv->phy_dp + QMP_DP_PHY_CFG) & 0xff,
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_CFG_1) & 0xff,
 		    tachyon_dp_qmp_status_low(priv));
-	log_warning("QMP DP PHY %s TX0: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
+	log_debug("QMP DP PHY %s TX0: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
 		    tag,
 		    readl(tx0 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
 		    readl(tx0 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
 		    readl(tx0 + QMP_V3_TX_RESET_TSYNC_EN) & 0xff);
-	log_warning("QMP DP PHY %s TX1: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
+	log_debug("QMP DP PHY %s TX1: HIGHZ_DRVR_EN=%02x TRANSCEIVER_BIAS_EN=%02x RESET_TSYNC_EN=%02x\n",
 		    tag,
 		    readl(tx1 + QMP_V3_TX_HIGHZ_DRVR_EN) & 0xff,
 		    readl(tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN) & 0xff,
@@ -243,7 +243,7 @@ static int tachyon_dp_qmp_poll(struct tachyon_dp_priv *priv,
 
 	ret = tachyon_dp_read_poll(base, reg, mask, value, 10000);
 
-	log_warning("QMP poll %-18s ret=%d val=%02x mask=%02x want=%02x PD=%02x DP_STATUS=%02x\n",
+	log_debug("QMP poll %-18s ret=%d val=%02x mask=%02x want=%02x PD=%02x DP_STATUS=%02x\n",
 		    name,
 		    ret,
 		    readl(base + reg) & 0xff,
@@ -337,7 +337,7 @@ static void tachyon_dp_qmp_rate_serdes_table(struct tachyon_dp_priv *priv,
 		break;
 	}
 
-	log_warning("QMP DP SerDes rate table: rate=%u table=%s count=%d\n",
+	log_debug("QMP DP SerDes rate table: rate=%u table=%s count=%d\n",
 		    priv->rate, name, *count);
 }
 
@@ -406,7 +406,7 @@ static void tachyon_dp_qmp_dump_serdes_table(struct tachyon_dp_priv *priv,
 
 	for (i = 0; i < count; i++) {
 		actual = readl(serdes + regs[i].off) & 0xff;
-		log_warning("QMP DP SerDes pre-C_READY %-4s[%02d] +%03x actual=%02x expected=%02x %s\n",
+		log_debug("QMP DP SerDes pre-C_READY %-4s[%02d] +%03x actual=%02x expected=%02x %s\n",
 			    name, i, regs[i].off, actual, regs[i].val,
 			    actual == regs[i].val ? "ok" : "MISMATCH");
 	}
@@ -420,7 +420,7 @@ static void tachyon_dp_qmp_dump_serdes_pre_ready(struct tachyon_dp_priv *priv)
 
 	tachyon_dp_qmp_rate_serdes_table(priv, &rate_tbl, &rate_tbl_count);
 
-	log_warning("QMP DP SerDes pre-C_READY: programmed=%u rate=%u lanes=%u SW_RESET=%02x RESETSM=%02x C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
+	log_debug("QMP DP SerDes pre-C_READY: programmed=%u rate=%u lanes=%u SW_RESET=%02x RESETSM=%02x C_READY=%02x CMN=%02x PD=%02x DP_STATUS=%02x\n",
 		    priv->qmp_dp_serdes_programmed,
 		    priv->rate,
 		    priv->lanes,
@@ -509,7 +509,7 @@ int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv)
 	writel(swing_cfg, tx1 + QMP_V3_TX_TX_DRV_LVL);
 	writel(pre_cfg, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
 
-	log_warning("DP TX train cfg: rate=%u lanes=%u swing=%u pre=%u drv=%02x emp=%02x "
+	log_debug("DP TX train cfg: rate=%u lanes=%u swing=%u pre=%u drv=%02x emp=%02x "
 		    "tx0_drv=%02x tx0_emp=%02x tx0_highz=%02x tx0_bias=%02x tx0_pol=%02x "
 		    "tx1_drv=%02x tx1_emp=%02x tx1_highz=%02x tx1_bias=%02x tx1_pol=%02x\n",
 		    priv->rate, priv->lanes, swing, pre, swing_cfg, pre_cfg,
@@ -569,7 +569,7 @@ static void tachyon_dp_qmp_v4_program_tx_bias(struct tachyon_dp_priv *priv)
 	writel(drvr1_en, tx1 + QMP_V3_TX_HIGHZ_DRVR_EN);
 	writel(bias1_en, tx1 + QMP_V3_TX_TRANSCEIVER_BIAS_EN);
 
-	log_warning("QMP DP V4 TX bias: lanes=%u reverse=%u bias0=%02x bias1=%02x drvr0=%02x drvr1=%02x\n",
+	log_debug("QMP DP V4 TX bias: lanes=%u reverse=%u bias0=%02x bias1=%02x drvr0=%02x drvr1=%02x\n",
 		    priv->lanes, reverse ? 1 : 0,
 		    bias0_en, bias1_en, drvr0_en, drvr1_en);
 }
@@ -594,7 +594,7 @@ static void tachyon_dp_qmp_program_tx_levels(struct tachyon_dp_priv *priv)
 	writel(0x20, tx0 + QMP_V3_TX_TX_EMP_POST1_LVL);
 	writel(0x20, tx1 + QMP_V3_TX_TX_EMP_POST1_LVL);
 
-	log_warning("QMP DP V4 TX levels: pol=0a drv=27 emp=20\n");
+	log_debug("QMP DP V4 TX levels: pol=0a drv=27 emp=20\n");
 }
 
 /*
@@ -607,7 +607,7 @@ static int tachyon_dp_qmp_configure_dp_clocks(struct tachyon_dp_priv *priv)
 
 	if (priv->dp_clk_valid[2]) {
 		clk_ret = clk_set_rate(&priv->dp_clks[2], priv->rate * 1000);
-		log_warning("QMP DP clock cfg: rate=%u link_clk=%ld ret=%ld\n",
+		log_debug("QMP DP clock cfg: rate=%u link_clk=%ld ret=%ld\n",
 			    priv->rate, (long)priv->rate * 1000, clk_ret);
 		if (clk_ret < 0) {
 			log_warning("Failed to set DP link clock %u kHz: %ld\n",
@@ -615,7 +615,7 @@ static int tachyon_dp_qmp_configure_dp_clocks(struct tachyon_dp_priv *priv)
 			/* Continue — clock may have been set previously */
 		}
 	} else {
-		log_warning("QMP DP clock cfg: no ctrl_link clock, rate=%u\n",
+		log_debug("QMP DP clock cfg: no ctrl_link clock, rate=%u\n",
 			    priv->rate);
 	}
 
@@ -636,7 +636,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 	u32 tx01, tx23;
 	int ret;
 
-	log_warning("QMP DP V456 start\n");
+	log_debug("QMP DP V456 start\n");
 
 	/* DP_PHY_CFG_1 = 0x0f */
 	writel(0x0f, priv->phy_dp + QMP_V4_DP_PHY_CFG_1);
@@ -660,7 +660,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 #endif
 	writel(tx01, priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL);
 	writel(tx23, priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL);
-	log_warning("QMP DP lane cfg: lanes=%u TX0_TX1=%02x TX2_TX3=%02x linux=%d\n",
+	log_debug("QMP DP lane cfg: lanes=%u TX0_TX1=%02x TX2_TX3=%02x linux=%d\n",
 		    priv->lanes,
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX0_TX1_LANE_CTL) & 0xff,
 		    readl(priv->phy_dp + QMP_V4_DP_PHY_TX2_TX3_LANE_CTL) & 0xff,
@@ -682,7 +682,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 		vco_div = 0x0;
 		break;
 	}
-	log_warning("QMP DP rate cfg: rate=%u vco_div=%u\n",
+	log_debug("QMP DP rate cfg: rate=%u vco_div=%u\n",
 		    priv->rate, vco_div);
 	writel(vco_div, priv->phy_dp + QMP_V4_DP_PHY_VCO_DIV);
 
@@ -693,7 +693,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 	 * DP_PHY_CFG while the PHY was still powered down (PD_CTL=0x02), so the
 	 * PLL state machine never reached C_READY/PHY_READY (DP_STATUS=00).
 	 */
-	log_warning("QMP DP PHY start: powering up all lanes (before CFG strobe)\n");
+	log_debug("QMP DP PHY start: powering up all lanes (before CFG strobe)\n");
 	tachyon_dp_qmp_power_up_all_lanes(priv);
 	tachyon_dp_qmp_dump_pll_state(priv, "after PD_CTL=7d");
 
@@ -709,7 +709,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 	priv->qmp_dp_phy_started = true;
 	tachyon_dp_qmp_dump_pll_state(priv, "after RESETSM_CNTRL");
 
-	log_warning("QMP DP start: PD=%02x RESETSM=%02x C_READY=%02x CMN=%02x STATUS=%02x\n",
+	log_debug("QMP DP start: PD=%02x RESETSM=%02x C_READY=%02x CMN=%02x STATUS=%02x\n",
 		    tachyon_dp_qmp_pd_low(priv),
 		    readl(serdes + QMP_V4_COM_RESETSM_CNTRL) & 0xff,
 		    readl(serdes + QMP_V4_COM_C_READY_STATUS) & 0xff,
@@ -792,7 +792,7 @@ static int tachyon_dp_qmp_v456_configure_dp_phy(struct tachyon_dp_priv *priv)
 			    tachyon_dp_qmp_status_low(priv));
 	}
 
-	log_warning("QMP DP V456 done\n");
+	log_debug("QMP DP V456 done\n");
 
 	return 0;
 }
@@ -832,7 +832,7 @@ static int tachyon_dp_qmp_v4_configure_dp_phy(struct tachyon_dp_priv *priv)
 
 	tachyon_dp_qmp_program_tx_levels(priv);
 
-	log_warning("QMP DP V4 post-cfg 18->19 done\n");
+	log_debug("QMP DP V4 post-cfg 18->19 done\n");
 
 	return 0;
 }
@@ -861,21 +861,21 @@ int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
 {
 	int ret;
 
-	log_warning("QMP DP program start: rate=%u lanes=%u orientation=%u\n",
+	log_debug("QMP DP program start: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
 
 	tachyon_dp_qmp_power_down(priv);
 
-	log_warning("QMP DP SERDES table start\n");
+	log_debug("QMP DP SERDES table start\n");
 	ret = tachyon_dp_qmp_program_serdes(priv);
-	log_warning("QMP DP SERDES table done ret=%d\n", ret);
+	log_debug("QMP DP SERDES table done ret=%d\n", ret);
 	if (ret)
 		return ret;
 
-	log_warning("QMP DP TX table start\n");
+	log_debug("QMP DP TX table start\n");
 	tachyon_dp_qmp_program_tx_table(priv);
 	tachyon_dp_qmp_deassert_serdes_reset(priv);
-	log_warning("QMP DP TX table done\n");
+	log_debug("QMP DP TX table done\n");
 
 	/*
 	 * Linux-aligned V4 DP PHY configure:
@@ -889,7 +889,7 @@ int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv)
 	if (ret)
 		return ret;
 
-	log_warning("QMP DP program done\n");
+	log_debug("QMP DP program done\n");
 
 	return 0;
 }
@@ -912,7 +912,7 @@ int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		return -EINVAL;
 	}
 
-	log_warning("QMP DP configure enter: rate=%u lanes=%u orientation=%u\n",
+	log_debug("QMP DP configure enter: rate=%u lanes=%u orientation=%u\n",
 		    priv->rate, priv->lanes, priv->orientation);
 
 	/* Direct writel: QMP COM registers are byte-style, RMW corrupts */
@@ -935,7 +935,7 @@ int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	dp_pd   = tachyon_dp_qmp_pd_low(priv);
 	dp_status = tachyon_dp_qmp_status_low(priv);
 
-	log_warning("QMP DP dump before: COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
+	log_debug("QMP DP dump before: COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
 		    com_pwr, rovrd, swr, swi,
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_TYPEC_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
@@ -952,7 +952,7 @@ int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 	dp_pd   = tachyon_dp_qmp_pd_low(priv);
 	dp_status = tachyon_dp_qmp_status_low(priv);
 
-	log_warning("QMP DP dump after:  COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
+	log_debug("QMP DP dump after:  COM_PWR=%02x ROVRD=%02x SWR=%02x SWI=%02x TYPEC=%02x MODE=%02x C_READY=%02x CMN=%02x DP_PD=%02x DP_STATUS=%02x\n",
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_POWER_DOWN_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_RESET_OVRD_CTRL),
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_SW_RESET),
@@ -961,7 +961,7 @@ int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv)
 		    tachyon_dp_qmp_com_readb(priv, QMP_V3_DP_COM_PHY_MODE_CTRL),
 		    c_ready, cmn, dp_pd, dp_status);
 
-	log_warning("QMP DP configure done\n");
+	log_debug("QMP DP configure done\n");
 
 	return 0;
 }

@@ -61,7 +61,7 @@ u8 tachyon_dp_bw_code(u32 rate)
 void tachyon_dp_dump_link_state(struct tachyon_dp_priv *priv,
 				const char *tag)
 {
-	log_warning("DP LINK %s: STATE_CTRL=%08x MAINLINK_CTRL=%08x "
+	log_debug("DP LINK %s: STATE_CTRL=%08x MAINLINK_CTRL=%08x "
 		    "MAINLINK_READY=%08x CONFIG_CTRL=%08x "
 		    "SOFTWARE_MVID=%08x SOFTWARE_NVID=%08x TOTAL_HOR_VER=%08x "
 		    "START_HOR_VER=%08x ACTIVE_HOR_VER=%08x POLARITY=%08x "
@@ -150,6 +150,6 @@ void tachyon_dp_log_lanes(struct tachyon_dp_priv *priv, const char *when)
 	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE0_1_STATUS, &l01, 1);
 	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE2_3_STATUS, &l23, 1);
 	tachyon_dp_aux_retry(priv, false, true, DPCD_LANE_ALIGN_STATUS, &align, 1);
-	log_warning("DP lanes @ %s: L01=%02x L23=%02x ALIGN=%02x\n",
+	log_debug("DP lanes @ %s: L01=%02x L23=%02x ALIGN=%02x\n",
 		    when, l01, l23, align);
 }

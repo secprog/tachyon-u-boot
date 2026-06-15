@@ -96,7 +96,7 @@ void tachyon_dp_env_mode(u32 *width, u32 *height)
 	 */
 	if (have_saved && tachyon_dp_env_bool("tachyon_dp_force_mode") &&
 	    tachyon_dp_valid_resolution(*width, *height)) {
-		log_warning("Forcing DP resolution %ux%u (tachyon_dp_force_mode)\n",
+		log_debug("Forcing DP resolution %ux%u (tachyon_dp_force_mode)\n",
 			    *width, *height);
 		return;
 	}
@@ -1169,12 +1169,12 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 		tachyon_dp_publish_edid_modes(priv);
 		return ret;
 	}
-	log_warning("DP EDID blk0: %02x %02x %02x %02x %02x %02x %02x %02x | ext_flag=%u csum_ok=%u hdr_ok=%u\n",
+	log_debug("DP EDID blk0: %02x %02x %02x %02x %02x %02x %02x %02x | ext_flag=%u csum_ok=%u hdr_ok=%u\n",
 		    edid_buf[0], edid_buf[1], edid_buf[2], edid_buf[3],
 		    edid_buf[4], edid_buf[5], edid_buf[6], edid_buf[7],
 		    edid_buf[126], tachyon_dp_edid_checksum_ok(edid_buf),
 		    tachyon_dp_edid_header_ok(edid_buf));
-	log_warning("DP EDID estab: %02x %02x %02x  ver=%u.%u\n",
+	log_debug("DP EDID estab: %02x %02x %02x  ver=%u.%u\n",
 		    edid_buf[35], edid_buf[36], edid_buf[37],
 		    edid_buf[18], edid_buf[19]);
 
@@ -1204,17 +1204,17 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 						   edid_buf + EDID_SIZE);
 	}
 
-	log_warning("DP EDID pre-filter: %d modes, rate=%u lanes=%u\n",
+	log_debug("DP EDID pre-filter: %d modes, rate=%u lanes=%u\n",
 		    priv->mode_count, priv->rate, priv->lanes);
 	for (i = 0; i < priv->mode_count; i++)
-		log_warning("DP EDID mode[%d] %ux%u has_timing=%u\n", i,
+		log_debug("DP EDID mode[%d] %ux%u has_timing=%u\n", i,
 			    priv->modes[i].width, priv->modes[i].height,
 			    priv->modes[i].has_timing);
 
 	tachyon_dp_filter_edid_modes(priv);
 	tachyon_dp_publish_edid_modes(priv);
 
-	log_warning("DP EDID post-filter: %d modes\n", priv->mode_count);
+	log_debug("DP EDID post-filter: %d modes\n", priv->mode_count);
 
 	return priv->mode_count ? 0 : -ENOENT;
 }
@@ -1288,7 +1288,7 @@ void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 		*width = 1920;
 		*height = 1080;
 		force_mode = true;
-		log_warning("DP TEST: forcing 1920x1080 (ignoring non-CEA native mode)\n");
+		log_debug("DP TEST: forcing 1920x1080 (ignoring non-CEA native mode)\n");
 	}
 
 	for (i = 0; i < priv->mode_count; i++) {
@@ -1313,7 +1313,7 @@ void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 	if (selected >= 0 && priv->modes[selected].has_timing) {
 		priv->timing = priv->modes[selected].timing;
 	} else if (tachyon_dp_known_timing(*width, *height, &priv->timing)) {
-		log_warning("Using built-in timing for DP mode %ux%u\n",
+		log_debug("Using built-in timing for DP mode %ux%u\n",
 			    *width, *height);
 	} else {
 		log_warning("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
@@ -1325,7 +1325,7 @@ void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 
 	tachyon_dp_apply_dp_porch_adjust(priv);
 	tachyon_dp_publish_selected_timing(priv);
-	log_warning("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u (DP bottom-right adjusted)\n",
+	log_debug("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u (DP bottom-right adjusted)\n",
 		 *width, *height, priv->timing.pixelclock.typ,
 		 priv->timing.hfront_porch.typ, priv->timing.hsync_len.typ,
 		 priv->timing.hback_porch.typ, priv->timing.vfront_porch.typ,
@@ -1357,13 +1357,13 @@ bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 	}
 
 	if (tachyon_dp_known_timing(width, height, &priv->timing)) {
-		log_warning("Using built-in timing for DP mode %ux%u\n",
+		log_debug("Using built-in timing for DP mode %ux%u\n",
 			    width, height);
 		tachyon_dp_apply_dp_porch_adjust(priv);
 		return true;
 	}
 
-	log_warning("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
+	log_debug("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
 		    width, height);
 	tachyon_dp_default_timing(&priv->timing);
 	tachyon_dp_timing_entry(&priv->timing.hactive, width);
@@ -1398,7 +1398,7 @@ void tachyon_dp_sink_power_on(struct tachyon_dp_priv *priv)
 	power = 0;
 	tachyon_dp_aux_retry(priv, false, true, DPCD_SET_POWER, &power, 1);
 
-	log_warning("DP sink: DFP_present=0x%02x DFP_count=0x%02x SINK_COUNT=0x%02x set_D0_ret=%d power_readback=0x%02x\n",
+	log_debug("DP sink: DFP_present=0x%02x DFP_count=0x%02x SINK_COUNT=0x%02x set_D0_ret=%d power_readback=0x%02x\n",
 		    dfp, dfp_count, sink_count, ret, power);
 }
 
