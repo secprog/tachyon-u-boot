@@ -17,7 +17,6 @@
 #include <dm/ofnode.h>
 #include <dm/read.h>
 #include <linux/bitops.h>
-#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
 #include <soc/qcom/cmd-db.h>

@@ -13,7 +13,6 @@
 #include <asm/io.h>
 #include <linux/delay.h>
 #include <linux/kernel.h>
-#include <linux/math64.h>
 #include "qcom_tachyon_dp.h"
 
 static u32 tachyon_dp_configuration_ctrl(struct tachyon_dp_priv *priv)

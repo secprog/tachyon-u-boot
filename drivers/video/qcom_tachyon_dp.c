@@ -13,20 +13,11 @@
 #include <asm/global_data.h>
 #include <asm/io.h>
 #include <clk.h>
-#include <command.h>
 #include <dm.h>
 #include <dm/device.h>
-#include <dm/device-internal.h>
-#include <dm/lists.h>
 #include <dm/read.h>
 #include <dm/ofnode.h>
-#include <dm/root.h>
-#include <dm/uclass-internal.h>
 #include <cpu_func.h>
-#include <edid.h>
-#if CONFIG_IS_ENABLED(EFI_LOADER)
-#include <efi_loader.h>
-#endif
 #include <env.h>
 #include <fdtdec.h>
 #include <generic-phy.h>
@@ -38,11 +29,8 @@
 #include <linux/string.h>
 #include <lmb.h>
 #include <log.h>
-#include <malloc.h>
 #include <mapmem.h>
-#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/pmic_glink.h>
-#include <soc/qcom/tcs.h>
 #include <video.h>
 
 #include "qcom_tachyon_dp.h"

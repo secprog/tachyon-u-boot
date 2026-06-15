@@ -11,7 +11,6 @@
 #include <log.h>
 #include <edid.h>
 #include <env.h>
-#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include "qcom_tachyon_dp.h"
