@@ -697,4 +697,15 @@ u32 tachyon_dp_htotal(const struct display_timing *t);
 u32 tachyon_dp_vtotal(const struct display_timing *t);
 bool tachyon_dp_env_bool(const char *name);
 
+/* AUX module (qcom_tachyon_dp_aux.c) entry points called by the parent. */
+void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv);
+bool tachyon_dp_hw_hpd_connected(struct tachyon_dp_priv *priv);
+int tachyon_dp_aux_retry_mot(struct tachyon_dp_priv *priv, bool i2c,
+			     bool read, bool mot, u32 addr, u8 *buf,
+			     size_t len);
+int tachyon_dp_aux_retry(struct tachyon_dp_priv *priv, bool i2c,
+			 bool read, u32 addr, u8 *buf, size_t len);
+int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
+			       u8 *buf);
+
 #endif /* __QCOM_TACHYON_DP_H__ */
