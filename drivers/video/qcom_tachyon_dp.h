@@ -10,6 +10,8 @@
 #define __QCOM_TACHYON_DP_H__
 
 #include <linux/types.h>
+#include <linux/delay.h>
+#include <linux/errno.h>
 #include <asm/io.h>
 #include <clk.h>
 #include <generic-phy.h>
@@ -640,5 +642,40 @@ struct tachyon_dp_priv {
 	enum tachyon_dp_hpd_state hpd_state;
 	ulong last_pmic_poll_ms;
 };
+
+/*
+ * Generic poll helper shared across the DP modules (aux/link/ctrl/phy).
+ * static inline in the header avoids a cross-file symbol.
+ */
+static inline int tachyon_dp_read_poll(void __iomem *base, u32 reg, u32 mask,
+				       u32 value, u32 timeout_us)
+{
+	u32 status;
+
+	while (timeout_us--) {
+		status = readl(base + reg);
+		if ((status & mask) == value)
+			return 0;
+		udelay(1);
+	}
+
+	return -ETIMEDOUT;
+}
+
+/* Implemented in qcom_tachyon_dp.c, called by the PHY module. */
+int tachyon_dp_pin_assignment_lanes(struct tachyon_dp_priv *priv);
+
+/* PHY module (qcom_tachyon_dp_phy.c) entry points called by the parent. */
+int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv);
+u8 tachyon_dp_qmp_com_readb(struct tachyon_dp_priv *priv, u32 reg);
+void tachyon_dp_qmp_com_orientation_update(struct tachyon_dp_priv *priv);
+void tachyon_dp_qmp_force_aux_on(struct tachyon_dp_priv *priv);
+int tachyon_dp_qmp_program_tx(struct tachyon_dp_priv *priv);
+int tachyon_dp_qmp_program_dp_phy(struct tachyon_dp_priv *priv);
+void tachyon_dp_qmp_aux_init(struct tachyon_dp_priv *priv);
+void tachyon_dp_qmp_power_down(struct tachyon_dp_priv *priv);
+bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv);
+u8 tachyon_dp_qmp_status_low(struct tachyon_dp_priv *priv);
+u8 tachyon_dp_qmp_phy_mode(struct tachyon_dp_priv *priv);
 
 #endif /* __QCOM_TACHYON_DP_H__ */
