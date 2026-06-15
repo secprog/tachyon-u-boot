@@ -78,6 +78,7 @@ obj-$(CONFIG_QCOM_TACHYON_DP) += qcom_tachyon_dp.o
 obj-$(CONFIG_QCOM_TACHYON_DP) += qcom_tachyon_dp_phy.o
 obj-$(CONFIG_QCOM_TACHYON_DP) += qcom_tachyon_dp_dpu.o
 obj-$(CONFIG_QCOM_TACHYON_DP) += qcom_tachyon_dp_aux.o
+obj-$(CONFIG_QCOM_TACHYON_DP) += qcom_tachyon_dp_panel.o
 obj-$(CONFIG_VIDEO_DSI_HOST_SANDBOX) += sandbox_dsi_host.o
 obj-$(CONFIG_VIDEO_SANDBOX_SDL) += sandbox_sdl.o
 obj-$(CONFIG_VIDEO_SIMPLE) += simplefb.o

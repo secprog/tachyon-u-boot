@@ -708,4 +708,42 @@ int tachyon_dp_aux_retry(struct tachyon_dp_priv *priv, bool i2c,
 int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
 			       u8 *buf);
 
+/*
+ * Parent helpers (qcom_tachyon_dp.c) called by the PANEL module.  These stay in
+ * the parent .c (also used by the future CTRL/LINK code) but are un-static'd so
+ * the panel mode-build / DPCD-caps path can reach them.
+ */
+u32 tachyon_dp_env_u32(const char *name, u32 fallback);
+bool tachyon_dp_env_has_u32(const char *name);
+void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
+void tachyon_dp_log_typec_resolved(struct tachyon_dp_priv *priv);
+
+/* PANEL module (qcom_tachyon_dp_panel.c) entry points called by the parent. */
+struct display_timing;
+struct timing_entry;
+bool tachyon_dp_valid_resolution(u32 width, u32 height);
+bool tachyon_dp_mode_fits_link(struct tachyon_dp_priv *priv,
+			       const struct display_timing *timing);
+void tachyon_dp_env_mode(u32 *width, u32 *height);
+void tachyon_dp_timing_entry(struct timing_entry *entry, u32 value);
+void tachyon_dp_fill_timing(struct display_timing *timing,
+			    u32 pixelclock, u32 hactive, u32 hfp,
+			    u32 hsync, u32 hbp, u32 vactive,
+			    u32 vfp, u32 vsync, u32 vbp,
+			    enum display_flags flags);
+void tachyon_dp_default_timing(struct display_timing *timing);
+bool tachyon_dp_cvt_timing(u32 width, u32 height, u32 hz,
+			   struct display_timing *timing);
+bool tachyon_dp_known_timing(u32 width, u32 height,
+			     struct display_timing *timing);
+int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv);
+void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv);
+void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv);
+void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
+			    u32 *width, u32 *height);
+bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
+				    int mode_index);
+void tachyon_dp_sink_power_on(struct tachyon_dp_priv *priv);
+int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv);
+
 #endif /* __QCOM_TACHYON_DP_H__ */
