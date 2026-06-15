@@ -665,6 +665,9 @@ static inline int tachyon_dp_read_poll(void __iomem *base, u32 reg, u32 mask,
 /* Implemented in qcom_tachyon_dp.c, called by the PHY module. */
 int tachyon_dp_pin_assignment_lanes(struct tachyon_dp_priv *priv);
 
+/* Implemented in qcom_tachyon_dp.c, called by the LINK module. */
+bool tachyon_dp_typec_state_valid(struct tachyon_dp_priv *priv);
+
 /* PHY module (qcom_tachyon_dp_phy.c) entry points called by the parent. */
 int tachyon_dp_qmp_configure(struct tachyon_dp_priv *priv);
 u8 tachyon_dp_qmp_com_readb(struct tachyon_dp_priv *priv, u32 reg);
@@ -717,6 +720,16 @@ u32 tachyon_dp_env_u32(const char *name, u32 fallback);
 bool tachyon_dp_env_has_u32(const char *name);
 void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
 void tachyon_dp_log_typec_resolved(struct tachyon_dp_priv *priv);
+
+/* LINK module (qcom_tachyon_dp_link.c) entry points called by the parent/CTRL. */
+u8 tachyon_dp_bw_code(u32 rate);
+void tachyon_dp_dump_link_state(struct tachyon_dp_priv *priv,
+				const char *tag);
+bool tachyon_dp_cr_done(u8 *status, u8 lanes);
+bool tachyon_dp_eq_done(u8 *status, u8 lanes);
+u8 tachyon_dp_train_set(struct tachyon_dp_priv *priv, u8 lane);
+void tachyon_dp_apply_adjust(struct tachyon_dp_priv *priv, u8 *adj);
+void tachyon_dp_log_lanes(struct tachyon_dp_priv *priv, const char *when);
 
 /* PANEL module (qcom_tachyon_dp_panel.c) entry points called by the parent. */
 struct display_timing;
