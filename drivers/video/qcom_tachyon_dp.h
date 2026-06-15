@@ -678,4 +678,23 @@ bool tachyon_dp_qmp_phy_ready(struct tachyon_dp_priv *priv);
 u8 tachyon_dp_qmp_status_low(struct tachyon_dp_priv *priv);
 u8 tachyon_dp_qmp_phy_mode(struct tachyon_dp_priv *priv);
 
+/* DPU module (qcom_tachyon_dp_dpu.c) entry points called by the parent. */
+struct video_uc_plat;
+struct video_priv;
+int tachyon_dpu_init(struct tachyon_dp_priv *priv);
+int tachyon_dpu_program_scanout(struct tachyon_dp_priv *priv,
+				struct video_uc_plat *plat,
+				struct video_priv *uc_priv);
+void tachyon_dpu_quiesce(struct tachyon_dp_priv *priv);
+void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv);
+
+/*
+ * Parent helpers (qcom_tachyon_dp.c) called by the DPU module.  htotal/vtotal
+ * will become the CTRL module later but stay in the parent .c for now.
+ */
+struct display_timing;
+u32 tachyon_dp_htotal(const struct display_timing *t);
+u32 tachyon_dp_vtotal(const struct display_timing *t);
+bool tachyon_dp_env_bool(const char *name);
+
 #endif /* __QCOM_TACHYON_DP_H__ */
