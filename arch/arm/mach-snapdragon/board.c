@@ -17,6 +17,7 @@
 #include <dm/device.h>
 #include <dm/pinctrl.h>
 #include <dm/uclass-internal.h>
+#include <dm/uclass.h>
 #include <dm/read.h>
 #include <power/regulator.h>
 #include <env.h>
@@ -24,6 +25,7 @@
 #include <init.h>
 #include <linux/arm-smccc.h>
 #include <linux/bug.h>
+#include <linux/delay.h>
 #include <linux/psci.h>
 #include <linux/sizes.h>
 #include <lmb.h>
@@ -469,6 +471,39 @@ int board_late_init(void)
 		if (adsp_ret)
 			log_warning("%s: ADSP PAS boot ret=%d (Type-C/DP unavailable)\n",
 				    __func__, adsp_ret);
+	}
+
+	/*
+	 * Probe the DisplayPort video device so DP comes up autonomously at
+	 * boot (trains the link, lights the dock, leaves a live GOP framebuffer
+	 * for Windows).  The video uclass does NOT probe it on its own here:
+	 * CONFIG_SYS_CONSOLE_IS_IN_ENV makes stdio_add_devices skip its
+	 * probe-all loop, and stdout carries no vidconsole.  Best-effort -- a DP
+	 * failure (e.g. no dock attached) must not abort boot; tachyon_dp_probe
+	 * quiesces cleanly on error.
+	 *
+	 * A COLD dock needs to be left alone until it has settled into a PD
+	 * contract: the probe's first act is qpg_open_session(), whose UCSI
+	 * PPM_RESET, if it fires while the dock is still mid-negotiation, knocks
+	 * the dock to opmode=5 and the contract never forms -- HW-confirmed (with
+	 * no delay a cold boot lands at opmode=5/mux=0/no-DP).  So delay the probe
+	 * past the cold dock's ~30s settle window; tunable via
+	 * tachyon_dp_settle_ms.  A WARM reboot keeps its contract (opmode=3) and a
+	 * settled dock is NOT disturbed by open_session, so the delay is only
+	 * needed for cold -- a future refinement could detect warm and skip it.
+	 */
+	if (IS_ENABLED(CONFIG_VIDEO_QCOM_TACHYON_DP)) {
+		ulong settle_ms = env_get_ulong("tachyon_dp_settle_ms", 10,
+						18000);
+		int dp_ret;
+
+		if (settle_ms)
+			mdelay(settle_ms);
+
+		dp_ret = uclass_probe_all(UCLASS_VIDEO);
+		if (dp_ret)
+			log_warning("%s: DP video probe ret=%d\n", __func__,
+				    dp_ret);
 	}
 
 	/* Configure the dfu_string for capsule updates */

@@ -4570,6 +4570,42 @@ static int tachyon_dp_link_train_at(struct tachyon_dp_priv *priv, u32 rate,
 	return 0;
 }
 
+/*
+ * Block until the dock asserts DisplayPort HPD (best-effort, bounded).
+ *
+ * The sink answers AUX (DPCD/EDID) as soon as the SBU mux + orientation are
+ * programmed, but its main-link receiver only comes up when it raises HPD.
+ * Clock recovery started while HPD is still low fails with lane status 00 at
+ * every rate -- the source transmits but the sink receiver is off.  This made
+ * boot DP intermittent: success depended purely on whether the entry/auto-DFP
+ * poll happened to outlast HPD (HW-confirmed: identical normal-orientation
+ * boots trained when hpd=1 arrived first, failed CR when training raced ahead
+ * of it).  The PMIC/ADSP altmode HPD is the dependable signal -- the hpd=1 that
+ * immediately preceded every successful train; the DP controller's own
+ * HPD_INT_STATUS reads "connected" too early to trust.  Keep the altmode state
+ * machine pumping so the notify is processed, and return as soon as HPD is
+ * seen; on timeout the caller trains anyway so a dock that never surfaces HPD
+ * still gets a chance.
+ */
+static bool tachyon_dp_wait_pmic_hpd(struct tachyon_dp_priv *priv,
+				     uint timeout_ms)
+{
+	struct qcom_pmic_glink_altmode_state state;
+	ulong start = get_timer(0);
+	int ret;
+
+	do {
+		ret = qcom_pmic_glink_altmode_poll(&state, 100);
+		if (!ret) {
+			tachyon_dp_apply_pmic_typec_state(priv, &state);
+			if (state.hpd)
+				return true;
+		}
+	} while (get_timer(start) < timeout_ms);
+
+	return false;
+}
+
 static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 {
 	static const u32 rates[] = {
@@ -4596,6 +4632,21 @@ static int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 		log_warning("DP: no valid sink (lanes=%u max_rate=%u) - skipping link training\n",
 			    priv->caps.lanes, priv->max_rate);
 		return -ENODEV;
+	}
+
+	/*
+	 * Wait for the dock to raise DisplayPort HPD before driving the link.
+	 * Training before the sink's main-link receiver is ready fails clock
+	 * recovery (lane status 00) at every rate; HPD is the reliable
+	 * "receiver ready" signal and removes the boot-time intermittency.
+	 * Disable with tachyon_dp_no_hpd_wait; tune via tachyon_dp_hpd_wait_ms.
+	 */
+	if (!tachyon_dp_env_bool("tachyon_dp_no_hpd_wait")) {
+		uint hpd_ms = tachyon_dp_env_u32("tachyon_dp_hpd_wait_ms", 8000);
+
+		log_warning("DP link train: PMIC HPD %s before training\n",
+			    tachyon_dp_wait_pmic_hpd(priv, hpd_ms) ?
+				    "asserted" : "wait timed out, training anyway");
 	}
 
 #if TACHYON_DP_FORCE_TRAIN_RBR_X4
@@ -7033,17 +7084,21 @@ static int tachyon_dp_probe(struct udevice *dev)
 			    altmode_ret);
 
 		/*
-		 * E1 (audit): the dock has not entered DP.  If a DFP partner is
-		 * attached and doesn't self-initiate the data-role swap, request
-		 * DFP ourselves (SET_UOR(DFP), now with ACCEPT_ROLE_SWAPS) so the
-		 * ADSP sink-path DP gate (DataRole==DFP, pe_snk.c:947) can fire —
-		 * no manual `qpg bounce` needed.  Disable with
-		 * tachyon_dp_no_auto_dfp=1 to keep the cold path pure-passive.
+		 * The dock has not entered DP yet.  At boot it is a cold Type-C
+		 * power-sink (UCSI opmode=5, no PD contract, partner=0) and only
+		 * self-completes its PD/DP negotiation ~20-30s after power-on
+		 * (which is why a manual run from the prompt always worked: the
+		 * dock had settled by then).  PAN_EN is armed, so poll for the
+		 * ADSP DP notify (mux=3 / dp_seen) and exit the instant it
+		 * arrives; the long window just lets a cold dock settle.  A warm
+		 * boot (dock already in DP) never reaches here.  Disable with
+		 * tachyon_dp_no_auto_dfp=1; tune the window with
+		 * tachyon_dp_auto_dfp_ms.
 		 */
 		if (!tachyon_dp_env_bool("tachyon_dp_no_auto_dfp")) {
 			int dfp = qcom_pmic_glink_request_dfp(
 				tachyon_dp_env_u32("tachyon_dp_auto_dfp_ms",
-						   4000));
+						   20000));
 
 			log_warning("DP auto-DFP ret=%d; re-reading altmode\n",
 				    dfp);
