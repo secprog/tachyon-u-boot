@@ -692,8 +692,8 @@ void tachyon_dpu_quiesce(struct tachyon_dp_priv *priv);
 void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv);
 
 /*
- * Parent helpers (qcom_tachyon_dp.c) called by the DPU module.  htotal/vtotal
- * will become the CTRL module later but stay in the parent .c for now.
+ * htotal/vtotal live in the CTRL module (qcom_tachyon_dp_ctrl.c) but are also
+ * called by the DPU module, so they stay exported here.
  */
 struct display_timing;
 u32 tachyon_dp_htotal(const struct display_timing *t);
@@ -758,5 +758,21 @@ bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 				    int mode_index);
 void tachyon_dp_sink_power_on(struct tachyon_dp_priv *priv);
 int tachyon_dp_read_dpcd_caps(struct tachyon_dp_priv *priv);
+
+/*
+ * Parent helper (qcom_tachyon_dp.c) called by the CTRL module's link_train to
+ * pump the PMIC altmode state machine until the dock raises DisplayPort HPD.
+ */
+bool tachyon_dp_wait_pmic_hpd(struct tachyon_dp_priv *priv, uint timeout_ms);
+
+/*
+ * CTRL module (qcom_tachyon_dp_ctrl.c) entry points called by the parent:
+ * link training + the video path (program_video_timing/source-link/quiesce).
+ */
+int tachyon_dp_link_train(struct tachyon_dp_priv *priv);
+void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv);
+void tachyon_dp_configure_source_link(struct tachyon_dp_priv *priv);
+void tachyon_dp_controller_quiesce(struct tachyon_dp_priv *priv);
+void tachyon_dp_mainlink_disable(struct tachyon_dp_priv *priv);
 
 #endif /* __QCOM_TACHYON_DP_H__ */
