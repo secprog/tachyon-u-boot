@@ -82,7 +82,14 @@
 #define QMP_MAGIC			0x4d41494c	/* "MAIL" LE */
 #define QMP_VERSION			1
 #define QMP_MSG_LEN			64		/* 64-byte messages */
-#define QMP_HANDSHAKE_TIMEOUT_MS	1000
+/*
+ * Cold-boot tolerant: HW-confirmed that on a failed boot the AOP completes the
+ * whole QMP handshake -- just slower than 1s -- so 1000 ms intermittently lost
+ * the link ack (-110), the ADSP PAS boot then failed, and Type-C/DP was
+ * unavailable for that boot.  5 s comfortably covers a slow cold AOP; on a
+ * warm/fast boot every wait returns almost immediately, so it costs nothing.
+ */
+#define QMP_HANDSHAKE_TIMEOUT_MS	5000
 #define QMP_REPLY_TIMEOUT_MS		2000
 
 struct qcom_aoss_qmp_priv {
@@ -140,6 +147,22 @@ static int qmp_open(struct udevice *dev, struct qcom_aoss_qmp_priv *priv)
 	}
 
 	/* Step 3: link handshake */
+	/*
+	 * Wait for the AOP to advertise its link is UP before acking it.  On a
+	 * cold boot the AOP can bring its QMP link up lazily; acking a not-yet-UP
+	 * state and racing ahead is part of how the link ack later times out.
+	 * Linux waits for this via the QMP IRQ; poll for it here.  No-op when the
+	 * AOP is already up.
+	 */
+	ret = wait_event_timeout(NULL,
+		readl(priv->msgram + QMP_DESC_UCORE_LINK_STATE) == QMP_STATE_UP,
+		QMP_HANDSHAKE_TIMEOUT_MS);
+	if (!ret) {
+		dev_err(dev, "qcom-aoss-qmp: ucore link up timeout after %u ms\n",
+			QMP_HANDSHAKE_TIMEOUT_MS);
+		return -ETIMEDOUT;
+	}
+
 	/* Ack remote core's link state */
 	val = readl(priv->msgram + QMP_DESC_UCORE_LINK_STATE);
 	writel(val, priv->msgram + QMP_DESC_UCORE_LINK_STATE_ACK);
