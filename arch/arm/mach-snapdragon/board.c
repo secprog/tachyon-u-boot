@@ -504,6 +504,22 @@ int board_late_init(void)
 		if (dp_ret)
 			log_warning("%s: DP video probe ret=%d\n", __func__,
 				    dp_ret);
+
+		/*
+		 * Route the U-Boot console onto the dock now that DP is up.  The
+		 * video probe registered a "vidconsole" stdio device, but it did
+		 * not exist back at console_init_r (CONFIG_SYS_CONSOLE_IS_IN_ENV
+		 * skips the probe-all there), so stdout is still serial-only.
+		 * Re-setting stdout/stderr fires the on_console env callback, which
+		 * re-evaluates the CONSOLE_MUX iomux and adds the vidconsole --
+		 * serial stays, so the serial console is unaffected and the
+		 * prompt/output also render on the dock.  Only when the probe
+		 * succeeded (the vidconsole is present); a no-op otherwise.
+		 */
+		if (!dp_ret) {
+			env_set("stdout", "serial,vidconsole");
+			env_set("stderr", "serial,vidconsole");
+		}
 	}
 
 	/* Configure the dfu_string for capsule updates */
