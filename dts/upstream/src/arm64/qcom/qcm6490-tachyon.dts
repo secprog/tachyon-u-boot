@@ -327,6 +327,79 @@
 			reg = <0x00 0xbb700000 0x00 0x04900000>;
 			no-map;
 		};
+
+		/*
+		 * TZ/QHEE-owned pages that the upstream reserved-memory list
+		 * omits, so U-Boot left them EFI CONVENTIONAL and Windows would
+		 * zero them -> XPU violation -> PS_HOLD reset. xbl_mem sits
+		 * directly above the QHEE hyp_mem block (0x80000000); debug_vm
+		 * is the lone TZ debug-VM page in the 0xc5100000-0xd0800000 gap.
+		 */
+		xbl_mem@80600000 {
+			reg = <0x00 0x80600000 0x00 0x100000>;
+			no-map;
+		};
+
+		debug_vm_mem@d0600000 {
+			reg = <0x00 0xd0600000 0x00 0x100000>;
+			no-map;
+		};
+
+		/*
+		 * Secure/hypervisor-owned DRAM regions taken from the ACTUAL
+		 * Tachyon (Kodiak SC7280) QHEE/Gunyah hypervisor_oem.xml. These
+		 * are firmware/DSP/hyp-owned and must NOT be OS-usable: with the
+		 * board running Linux under Gunyah they are stage-2-hidden from
+		 * Linux, but Windows is handed the raw physical EFI map and
+		 * zeroes any CONVENTIONAL page at phase 0 -> XPU/secure fault ->
+		 * TZ PS_HOLD reset with no kernel output. (LPASS-ML, CDSP heap,
+		 * SMEM, TZ_STAT and the pIMEM Vault already fall inside existing
+		 * reserved ranges; these are the ones still exposed.)
+		 */
+		gpu_prr_mem@80894000 {		/* hyp_gpu_prr_base */
+			reg = <0x00 0x80894000 0x00 0x0006b000>;
+			no-map;
+		};
+
+		/*
+		 * PIL firmware region (modem/adsp/cdsp loaded code). The single
+		 * full-span node (0x84300000 + 0x17a00000) OVERLAPPED camera_mem/
+		 * video_mem/ipa_gsi, so lmb rejected it and the head + the small
+		 * inter-image gaps stayed EFI CONVENTIONAL (confirmed via efidebug
+		 * memmap). Windows winload then XPU-ABORTED (silent HANG, not a
+		 * reset) touching this live firmware right after ExitBootServices.
+		 * Split into NON-overlapping pieces filling exactly the ranges that
+		 * read CONVENTIONAL so they actually reserve.
+		 */
+		pil_region_head@84300000 {	/* 0x84300000-0x86200000 (head, before camera_mem) */
+			reg = <0x00 0x84300000 0x00 0x01f00000>;
+			no-map;
+		};
+
+		pil_region_gap1@8b600000 {	/* 0x8b600000-0x8b700000 (video_mem -> ipa_gsi) */
+			reg = <0x00 0x8b600000 0x00 0x00100000>;
+			no-map;
+		};
+
+		pil_region_gap2@8b71c000 {	/* 0x8b71c000-0x8b800000 (ipa_gsi -> mpss gap) */
+			reg = <0x00 0x8b71c000 0x00 0x000e4000>;
+			no-map;
+		};
+
+		mpss_efs_mem@a0800000 {		/* MPSS_EFS */
+			reg = <0x00 0xa0800000 0x00 0x00300000>;
+			no-map;
+		};
+
+		adsp_rpc_remote_heap_mem@c6500000 {	/* ADSP RPC Remote Heap — live ADSP DMA */
+			reg = <0x00 0xc6500000 0x00 0x00800000>;
+			no-map;
+		};
+
+		mdp_db_mem@c6d00000 {		/* hyp_mdp_db (MDP display buffer) 0xc6d00000-0xc7d00000 */
+			reg = <0x00 0xc6d00000 0x00 0x01000000>;
+			no-map;
+		};
 	};
 };
 
