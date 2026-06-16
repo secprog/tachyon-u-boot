@@ -574,16 +574,53 @@ static int fdt_cmp_res(const void *v1, const void *v2)
 {
 	const struct fdt_resource *res1 = v1, *res2 = v2;
 
-	return res1->start - res2->start;
+	/*
+	 * Return a clamped -1/0/1, NOT (res1->start - res2->start): .start is a
+	 * 64-bit phys_addr_t, and truncating the difference to int flips sign
+	 * whenever two regions differ by more than INT_MAX (e.g. 0x4cd000 vs
+	 * 0xfc200000 -- Tachyon has ~40 reserved nodes spanning >2 GB). A
+	 * mis-sorted list makes carve_out_reserved_memory()'s merge compute
+	 * (res[i].end - start) with end < start -> size_t underflow -> a multi-GB
+	 * range -> the MMU walker runs off mapped DRAM and panics
+	 * ("PTE ... should be a table").
+	 */
+	if (res1->start < res2->start)
+		return -1;
+	if (res1->start > res2->start)
+		return 1;
+	return 0;
 }
 
-#define N_RESERVED_REGIONS 32
-
-/* Mark all no-map regions as PTE_TYPE_FAULT to prevent speculative access.
- * On some platforms this is enough to trigger a security violation and trap
- * to EL3.
+/*
+ * Bumped from 32: the Tachyon DTB carries more /reserved-memory no-map nodes
+ * than the qcs404 baseline, and for the Windows handoff EVERY secure carveout
+ * must be made non-cacheable (a missed one keeps a cacheable line that
+ * winload's post-EBS writeback faults on the XPU -> silent hang).
  */
-static void carve_out_reserved_memory(void)
+#define N_RESERVED_REGIONS 64
+
+/*
+ * Apply a protective attribute to every /reserved-memory no-map region.
+ *
+ * @noncacheable: false -> map them PTE_TYPE_FAULT (qcs404). Must run BEFORE the
+ *                MMU/dcache is enabled; prevents the cache-prefetcher touching
+ *                them and trapping to EL3.
+ *                true  -> make them Normal NON-Cacheable (MT_NORMAL_NC, MAIR
+ *                index 3) but VALID/ACCESSIBLE, via mmu_change_region_attr().
+ *                Like the FAULT path, MUST run BEFORE dcache_enable(): the
+ *                regions are then never cached, so nothing is ever dirty to
+ *                flush (a runtime cache-clean of these ranges itself faults the
+ *                XPU) and no cacheable line ever exists. Used on Tachyon
+ *                (QCM6490/SC7280): winload cleans the dcache after
+ *                ExitBootServices, and a writeback of any cacheable line over an
+ *                XPU/TZ-protected carveout (PIL, SMEM, AOP, TZ/hyp) is rejected
+ *                by the SC7280 XPU -> the AXI access never completes -> the AP
+ *                spins (silent hang before SetVirtualAddressMap). Normal-NC (not
+ *                device, not FAULT) so U-Boot's own unaligned SMEM/ACPI reads of
+ *                these ranges still work. Mirrors the working Mu-Silicium/Kodiak
+ *                firmware, which maps these regions uncached.
+ */
+static void carve_out_reserved_memory(bool noncacheable)
 {
 	static struct fdt_resource res[N_RESERVED_REGIONS] = { 0 };
 	int parent, rmem, count, i = 0;
@@ -622,7 +659,15 @@ static void carve_out_reserved_memory(void)
 			 */
 			res[i].start = fdt32_to_cpu(ptr[1]);
 			res[i].end = res[i].start + fdt32_to_cpu(ptr[3]);
-			i++;
+			/*
+			 * For the Tachyon Normal-NC path, only carve DRAM regions.
+			 * Sub-DRAM no-map nodes (e.g. wlan_ce@4cd000) live in
+			 * device/MMIO space; their 2M-aligned range would retype real
+			 * MMIO to Normal-NC, and they aren't the cacheable secure-DRAM
+			 * the Windows handoff cares about. qcs404 (FAULT) keeps all.
+			 */
+			if (!noncacheable || res[i].start >= gd->bd->bi_dram[0].start)
+				i++;
 		}
 	}
 
@@ -644,9 +689,31 @@ static void carve_out_reserved_memory(void)
 		 * start a new region.
 		 */
 		if (i == count || start + size < res[i].start - SZ_2M) {
-			debug("  0x%016llx - 0x%016llx: reserved\n",
-			      start, start + size);
-			mmu_change_region_attr(start, size, PTE_TYPE_FAULT);
+			debug("  0x%016llx - 0x%016llx: %s\n", start,
+			      start + size,
+			      noncacheable ? "non-cacheable" : "fault");
+			if (noncacheable)
+				/*
+				 * Normal Non-Cacheable (MT_NORMAL_NC): keeps the
+				 * block VALID + accessible (unlike FAULT) so
+				 * U-Boot's own unaligned SMEM/ACPI reads still
+				 * work, and execute-never. Use mmu_change_region_attr
+				 * (NOT mmu_set_region_dcache_behaviour): the latter
+				 * FLUSHES the region, and a cache clean of an
+				 * XPU/TZ-protected region faults the XPU and resets
+				 * the AP (confirmed by the scarveout test). This
+				 * runs BEFORE dcache_enable(), so the regions were
+				 * never cached -> nothing to write back -> no XPU
+				 * fault, and they stay non-cacheable through the
+				 * Windows handoff (no line for winload to clean).
+				 */
+				mmu_change_region_attr(start, size,
+					PTE_TYPE_VALID |
+					PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+					PTE_BLOCK_PXN | PTE_BLOCK_UXN);
+			else
+				mmu_change_region_attr(start, size,
+						       PTE_TYPE_FAULT);
 			/* If this is the final region then quit here before we index
 			 * out of bounds...
 			 */
@@ -692,11 +759,23 @@ void enable_caches(void)
 	gd->arch.tlb_addr = tlb_addr;
 	gd->arch.tlb_size = tlb_size;
 
-	/* We do the carveouts only for QCS404, for now. */
+	/*
+	 * qcs404: FAULT-map the no-map carveouts BEFORE the MMU/dcache come up
+	 * (prevents the cache-prefetcher from touching them and trapping to EL3).
+	 *
+	 * NOTE: a Tachyon "map the secure carveouts Normal-NC here" path was tried
+	 * to fix the Windows winload hand-off hang and is DISPROVEN/removed: it did
+	 * NOT change the hang -- Windows still dies in the exact same place (after
+	 * ExitBootServices completes, before SetVirtualAddressMap is entered), so
+	 * secure-region cacheability is NOT the cause. (An apparent DP regression
+	 * seen during that test turned out to be an unplugged monitor cable, not
+	 * the carveout -- but the Windows result alone is reason enough to drop it.)
+	 * Do NOT re-enable carve_out_reserved_memory(true) on Tachyon.
+	 */
 	if (fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,qcs404") == 0) {
 		carveout_start = get_timer(0);
 		/* Takes ~20-50ms on SDM845 */
-		carve_out_reserved_memory();
+		carve_out_reserved_memory(false);
 		debug("carveout time: %lums\n", get_timer(carveout_start));
 	}
 	dcache_enable();
