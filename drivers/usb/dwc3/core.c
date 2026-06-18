@@ -1137,6 +1137,31 @@ void dwc3_of_parse(struct dwc3 *dwc)
 				"snps,dis-tx-ipgap-linecheck-quirk");
 	dwc->dis_enblslpm_quirk = dev_read_bool(dev,
 				"snps,dis_enblslpm_quirk");
+	/*
+	 * Same Qualcomm "host binds to a leaf subnode" issue as the parkmode
+	 * fallback above: the U2/U3 suspend-PHY and L1-sleep quirks live on the
+	 * parent controller node, so dwc->dev (the leaf) does not carry them and
+	 * the reads above return false. Fall back to the parent. Without this,
+	 * dwc3_phy_setup() leaves GUSB2PHYCFG.SUSPHY/ENBLSLPM (and
+	 * GUSB3PIPECTL.SUSPHY) set for rev>1.94a, the HS UTMI auto-suspends, and
+	 * the USB2 root-port reset never completes ("cannot reset port").
+	 */
+	if (!dwc->dis_u2_susphy_quirk || !dwc->dis_u3_susphy_quirk ||
+	    !dwc->dis_enblslpm_quirk) {
+		struct udevice *parent = dev_get_parent(dev);
+
+		if (parent) {
+			if (!dwc->dis_u2_susphy_quirk)
+				dwc->dis_u2_susphy_quirk = dev_read_bool(parent,
+						"snps,dis_u2_susphy_quirk");
+			if (!dwc->dis_u3_susphy_quirk)
+				dwc->dis_u3_susphy_quirk = dev_read_bool(parent,
+						"snps,dis_u3_susphy_quirk");
+			if (!dwc->dis_enblslpm_quirk)
+				dwc->dis_enblslpm_quirk = dev_read_bool(parent,
+						"snps,dis_enblslpm_quirk");
+		}
+	}
 	dwc->dis_u2_freeclk_exists_quirk = dev_read_bool(dev,
 				"snps,dis-u2-freeclk-exists-quirk");
 	dwc->tx_de_emphasis_quirk = dev_read_bool(dev,

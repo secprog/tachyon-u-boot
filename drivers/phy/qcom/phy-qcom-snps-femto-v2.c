@@ -139,6 +139,23 @@ static int qcom_snps_hsphy_power_on(struct phy *phy)
 	struct qcom_snps_hsphy *priv = dev_get_priv(phy->dev);
 	int ret;
 
+	/*
+	 * Pulse the PHY reset (assert -> settle -> deassert) before programming
+	 * it, mirroring Linux qcom_snps_hsphy_init(). The previous code only
+	 * de-asserted the reset (here and in probe), so on a cold boot the femto
+	 * HS PHY was never freshly reset and came up marginal: the first USB2
+	 * root-port reset then failed ("cannot reset port") and only a second
+	 * enumeration recovered it (a `usb reset` asserts the reset via
+	 * power_off() then de-asserts it via power_on(), i.e. it happens to form
+	 * the missing pulse). Doing the full pulse here makes the first
+	 * `usb start` enumerate the USB2 port.
+	 */
+	ret = reset_assert_bulk(&priv->resets);
+	if (ret)
+		return ret;
+
+	udelay(150);
+
 	ret = reset_deassert_bulk(&priv->resets);
 	if (ret)
 		return ret;
