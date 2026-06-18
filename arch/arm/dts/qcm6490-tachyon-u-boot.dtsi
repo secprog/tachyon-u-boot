@@ -133,6 +133,47 @@
 };
 
 /*
+ * &tlmm carries its own "default" pinctrl hog (pinctrl-0 in qcm6490-tachyon.dts:
+ * header_40pin_gpio, peri_5v_en, dsi_csi_sw_en, syscon_rgb_reserved,
+ * syscon_bls_invoke_ctrl, syscon_reset_ctrl, level_shifter_en). Because &tlmm is
+ * bootph-all it binds and probes in the pre-reloc DM pass, and DM auto-applies
+ * the controller's own "default" state there (drivers/core/device.c). As with the
+ * uart5 pins below, pinconfig_post_bind() gates each state child on a node-level
+ * bootph check that is NOT inherited from &tlmm, so without bootph-all on these
+ * nodes the PINCONFIG devices don't exist yet in the pre-reloc pass and
+ * pinctrl_select_state() warns once per phandle:
+ *   pinctrl_select_state_full: uclass_get_device_by_phandle_id: err=-19
+ * Mark them so they bind pre-relocation and the hog applies cleanly.
+ */
+&header_40pin_gpio_default {
+	bootph-all;
+};
+
+&peri_5v_en_default {
+	bootph-all;
+};
+
+&dsi_csi_sw_en_default {
+	bootph-all;
+};
+
+&syscon_rgb_reserved_default {
+	bootph-all;
+};
+
+&syscon_bls_invoke_ctrl_default {
+	bootph-all;
+};
+
+&syscon_reset_ctrl_default {
+	bootph-all;
+};
+
+&level_shifter_en_default {
+	bootph-all;
+};
+
+/*
  * The debug UART (uart5, serial@994000) is the pre-relocation console: its
  * driver carries DM_FLAG_PRE_RELOC, so it binds and probes in the pre-reloc
  * DM pass and DM auto-applies its "default" pinctrl state there. The pinmux
