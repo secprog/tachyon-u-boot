@@ -252,6 +252,27 @@ int generic_phy_init(struct phy *phy)
 	return 0;
 }
 
+/*
+ * Force the PHY .init op to run again, ignoring the init refcount. Used to
+ * re-establish a PHY whose datapath was disturbed by a later controller reset
+ * after the PHY was already initialised - e.g. DWC3 GUSB3PIPECTL.PHYSOFTRST
+ * de-syncs the SuperSpeed PIPE on the QMP combo PHY. Linux re-runs phy_power_on
+ * after the core soft reset; this mirrors that. Deliberately does NOT touch the
+ * refcount (it is a re-sync of an already-init'd PHY, not a new init/exit).
+ */
+int generic_phy_reinit(struct phy *phy)
+{
+	struct phy_ops const *ops;
+
+	if (!generic_phy_valid(phy))
+		return 0;
+	ops = phy_dev_ops(phy->dev);
+	if (!ops->init)
+		return 0;
+
+	return ops->init(phy);
+}
+
 int generic_phy_reset(struct phy *phy)
 {
 	struct phy_ops const *ops;

@@ -877,13 +877,21 @@ static int initf_upl(void)
 
 static const init_fnc_t init_sequence_f[] = {
 	setup_mon_len,
+	/*
+	 * Initialise the early malloc() pool before fdtdec_setup(): the
+	 * latter calls bloblist_maybe_init() to look for a control FDT in
+	 * the bloblist, and with CONFIG_BLOBLIST_ALLOC the bloblist is
+	 * carved from this pool.  If initf_malloc() runs later, that first
+	 * allocation fails ("alloc space exhausted ... limit 0") and the
+	 * bloblist is only created on the second, post-malloc attempt.
+	 */
+	initf_malloc,
 #ifdef CONFIG_OF_CONTROL
 	fdtdec_setup,
 #endif
 #ifdef CONFIG_TRACE_EARLY
 	trace_early_init,
 #endif
-	initf_malloc,
 	initf_upl,
 	log_init,
 	initf_bootstage,	/* uses its own timer, so does not need DM */

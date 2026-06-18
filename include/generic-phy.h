@@ -215,6 +215,18 @@ struct phy_bulk {
 int generic_phy_init(struct phy *phy);
 
 /**
+ * generic_phy_reinit() - re-run the PHY .init op, ignoring the init refcount
+ *
+ * Re-establish a PHY whose datapath was disturbed by a later controller reset
+ * after it was already initialised (e.g. DWC3 PHYSOFTRST de-syncing the SS
+ * combo-PHY PIPE). Does not change the refcount.
+ *
+ * @phy:	the PHY port to re-initialize
+ * Return: 0 if OK, or a negative error code
+ */
+int generic_phy_reinit(struct phy *phy);
+
+/**
  * generic_phy_init() - de-initialize the PHY device
  *
  * @phy:	PHY port to be de-initialized
@@ -435,6 +447,11 @@ int generic_shutdown_phy(struct phy *phy);
 #else /* CONFIG_PHY */
 
 static inline int generic_phy_init(struct phy *phy)
+{
+	return 0;
+}
+
+static inline int generic_phy_reinit(struct phy *phy)
 {
 	return 0;
 }

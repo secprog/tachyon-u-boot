@@ -138,9 +138,16 @@ static int dwc3_generic_probe(struct udevice *dev,
 	 * (phys[1]); the HS PHY (phys[0]) is owned by the EUD serial debugger,
 	 * so re-initing it could drop the console. The QMP combo COM guard
 	 * keeps DP preserved.
+	 *
+	 * Use generic_phy_reinit(): the PHY was already init'd in
+	 * dwc3_setup_phy() (init_count=1), so generic_phy_init() would just bump
+	 * the refcount and return WITHOUT re-running the PHY - leaving the PIPE
+	 * de-synced. generic_phy_reinit() forces the .init op (the combo PHY
+	 * re-runs qmp_combo_usb_power_on, re-arming the SS SerDes/PCS) past the
+	 * refcount.
 	 */
 	if (mode == USB_DR_MODE_HOST && priv->phys.count > 1)
-		generic_phy_init(&priv->phys.phys[1]);
+		generic_phy_reinit(&priv->phys.phys[1]);
 
 	return 0;
 }
