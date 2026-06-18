@@ -378,8 +378,19 @@ int usb_hub_port_connect_change(struct usb_device *dev, int port)
 	/* Reset the port */
 	ret = usb_hub_port_reset(dev, port, &portstatus);
 	if (ret < 0) {
+		/*
+		 * A port that reports a connection but never enables after the
+		 * full reset sequence has no usable device behind it. Some USB-C
+		 * docks expose reserved/internal downstream ports that assert a
+		 * phantom connect with no real device (e.g. the HP USB-C Dock G5
+		 * does this on an empty USB2 hub port - status 0x0101, reset
+		 * never completes). Linux debounces these away silently; the
+		 * port is skipped here regardless, so don't spam the console.
+		 * Genuine, actionable reset failures are still visible in a
+		 * DEBUG build.
+		 */
 		if (ret != -ENXIO)
-			printf("cannot reset port %i!?\n", port + 1);
+			debug("cannot reset port %i!?\n", port + 1);
 		return ret;
 	}
 
