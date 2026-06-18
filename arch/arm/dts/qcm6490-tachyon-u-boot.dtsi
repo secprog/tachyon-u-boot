@@ -132,6 +132,25 @@
 	bootph-all;
 };
 
+/*
+ * The debug UART (uart5, serial@994000) is the pre-relocation console: its
+ * driver carries DM_FLAG_PRE_RELOC, so it binds and probes in the pre-reloc
+ * DM pass and DM auto-applies its "default" pinctrl state there. The pinmux
+ * state nodes are bound separately by pinconfig_post_bind(), which gates each
+ * child on a node-level bootph check that is NOT inherited from &tlmm. Without
+ * bootph-all here the PINCONFIG devices don't exist yet in the pre-reloc pass,
+ * so pinctrl_select_state() warns:
+ *   pinctrl_select_state_full: uclass_get_device_by_phandle_id: err=-19
+ * once per phandle (tx + rx). Mark them so they bind pre-relocation too.
+ */
+&qup_uart5_tx {
+	bootph-all;
+};
+
+&qup_uart5_rx {
+	bootph-all;
+};
+
 /* Keep USB-C/DP related nodes available to U-Boot. Do not change Linux semantics. */
 &usb_1 {
 	bootph-all;

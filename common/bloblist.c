@@ -537,12 +537,20 @@ int bloblist_init(void)
 	else if (from_addr)
 		ret = bloblist_check(addr, size);
 
-	if (ret)
-		log_warning("Bloblist at %lx not found (err=%d)\n",
-			    addr, ret);
-	else
+	if (!ret) {
 		/* Get the real size */
 		size = gd->bloblist->total_size;
+	} else if (from_boot_arg || from_addr) {
+		/*
+		 * Only warn when we actually expected to find an existing
+		 * bloblist (fixed address or previous-phase handoff).  With
+		 * CONFIG_BLOBLIST_ALLOC and no fixed address there is nothing
+		 * to find yet; a fresh one is allocated below, so a "not
+		 * found" message here would be spurious.
+		 */
+		log_warning("Bloblist at %lx not found (err=%d)\n",
+			    addr, ret);
+	}
 
 	if (ret) {
 		/*
