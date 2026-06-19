@@ -12,6 +12,7 @@ TMP_DIR="${PROJECT_DIR}/.tmp"
 USE_DOCKER=""  # Will be auto-detected
 DEVICE_CONFIG="qcm6490_tachyon_defconfig"
 BUILD_TARGET="u-boot-dtb.bin"
+DOCKER_IMAGE="uboot-tachyon:latest"
 JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 AUTO_MODE=true
 
@@ -241,6 +242,7 @@ install_native_prerequisites() {
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 gcc \
                 gcc-aarch64-linux-gnu \
+                acpica-tools \
                 bc \
                 bison \
                 build-essential \
@@ -346,7 +348,7 @@ install_native_prerequisites() {
 build_docker() {
     section "BUILDING IN DOCKER CONTAINER"
 
-    local docker_image="uboot-tachyon:latest"
+    local docker_image="${DOCKER_IMAGE}"
     local dockerfile="${PROJECT_DIR}/Dockerfile.tachyon"
 
     # Check if Docker is available
@@ -380,9 +382,22 @@ build_docker() {
     info "Target: $BUILD_TARGET"
     info "Jobs: $JOBS"
 
+    # Under Git-Bash/MSYS on Windows, MSYS path-conversion rewrites the
+    # container-side paths (e.g. "-w /project" -> "C:/Program Files/Git/project")
+    # and the build fails. Detect MSYS via cygpath: pass Windows-style mount
+    # sources and disable path conversion so /project, /tmp/work and -w survive.
+    local host_project="${PROJECT_DIR}"
+    local host_tmp="${TMP_DIR}"
+    if command -v cygpath &> /dev/null; then
+        host_project="$(cygpath -m "${PROJECT_DIR}")"
+        host_tmp="$(cygpath -m "${TMP_DIR}")"
+        export MSYS_NO_PATHCONV=1
+        export MSYS2_ARG_CONV_EXCL='*'
+    fi
+
     docker run --rm \
-        -v "${PROJECT_DIR}:/project" \
-        -v "${TMP_DIR}:/tmp/work" \
+        -v "${host_project}:/project" \
+        -v "${host_tmp}:/tmp/work" \
         -w /project \
         "$docker_image" \
         bash -c "export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- && make ${DEVICE_CONFIG} && make -j${JOBS} ${BUILD_TARGET}"
@@ -482,8 +497,30 @@ show_build_output() {
 clean_build() {
     section "CLEANING BUILD ARTIFACTS"
 
-    info "Running make distclean..."
-    make distclean || make mrproper || true
+    if [ "$USE_DOCKER" = true ]; then
+        # Native `make` isn't present under Git-Bash/MSYS on Windows, so a
+        # host-side distclean silently no-ops and leaves a stale tree (the
+        # cause of "stale Docker build" issues). Run the clean inside the same
+        # container the build uses, with the same MSYS-safe path handling.
+        local host_project="${PROJECT_DIR}"
+        if command -v cygpath &> /dev/null; then
+            host_project="$(cygpath -m "${PROJECT_DIR}")"
+            export MSYS_NO_PATHCONV=1
+            export MSYS2_ARG_CONV_EXCL='*'
+        fi
+
+        if docker image inspect "${DOCKER_IMAGE}" &> /dev/null; then
+            info "Running make distclean in Docker..."
+            docker run --rm -v "${host_project}:/project" -w /project \
+                "${DOCKER_IMAGE}" \
+                bash -c "make distclean || make mrproper || true"
+        else
+            info "Docker image not built yet; tree is already clean"
+        fi
+    else
+        info "Running make distclean..."
+        make distclean || make mrproper || true
+    fi
 
     info "✓ Clean complete"
 }

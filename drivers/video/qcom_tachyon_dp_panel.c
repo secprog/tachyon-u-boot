@@ -615,10 +615,23 @@ static bool tachyon_dp_edid_header_ok(const u8 *buf)
 	return !memcmp(buf, header, sizeof(header));
 }
 
-static void tachyon_dp_add_mode_timing(struct tachyon_dp_mode *modes,
-				       int *count, u32 width, u32 height,
+static u32 tachyon_dp_mode_refresh(const struct display_timing *t)
+{
+	u32 htotal = tachyon_dp_htotal(t);
+	u32 vtotal = tachyon_dp_vtotal(t);
+
+	if (!t->pixelclock.typ || !htotal || !vtotal)
+		return 0;
+
+	return DIV_ROUND_CLOSEST(t->pixelclock.typ, htotal * vtotal);
+}
+
+static void tachyon_dp_add_mode_timing(struct tachyon_dp_priv *priv,
+				       u32 width, u32 height,
 				       const struct display_timing *timing)
 {
+	struct tachyon_dp_mode *modes = priv->modes;
+	int *count = &priv->mode_count;
 	int i;
 
 	if (!tachyon_dp_valid_resolution(width, height))
@@ -627,7 +640,18 @@ static void tachyon_dp_add_mode_timing(struct tachyon_dp_mode *modes,
 	for (i = 0; i < *count; i++) {
 		if (modes[i].width != width || modes[i].height != height)
 			continue;
-		if (timing && !modes[i].has_timing) {
+		/*
+		 * One slot per resolution.  Keep the first entry, EXCEPT when
+		 * the incoming timing fits the trained link and the stored one
+		 * does not (no timing yet, or a stored timing that exceeds the
+		 * link budget) — then replace it.  This lets e.g. 4K30 (fits
+		 * HBR2x2) survive when the EDID listed 4K60 (does not fit a
+		 * 2-lane link) first, instead of dropping the resolution.
+		 */
+		if (timing &&
+		    (!modes[i].has_timing ||
+		     (tachyon_dp_mode_fits_link(priv, timing) &&
+		      !tachyon_dp_mode_fits_link(priv, &modes[i].timing)))) {
 			modes[i].timing = *timing;
 			modes[i].has_timing = true;
 		}
@@ -646,20 +670,20 @@ static void tachyon_dp_add_mode_timing(struct tachyon_dp_mode *modes,
 	(*count)++;
 }
 
-static void tachyon_dp_add_mode(struct tachyon_dp_mode *modes, int *count,
+static void tachyon_dp_add_mode(struct tachyon_dp_priv *priv,
 				u32 width, u32 height)
 {
 	struct display_timing timing;
 
 	if (tachyon_dp_known_timing(width, height, &timing) ||
 	    tachyon_dp_cvt_timing(width, height, 60, &timing))
-		tachyon_dp_add_mode_timing(modes, count, width, height,
+		tachyon_dp_add_mode_timing(priv, width, height,
 					   &timing);
 	else
-		tachyon_dp_add_mode_timing(modes, count, width, height, NULL);
+		tachyon_dp_add_mode_timing(priv, width, height, NULL);
 }
 
-static void tachyon_dp_parse_dtd(struct tachyon_dp_mode *modes, int *count,
+static void tachyon_dp_parse_dtd(struct tachyon_dp_priv *priv,
 				 const u8 *buf)
 {
 	const struct edid_detailed_timing *t =
@@ -693,11 +717,10 @@ static void tachyon_dp_parse_dtd(struct tachyon_dp_mode *modes, int *count,
 			       width, hfp, hsync, hblank - hfp - hsync,
 			       height, vfp, vsync, vblank - vfp - vsync,
 			       flags);
-	tachyon_dp_add_mode_timing(modes, count, width, height, &timing);
+	tachyon_dp_add_mode_timing(priv, width, height, &timing);
 }
 
-static void tachyon_dp_parse_standard_timings(struct tachyon_dp_mode *modes,
-					      int *count,
+static void tachyon_dp_parse_standard_timings(struct tachyon_dp_priv *priv,
 					      const struct edid1_info *edid)
 {
 	int i;
@@ -728,18 +751,16 @@ static void tachyon_dp_parse_standard_timings(struct tachyon_dp_mode *modes,
 		}
 		if (tachyon_dp_known_timing(width, height, &timing) ||
 		    tachyon_dp_cvt_timing(width, height, 60, &timing))
-			tachyon_dp_add_mode_timing(modes, count, width, height,
+			tachyon_dp_add_mode_timing(priv, width, height,
 						   &timing);
 		else
-			tachyon_dp_add_mode(modes, count, width, height);
+			tachyon_dp_add_mode(priv, width, height);
 	}
 }
 
-static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
-				   u8 vic);
+static void tachyon_dp_add_cea_vic(struct tachyon_dp_priv *priv, u8 vic);
 
-static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
-						 int *count,
+static void tachyon_dp_parse_established_timings(struct tachyon_dp_priv *priv,
 						 const struct edid1_info *edid)
 {
 	struct display_timing timing;
@@ -750,35 +771,35 @@ static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
 				       480, 10, 2, 33,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+		tachyon_dp_add_mode_timing(priv, 640, 480, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_800X600_60(*edid)) {
 		tachyon_dp_fill_timing(&timing, 40000000, 800, 40, 128, 88,
 				       600, 1, 4, 23,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 800, 600, &timing);
+		tachyon_dp_add_mode_timing(priv, 800, 600, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_1024X768_60(*edid)) {
 		tachyon_dp_fill_timing(&timing, 65000000, 1024, 24, 136, 160,
 				       768, 3, 6, 29,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 1024, 768, &timing);
+		tachyon_dp_add_mode_timing(priv, 1024, 768, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_1280X1024_75(*edid)) {
 		tachyon_dp_fill_timing(&timing, 135000000, 1280, 16, 144, 248,
 				       1024, 1, 3, 38,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1280, 1024, &timing);
+		tachyon_dp_add_mode_timing(priv, 1280, 1024, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_1152X870_75(*edid)) {
 		tachyon_dp_fill_timing(&timing, 92940000, 1152, 48, 128, 112,
 				       870, 3, 3, 39,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 1152, 870, &timing);
+		tachyon_dp_add_mode_timing(priv, 1152, 870, &timing);
 	}
 	/* These are infrequently declared in EDID, but cover them anyway */
 	if (EDID1_INFO_ESTABLISHED_TIMING_720X400_70(*edid)) {
@@ -786,33 +807,32 @@ static void tachyon_dp_parse_established_timings(struct tachyon_dp_mode *modes,
 				       400, 13, 2, 34,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 720, 400, &timing);
+		tachyon_dp_add_mode_timing(priv, 720, 400, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_640X480_75(*edid)) {
 		tachyon_dp_fill_timing(&timing, 31500000, 640, 16, 64, 120,
 				       480, 1, 3, 16,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+		tachyon_dp_add_mode_timing(priv, 640, 480, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_800X600_75(*edid)) {
 		tachyon_dp_fill_timing(&timing, 49500000, 800, 16, 80, 160,
 				       600, 1, 3, 21,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 800, 600, &timing);
+		tachyon_dp_add_mode_timing(priv, 800, 600, &timing);
 	}
 	if (EDID1_INFO_ESTABLISHED_TIMING_1024X768_75(*edid)) {
 		tachyon_dp_fill_timing(&timing, 78750000, 1024, 16, 96, 176,
 				       768, 1, 3, 28,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1024, 768, &timing);
+		tachyon_dp_add_mode_timing(priv, 1024, 768, &timing);
 	}
 }
 
-static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
-				   u8 vic)
+static void tachyon_dp_add_cea_vic(struct tachyon_dp_priv *priv, u8 vic)
 {
 	struct display_timing timing;
 
@@ -823,7 +843,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       480, 10, 2, 33,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 640, 480, &timing);
+		tachyon_dp_add_mode_timing(priv, 640, 480, &timing);
 		break;
 	/* 720×480 @ 59.94/60Hz */
 	case 2:
@@ -832,7 +852,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       480, 9, 6, 30,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 720, 480, &timing);
+		tachyon_dp_add_mode_timing(priv, 720, 480, &timing);
 		break;
 	/* 1280×720 @ 60Hz */
 	case 4:
@@ -840,7 +860,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       720, 5, 5, 20,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+		tachyon_dp_add_mode_timing(priv, 1280, 720, &timing);
 		break;
 	/* 1920×1080i @ 60Hz (treat as progressive 1920×540) — skip interlace */
 	/* 720(1440)×480i @ 60Hz (2x) — skip interlace */
@@ -853,7 +873,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       1080, 4, 5, 36,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		tachyon_dp_add_mode_timing(priv, 1920, 1080, &timing);
 		break;
 	/* 720×576 @ 50Hz */
 	case 17:
@@ -862,7 +882,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       576, 5, 5, 39,
 				       DISPLAY_FLAGS_HSYNC_LOW |
 				       DISPLAY_FLAGS_VSYNC_LOW);
-		tachyon_dp_add_mode_timing(modes, count, 720, 576, &timing);
+		tachyon_dp_add_mode_timing(priv, 720, 576, &timing);
 		break;
 	/* 1280×720 @ 50Hz */
 	case 19:
@@ -870,7 +890,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       720, 5, 5, 20,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1280, 720, &timing);
+		tachyon_dp_add_mode_timing(priv, 1280, 720, &timing);
 		break;
 	/* 1920×1080 @ 50Hz */
 	case 31:
@@ -878,7 +898,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       1080, 4, 5, 36,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		tachyon_dp_add_mode_timing(priv, 1920, 1080, &timing);
 		break;
 	/* 1920×1080 @ 24Hz */
 	case 32:
@@ -886,7 +906,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       1080, 4, 5, 36,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		tachyon_dp_add_mode_timing(priv, 1920, 1080, &timing);
 		break;
 	/* 1920×1080 @ 25Hz */
 	case 33:
@@ -894,7 +914,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       1080, 4, 5, 36,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		tachyon_dp_add_mode_timing(priv, 1920, 1080, &timing);
 		break;
 	/* 2880×480 @ 60Hz / 2880×240 */
 	case 35:
@@ -908,7 +928,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       1080, 3, 5, 24,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 1920, 1080, &timing);
+		tachyon_dp_add_mode_timing(priv, 1920, 1080, &timing);
 		break;
 	/* 3840×2160 @ 24Hz */
 	case 93:
@@ -916,7 +936,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 3840, 2160, &timing);
 		break;
 	/* 3840×2160 @ 25Hz */
 	case 94:
@@ -924,7 +944,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 3840, 2160, &timing);
 		break;
 	/* 3840×2160 @ 30Hz */
 	case 95:
@@ -932,7 +952,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 3840, 2160, &timing);
 		break;
 	/* 3840×2160 @ 50Hz */
 	case 96:
@@ -940,7 +960,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 3840, 2160, &timing);
 		break;
 	/* 3840×2160 @ 60Hz */
 	case 97:
@@ -948,7 +968,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 3840, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 3840, 2160, &timing);
 		break;
 	/* 4096×2160 @ 24Hz */
 	case 98:
@@ -956,7 +976,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 4096, 2160, &timing);
 		break;
 	/* 4096×2160 @ 25Hz */
 	case 99:
@@ -964,7 +984,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 4096, 2160, &timing);
 		break;
 	/* 4096×2160 @ 30Hz */
 	case 100:
@@ -972,7 +992,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 4096, 2160, &timing);
 		break;
 	/* 4096×2160 @ 50Hz */
 	case 101:
@@ -980,7 +1000,7 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 4096, 2160, &timing);
 		break;
 	/* 4096×2160 @ 60Hz */
 	case 102:
@@ -988,15 +1008,15 @@ static void tachyon_dp_add_cea_vic(struct tachyon_dp_mode *modes, int *count,
 				       2160, 8, 10, 72,
 				       DISPLAY_FLAGS_HSYNC_HIGH |
 				       DISPLAY_FLAGS_VSYNC_HIGH);
-		tachyon_dp_add_mode_timing(modes, count, 4096, 2160, &timing);
+		tachyon_dp_add_mode_timing(priv, 4096, 2160, &timing);
 		break;
 	default:
 		break;
 	}
 }
 
-static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
-				       int *count, const u8 *buf)
+static void tachyon_dp_parse_cea_modes(struct tachyon_dp_priv *priv,
+				       const u8 *buf)
 {
 	const struct edid_cea861_info *cea =
 		(const struct edid_cea861_info *)buf;
@@ -1015,7 +1035,7 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
 
 		if (tag == EDID_CEA861_DB_VIDEO) {
 			for (i = 1; i <= len; i++)
-				tachyon_dp_add_cea_vic(modes, count,
+				tachyon_dp_add_cea_vic(priv,
 						       buf[offset + i]);
 		}
 
@@ -1024,7 +1044,7 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_mode *modes,
 
 	dtd = cea->dtd_offset;
 	while (dtd && dtd + sizeof(struct edid_detailed_timing) <= EDID_SIZE) {
-		tachyon_dp_parse_dtd(modes, count, buf + dtd);
+		tachyon_dp_parse_dtd(priv, buf + dtd);
 		dtd += sizeof(struct edid_detailed_timing);
 	}
 }
@@ -1068,13 +1088,19 @@ void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 
 		if (!priv->modes[in].has_timing ||
 		    !tachyon_dp_mode_fits_link(priv, &priv->modes[in].timing)) {
-			log_warning("Dropping DP EDID mode %ux%u: %s\n",
+			log_warning("Dropping DP EDID mode %ux%u@%uHz: %s\n",
 				 priv->modes[in].width, priv->modes[in].height,
+				 priv->modes[in].has_timing ?
+				 tachyon_dp_mode_refresh(&priv->modes[in].timing) : 0,
 				 !priv->modes[in].has_timing ?
 				 "no timing available" :
 				 "exceeds link policy");
 			continue;
 		}
+
+		log_info("DP EDID mode kept: %ux%u@%uHz\n",
+			 priv->modes[in].width, priv->modes[in].height,
+			 tachyon_dp_mode_refresh(&priv->modes[in].timing));
 
 		if (out != in)
 			priv->modes[out] = priv->modes[in];
@@ -1148,8 +1174,10 @@ void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv)
 	else
 		env_set("tachyon_dp_pref_pclk", NULL);
 
-	log_info("DP EDID modes: %s preferred=%ux%u pclk=%u\n",
+	log_info("DP EDID modes: %s preferred=%ux%u@%uHz pclk=%u\n",
 		 out, priv->modes[pref].width, priv->modes[pref].height,
+		 priv->modes[pref].has_timing ?
+		 tachyon_dp_mode_refresh(&priv->modes[pref].timing) : 0,
 		 priv->modes[pref].has_timing ?
 		 priv->modes[pref].timing.pixelclock.typ : 0);
 }
@@ -1188,20 +1216,17 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 	edid = (struct edid1_info *)edid_buf;
 
 	for (i = 0; i < 4; i++)
-		tachyon_dp_parse_dtd(priv->modes, &priv->mode_count,
+		tachyon_dp_parse_dtd(priv,
 				     edid->monitor_details.timing +
 				     i * sizeof(struct edid_detailed_timing));
 
-	tachyon_dp_parse_standard_timings(priv->modes, &priv->mode_count, edid);
-	tachyon_dp_parse_established_timings(priv->modes, &priv->mode_count,
-					     edid);
+	tachyon_dp_parse_standard_timings(priv, edid);
+	tachyon_dp_parse_established_timings(priv, edid);
 
 	if (edid->extension_flag) {
 		ret = tachyon_dp_edid_read_block(priv, 1, edid_buf + EDID_SIZE);
 		if (!ret && tachyon_dp_edid_checksum_ok(edid_buf + EDID_SIZE))
-			tachyon_dp_parse_cea_modes(priv->modes,
-						   &priv->mode_count,
-						   edid_buf + EDID_SIZE);
+			tachyon_dp_parse_cea_modes(priv, edid_buf + EDID_SIZE);
 	}
 
 	log_debug("DP EDID pre-filter: %d modes, rate=%u lanes=%u\n",

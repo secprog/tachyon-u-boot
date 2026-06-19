@@ -423,7 +423,7 @@ int acpi_write_dbg2_pci_uart(struct acpi_ctx *ctx, struct udevice *dev,
 	return 0;
 }
 
-static int acpi_write_spcr(struct acpi_ctx *ctx, const struct acpi_writer *entry)
+__weak int acpi_write_spcr(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct serial_device_info serial_info = {0};
 	u64 serial_address, serial_offset;

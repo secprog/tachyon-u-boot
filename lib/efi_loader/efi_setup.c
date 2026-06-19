@@ -10,6 +10,7 @@
 #include <efi_loader.h>
 #include <efi_variable.h>
 #include <log.h>
+#include <stdio.h>
 #include <asm-generic/unaligned.h>
 
 #define OBJ_LIST_NOT_INITIALIZED 1
@@ -326,6 +327,40 @@ efi_status_t efi_init_obj_list(void)
 		ret = efi_acpi_register();
 		if (ret != EFI_SUCCESS)
 			goto out;
+	}
+	if (IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)) {
+		/*
+		 * Windows-on-ARM: winload reads the SPCR/DBG2 ACPI tables, finds
+		 * the GENI QUP serial console at 0x994000, and writes to it during
+		 * early boot (pre-SetVirtualAddressMap). winload installs its own
+		 * page tables and its on-demand mapper (BlMmMapPhysicalAddress)
+		 * only maps a physical page if that page is already a member of
+		 * winload's loader-descriptor DB; otherwise the map silently fails
+		 * and the console write data-aborts (HW-confirmed: ESR=0x96000045
+		 * WRITE, FAR=0x99480c = UART + TX_WATERMARK_REG 0x80c).
+		 *
+		 * The DB-membership gate accepts any class except EFI_PAL_CODE, so
+		 * the EFI type itself is not the issue -- timing is. EfiMemoryMappedIO
+		 * / EfiReservedMemoryType regions are only ingested late (by winload's
+		 * OslpProcessFirmwareMemoryMap), AFTER the console is first written,
+		 * so they are not in the DB yet and the write faults. EFI_LOADER_DATA
+		 * regions are merged into the DB at the earliest loader stage, before
+		 * the console write, so winload identity-maps the UART itself. Use
+		 * EFI_MEMORY_UC (not RUNTIME -- RUNTIME would request a high-VA remap
+		 * at SVAM instead of the identity mapping the early write needs).
+		 *
+		 * Done unconditionally (not gated on boot_os): efi_init_obj_list()
+		 * runs once on the first EFI op, which may be an early autoboot
+		 * before the user sets boot_os=windows, so a gate here can be
+		 * silently skipped. Adding the region is harmless to Linux, which
+		 * maps the UART itself.
+		 */
+		efi_status_t r = efi_add_memory_map_attr(0x994000, 0x4000,
+							 EFI_LOADER_DATA,
+							 EFI_MEMORY_UC);
+
+		printf("EFI-HANDOFF: console UART 0x994000+0x4000 -> EFI map (LOADER_DATA/UC) ret=%lu\n",
+		       (unsigned long)r);
 	}
 	if (IS_ENABLED(CONFIG_SMBIOS)) {
 		ret = efi_smbios_register();

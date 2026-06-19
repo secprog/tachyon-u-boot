@@ -28,6 +28,11 @@
 #include <dm/ofnode.h>
 #include <video.h>
 #include <video_console.h>
+#include <smem.h>
+#include <mapmem.h>
+#include <display_options.h>
+#include <vsprintf.h>
+#include <linux/err.h>
 
 #include "efs.h"
 
@@ -479,6 +484,111 @@ static int do_tachyon_resolution(struct cmd_tbl* cmdtp, int flag, int argc,
 	return CMD_RET_USAGE;
 }
 
+/*
+ * QHEE EL2-abort post-mortem reader.
+ *
+ * QHEE (the SC7280 EL2 hypervisor) handles an unrecoverable guest fault by
+ * dumping the EL2 context (ESR_EL2/FAR_EL2/HPFAR_EL2/...) and then issuing the
+ * TZ_SECURE_WDOG_TRIGGER SMC -> PSHOLD whole-SoC reset, with NO exception
+ * delivered to EL1 (so it is invisible to U-Boot/Windows at fault time). The
+ * context survives the warm reset in DDR and is registered in the Qualcomm SBL
+ * minidump table (SMEM item 602, NS-readable). The per-core abort record begins
+ * with magic 'SYDB' (0x42445953) followed by "hyp"+core; the saved 0x180-byte
+ * EL2 frame starts at record+0x10, with (from QHEE disasm) ESR_EL2 @ +0x158,
+ * FAR_EL2 @ +0x160, HPFAR_EL2 @ +0x168 within that frame.
+ *
+ *   tachyon qhee            -> dump SMEM minidump TOC (602) + flag hyp regions
+ *   tachyon qhee <hexPA>    -> decode the abort record at physical addr <hexPA>
+ *
+ * HPFAR_EL2 gives the faulting guest IPA (= the PA Windows touched that QHEE
+ * rejected). Only read a <hexPA> that the TOC shows is a real dump region, and
+ * NOT inside the hyp carveout (0x80000000-0x80600000) which is stage-2-hidden
+ * from EL1 (reading it would itself abort -> reset).
+ */
+#define QHEE_MINIDUMP_SMEM_ID	602
+#define QHEE_REC_MAGIC		0x42445953	/* 'SYDB' */
+
+static int do_tachyon_qhee(struct cmd_tbl *cmdtp, int flag, int argc,
+			   char *const argv[]) {
+	struct udevice *dev = NULL;
+	size_t size = 0;
+	void *ptr;
+	u8 *b;
+	size_t i, n;
+	int ret;
+
+	if (argc >= 2) {
+		/* decode an abort record at a physical address */
+		u64 pa = simple_strtoull(argv[1], NULL, 16);
+		u8 *m = map_sysmem(pa, 0x200);
+		u32 magic = *(u32 *)m;
+		u64 esr = *(u64 *)(m + 0x168);
+		u64 far = *(u64 *)(m + 0x170);
+		u64 hpfar = *(u64 *)(m + 0x178);
+
+		printf("rec @0x%llx magic=0x%08x %s name='%.8s'\n",
+		       (unsigned long long)pa, magic,
+		       magic == QHEE_REC_MAGIC ? "(SYDB ok)" : "(NOT SYDB)",
+		       (char *)(m + 8));
+		printf("ESR_EL2  =0x%016llx  EC=0x%llx DFSC=0x%llx WnR=%llu ISV=%llu\n",
+		       (unsigned long long)esr, (unsigned long long)(esr >> 26),
+		       (unsigned long long)(esr & 0x3f),
+		       (unsigned long long)((esr >> 6) & 1),
+		       (unsigned long long)((esr >> 24) & 1));
+		printf("FAR_EL2  =0x%016llx\n", (unsigned long long)far);
+		printf("HPFAR_EL2=0x%016llx  faulting IPA=0x%llx\n",
+		       (unsigned long long)hpfar,
+		       (unsigned long long)((hpfar >> 4) << 12));
+		printf("--- record+0x150..0x190 ---\n");
+		print_buffer(pa + 0x150, m + 0x150, 1, 0x40, 0);
+		unmap_sysmem(m);
+		return CMD_RET_SUCCESS;
+	}
+
+	ret = uclass_first_device_err(UCLASS_SMEM, &dev);
+	if (ret) {
+		printf("SMEM device error %d\n", ret);
+		return CMD_RET_FAILURE;
+	}
+
+	ptr = smem_get(dev, -1, QHEE_MINIDUMP_SMEM_ID, &size);
+	if (IS_ERR_OR_NULL(ptr) || !size) {
+		printf("SMEM item %d (minidump) not present (ptr=%p size=%zu)\n",
+		       QHEE_MINIDUMP_SMEM_ID, ptr, size);
+		return CMD_RET_FAILURE;
+	}
+	printf("SMEM minidump (item %d) @ %p size %zu\n",
+	       QHEE_MINIDUMP_SMEM_ID, ptr, size);
+	print_buffer(0, ptr, 1, size < 0x300 ? size : 0x300, 0);
+
+	/* scan for region records: a printable name (>=3 chars) followed, 16 bytes
+	 * in, by an addr/size u64 pair (covers the minidump_region layout). Flag
+	 * anything that looks hyp-related or carries the SYDB magic. */
+	b = ptr;
+	printf("--- candidate regions ---\n");
+	for (i = 0; i + 0x28 <= size; i++) {
+		char nm[17];
+
+		if (b[i] < 0x20 || b[i] >= 0x7f)
+			continue;
+		for (n = 0; n < 16 && b[i + n] >= 0x20 && b[i + n] < 0x7f; n++)
+			;
+		if (n < 3 || n > 15 || b[i + n] != 0)
+			continue;
+		memcpy(nm, b + i, n);
+		nm[n] = 0;
+		if (strstr(nm, "yp") || strstr(nm, "YP") || strstr(nm, "DIAG") ||
+		    *(u32 *)(b + i) == QHEE_REC_MAGIC) {
+			u64 a = *(u64 *)(b + i + 24);
+			u64 s = *(u64 *)(b + i + 32);
+
+			printf("  off0x%zx name='%s' addr=0x%llx size=0x%llx\n",
+			       i, nm, (unsigned long long)a, (unsigned long long)s);
+		}
+	}
+	return CMD_RET_SUCCESS;
+}
+
 static int do_tachyon(struct cmd_tbl* cmdtp, int flag, int argc,
 		      char* const argv[]) {
 	if (argc < 2) {
@@ -487,6 +597,10 @@ static int do_tachyon(struct cmd_tbl* cmdtp, int flag, int argc,
 
 	if (!strcmp(argv[1], "resolution")) {
 		return do_tachyon_resolution(cmdtp, flag, argc - 1, argv + 1);
+	}
+
+	if (!strcmp(argv[1], "qhee")) {
+		return do_tachyon_qhee(cmdtp, flag, argc - 1, argv + 1);
 	}
 
 	return CMD_RET_USAGE;
@@ -500,7 +614,9 @@ U_BOOT_CMD(
 	"resolution load\n"
 	"resolution menu\n"
 	"resolution save\n"
-	"resolution set <width>x<height> [save]"
+	"resolution set <width>x<height> [save]\n"
+	"qhee            - dump QHEE EL2-abort minidump TOC (SMEM 602)\n"
+	"qhee <hexPA>    - decode QHEE abort record (ESR/FAR/HPFAR) at phys addr"
 );
 
 static int tachyon_setup_efs(void) {

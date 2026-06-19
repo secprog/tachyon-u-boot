@@ -11,6 +11,7 @@
 #include <cpu_func.h>
 #include <dm.h>
 #include <elf.h>
+#include <env.h>
 #include <efi_loader.h>
 #include <efi_variable.h>
 #include <log.h>
@@ -26,6 +27,29 @@ DECLARE_GLOBAL_DATA_PTR;
 /* GUID of the runtime properties table */
 static const efi_guid_t efi_rt_properties_table_guid =
 				EFI_RT_PROPERTIES_TABLE_GUID;
+
+/* GUID of the EFI Memory Attributes Table (UEFI 2.6+) */
+static const efi_guid_t efi_mem_attributes_table_guid =
+	EFI_GUID(0xdcfa911d, 0x26eb, 0x469f,
+		 0xa2, 0x20, 0x38, 0xb7, 0xdc, 0x46, 0x12, 0x20);
+
+/**
+ * struct efi_mem_attributes_table - EFI Memory Attributes Table
+ * @version:		table version (1)
+ * @num_entries:	number of descriptors that follow
+ * @desc_size:		size of one descriptor in bytes
+ * @flags:		table flags (0)
+ * @entry:		array of @num_entries memory descriptors
+ */
+struct efi_mem_attributes_table {
+	u32 version;
+	u32 num_entries;
+	u32 desc_size;
+	u32 flags;
+	struct efi_mem_desc entry[];
+};
+
+#define EFI_MEMORY_ATTRIBUTES_TABLE_VERSION 1
 
 struct efi_runtime_mmio_list {
 	struct list_head link;
@@ -102,6 +126,103 @@ static __efi_runtime_data efi_uintn_t efi_descriptor_size;
  * payload are running concurrently at the same time. In this mode, we can
  * handle a good number of runtime callbacks
  */
+
+/**
+ * efi_init_memory_attributes_table() - publish the EFI Memory Attributes Table
+ *
+ * Modern Windows (winload, Windows 11 22H2 and later) consults the EFI Memory
+ * Attributes Table (MAT) and applies W^X protections to the runtime services
+ * regions before SetVirtualAddressMap(). When the table is absent the loader's
+ * runtime-region handling diverges from what it expects. We therefore publish a
+ * MAT describing every EFI_MEMORY_RUNTIME region: runtime *code* as read-only
+ * (EFI_MEMORY_RO, still executable) and everything else as non-executable
+ * (EFI_MEMORY_XP). Older Windows and Linux ignore the unknown table.
+ *
+ * The table is allocated as runtime data *before* the memory map is read so its
+ * own region is described in the table, and it covers the runtime regions that
+ * exist at EFI init (no further runtime allocations occur before the OS is
+ * handed control, so this matches the map presented at ExitBootServices()).
+ *
+ * Return:	status code
+ */
+static efi_status_t efi_init_memory_attributes_table(void)
+{
+	efi_uintn_t map_size = 0, map_key, desc_size = 0, mat_alloc;
+	struct efi_mem_attributes_table *mat;
+	struct efi_mem_desc *map;
+	uint32_t desc_ver;
+	efi_status_t ret;
+	u32 n = 0;
+	u8 *p;
+
+	/* Probe the map size and descriptor stride. */
+	ret = efi_get_memory_map(&map_size, NULL, &map_key, &desc_size,
+				 &desc_ver);
+	if (ret != EFI_BUFFER_TOO_SMALL || !desc_size)
+		return EFI_INVALID_PARAMETER;
+
+	/*
+	 * Allocate the table first, as runtime data, so that its own region is
+	 * present in the memory map read below. Size generously to cover every
+	 * current map entry plus headroom for the two allocations made here.
+	 */
+	mat_alloc = sizeof(*mat) + (map_size / desc_size + 8) * desc_size;
+	ret = efi_allocate_pool(EFI_RUNTIME_SERVICES_DATA, mat_alloc,
+				(void **)&mat);
+	if (ret != EFI_SUCCESS)
+		return ret;
+
+	map_size += 8 * desc_size;
+	ret = efi_allocate_pool(EFI_BOOT_SERVICES_DATA, map_size, (void **)&map);
+	if (ret != EFI_SUCCESS) {
+		efi_free_pool(mat);
+		return ret;
+	}
+
+	ret = efi_get_memory_map(&map_size, map, &map_key, &desc_size,
+				 &desc_ver);
+	if (ret != EFI_SUCCESS) {
+		efi_free_pool(map);
+		efi_free_pool(mat);
+		return ret;
+	}
+
+	mat->version = EFI_MEMORY_ATTRIBUTES_TABLE_VERSION;
+	mat->desc_size = desc_size;
+	mat->flags = 0;
+
+	for (p = (u8 *)map; p < (u8 *)map + map_size; p += desc_size) {
+		struct efi_mem_desc *d = (struct efi_mem_desc *)p;
+		struct efi_mem_desc *o;
+
+		if (!(d->attribute & EFI_MEMORY_RUNTIME))
+			continue;
+
+		o = (struct efi_mem_desc *)((u8 *)mat + sizeof(*mat) +
+					    (size_t)n * desc_size);
+		*o = *d;
+		o->virtual_start = 0;
+		/* W^X: runtime code is read-only, all other runtime is XP. */
+		o->attribute &= ~(EFI_MEMORY_RO | EFI_MEMORY_XP);
+		if (d->type == EFI_RUNTIME_SERVICES_CODE)
+			o->attribute |= EFI_MEMORY_RO;
+		else
+			o->attribute |= EFI_MEMORY_XP;
+		n++;
+	}
+	mat->num_entries = n;
+
+	efi_free_pool(map);
+
+	ret = efi_install_configuration_table(&efi_mem_attributes_table_guid,
+					      mat);
+	printf("EFI-HANDOFF: Memory Attributes Table -> %u runtime region(s), ret=%lu\n",
+	       n, ret);
+	if (ret != EFI_SUCCESS)
+		efi_free_pool(mat);
+
+	return ret;
+}
 
 /**
  * efi_init_runtime_supported() - create runtime properties table
@@ -185,7 +306,18 @@ efi_status_t efi_init_runtime_supported(void)
 
 	ret = efi_install_configuration_table(&efi_rt_properties_table_guid,
 					      rt_table);
-	return ret;
+	if (ret != EFI_SUCCESS)
+		return ret;
+
+	/*
+	 * Publish the EFI Memory Attributes Table. Windows 11 22H2+ winload
+	 * applies W^X to the runtime regions from this table before
+	 * SetVirtualAddressMap(); without it its runtime handling diverges.
+	 * Best-effort: a failure here must not abort EFI initialisation.
+	 */
+	efi_init_memory_attributes_table();
+
+	return EFI_SUCCESS;
 }
 
 /**
@@ -822,6 +954,9 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 	EFI_ENTRY("%zx %zx %x %p", memory_map_size, descriptor_size,
 		  descriptor_version, virtmap);
 
+	/* Diagnostic marker over serial: entered SetVirtualAddressMap. */
+	printf("EFI-HANDOFF: SetVirtualAddressMap enter\n");
+
 	if (descriptor_version != EFI_MEMORY_DESCRIPTOR_VERSION ||
 	    descriptor_size < sizeof(struct efi_mem_desc))
 		goto out;
@@ -909,6 +1044,8 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 
 			efi_relocate_runtime_table(new_offset);
 			efi_runtime_relocate(new_offset, map);
+			/* Diagnostic marker over serial: SVAM relocation done. */
+			printf("EFI-HANDOFF: SetVirtualAddressMap done\n");
 			ret = EFI_SUCCESS;
 			goto out;
 		}

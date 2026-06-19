@@ -11,6 +11,7 @@
 #include <log.h>
 #include <sort.h>
 #include <smem.h>
+#include <linux/string.h>
 #include <dm/device-internal.h>
 
 int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t nbanks)
@@ -57,4 +58,47 @@ int qcom_parse_memory_smem(qcom_mem_bank* banks, size_t nbanks)
     qcom_sort_memory_banks(banks, j);
 
     return j;
+}
+
+/*
+ * Look up a named region in the SMEM RAM partition table (item 402) by its
+ * partition name (e.g. "MPSS_EFS", "ADSP_EFS", "TGCM").  Unlike
+ * qcom_parse_memory_smem(), this does NOT filter on category/type because the
+ * regions of interest are firmware carveouts, not system RAM.  Used by the
+ * ACPI DSDT patcher to publish modem/ADSP/sensor memory windows to Windows.
+ *
+ * Returns 0 and fills @bank on success, or a negative errno if the SMEM table
+ * is unavailable or no partition matches @name.
+ */
+int qcom_find_smem_region(const char *name, qcom_mem_bank *bank)
+{
+    size_t size;
+    int i, ret;
+    struct smem_ram_ptable *ram_ptable;
+    struct smem_ram_ptn *p;
+    struct udevice *dev = NULL;
+
+    if (!name || !bank)
+        return -EINVAL;
+
+    ret = uclass_first_device_err(UCLASS_SMEM, &dev);
+    if (ret)
+        return ret;
+
+    ram_ptable = smem_get(dev, -1 /* any */,
+                          SMEM_USABLE_RAM_PARTITION_TABLE, &size);
+    if (!ram_ptable)
+        return -ENODEV;
+
+    for (i = 0; i < RAM_NUM_PART_ENTRIES; i++) {
+        p = &ram_ptable->parts[i];
+        if (strncmp(p->name, name, RAM_PART_NAME_LENGTH))
+            continue;
+
+        bank->start = p->start;
+        bank->size = p->size;
+        return 0;
+    }
+
+    return -ENOENT;
 }

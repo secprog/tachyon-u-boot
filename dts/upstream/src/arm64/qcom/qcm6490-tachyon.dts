@@ -264,10 +264,23 @@
 	};
 
 	reserved-memory {
-		// This has to match what the modem is expecting
-		rmtfs_mem: rmtfs@fc200000 {
+		/*
+		 * rmtfs (modem remote-FS shared memory). MUST be the
+		 * Tachyon-specific base/size from the canonical kernel DTS
+		 * (qcm6490-particle-tachyon.dts: 0xf8500000 + 0x600000), NOT the
+		 * generic qcm6490 0xfc200000/0x280000 that was here before -- that
+		 * left the REAL rmtfs region (0xf8500000-0xfb500000) un-reserved,
+		 * so U-Boot handed it to Windows as reclaimable memory. rmtfs is
+		 * assigned to the modem/NAV VMIDs (XPU/QHEE-owned, stage-2-hidden
+		 * from the HLOS VM); Windows zeroes reclaimable pages at phase 0,
+		 * and a write into this modem-owned carveout faults at EL2 ->
+		 * QHEE issues TZ_SECURE_WDOG_TRIGGER -> silent PS_HOLD SoC reset
+		 * at the winload->NT handoff (Linux is immune: it reserves+vmid-
+		 * assigns this exact range and never touches it).
+		 */
+		rmtfs_mem: rmtfs@f8500000 {
 			compatible = "qcom,rmtfs-mem";
-			reg = <0x0 0xfc200000 0x0 0x280000>;
+			reg = <0x0 0xf8500000 0x0 0x600000>;
 			no-map;
 			qcom,client-id = <1>;
 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>, <QCOM_SCM_VMID_NAV>;
@@ -393,6 +406,22 @@
 
 		adsp_rpc_remote_heap_mem@c6500000 {	/* ADSP RPC Remote Heap — live ADSP DMA */
 			reg = <0x00 0xc6500000 0x00 0x00800000>;
+			no-map;
+		};
+
+		/*
+		 * CANONICAL Kodiak ADSP-RPC (fastrpc) remote heap. The upstream
+		 * Tachyon kernel (kodiak.dtsi adsp-rpc-remote-heap@9cb80000, NOT
+		 * in the product /delete-node list) reserves this 8 MB no-map and
+		 * the ADSP fastrpc owns it; Linux never touches it. Our DTS had
+		 * the heap only at 0xc6500000, leaving 0x9cb80000 EFI CONVENTIONAL,
+		 * so Windows phase-0 reclaims+zeroes the DSP-owned page -> EL2
+		 * stage-2/XPU fault -> QHEE TZ_SECURE_WDOG -> PS_HOLD reset. Same
+		 * class as the rmtfs fix. (This is the ONLY kodiak-reserved region
+		 * our EFI map still leaves reclaimable.)
+		 */
+		adsp_rpc_remote_heap_base@9cb80000 {
+			reg = <0x00 0x9cb80000 0x00 0x00800000>;
 			no-map;
 		};
 

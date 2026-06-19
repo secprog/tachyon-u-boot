@@ -26,6 +26,9 @@ CONFIG_OF_LIBFDT_OVERLAY=y
 CONFIG_BOOTDELAY=-1
 
 CONFIG_CMD_PMIC=y
+# Generic `smc <fid> [args]` command (cmd/smccc.c) to issue raw SCM/SMC calls
+# from the U-Boot prompt — used to drive the TZ download-mode / dump SCM calls.
+CONFIG_CMD_SMC=y
 
 # USB-C DisplayPort path: PMIC-GLINK boots ADSP on demand, queries
 # Type-C orientation/Alt Mode policy, then the DP driver trains the link.
@@ -53,3 +56,39 @@ CONFIG_VIDEO_QCOM_TACHYON_DP=y
 CONFIG_QCOM_MDSS_BUS=y
 CONFIG_PHY_QCOM_QMP_COMBO=y
 CONFIG_EFI_LOADER=y
+# Route EFI BlockIo transfers through a cache-aligned bounce buffer. The QMP
+# USB3 path DMAs into caller-supplied EFI buffers; an unaligned buffer lets the
+# bulk-IN dcache invalidate corrupt the head/tail cache line. Required for the
+# sustained NTFS reads when chainloading Windows (boot.wim) from a USB stick.
+CONFIG_EFI_LOADER_BOUNCE_BUFFER=y
+
+# --- Windows-on-ARM boot: ACPI table generation ---
+# Windows boots ONLY via ACPI (never device tree). U-Boot generates the
+# RSDP/XSDT/FADT/MADT/GTDT/IORT/MCFG/PPTT/CSRT/DBG2/SPCR tables (see
+# board/particle/tachyon/acpi.c) plus the DSDT compiled from dsdt.asl, and
+# installs the RSDP into the EFI configuration table for the boot manager.
+#
+# On ARM the generic writer (lib/acpi/acpi_table.c) only emits tables when the
+# bloblist-tables path is selected, so BLOBLIST + BLOBLIST_TABLES are required.
+# alloc_write_acpi_tables() reserves a 256 KiB (TABLE_SIZE) blob; the Tachyon
+# DSDT alone is ~89 KiB and the CSRT ~69 KiB, so size the RELOC bloblist
+# generously (512 KiB).
+#
+# IMPORTANT: the ACPI tables live in the POST-relocation bloblist, which
+# reserve_bloblist() carves from DRAM below the stack using
+# CONFIG_BLOBLIST_SIZE_RELOC. The PRE-relocation bloblist (CONFIG_BLOBLIST_SIZE)
+# is allocated from the tiny early malloc pool (CONFIG_SYS_MALLOC_F_LEN =
+# 0x20000), so it MUST stay small — making it 0x80000 OOMs board_init_f before
+# relocation ("alloc space exhausted ... limit 20000"). Keep them decoupled:
+# small pre-reloc, large reloc.
+CONFIG_ACPI=y
+CONFIG_GENERATE_ACPI_TABLE=y
+CONFIG_BLOBLIST=y
+CONFIG_BLOBLIST_ALLOC=y
+CONFIG_BLOBLIST_SIZE=0x2000
+CONFIG_BLOBLIST_SIZE_RELOC=0x80000
+CONFIG_BLOBLIST_TABLES=y
+# ARM implies ACPIGEN, which pulls in lib/acpi/acpi_device.c and
+# drivers/i2c/acpi_i2c.c; both use the IRQ uclass (irq_get_acpi /
+# irq_get_by_index), so the interrupt-controller uclass must be enabled.
+CONFIG_IRQ=y

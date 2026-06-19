@@ -314,6 +314,70 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
 }
 
 /*
+ * MADT (Multiple APIC Description Table) body — GICv3
+ *
+ * We emit the GIC sub-tables from fixed constants taken from the known-good
+ * Qualcomm Windows firmware MADT for this exact SoC
+ * instead of via U-Boot's
+ * driver model.  U-Boot has NO DM driver for "arm,gic-v3": the generic path
+ * (arch/arm acpi_fill_madt -> armv8_cpu_fill_madt) cannot resolve the GIC as an
+ * interrupt-parent, so it would emit zero GICC entries, and nothing at all
+ * would emit the GICD that Windows requires to drive the distributor.  This
+ * override (the arch acpi_fill_madt is __weak) reproduces the reference table
+ * byte-for-byte in meaning:
+ *
+ *   QCM6490 / SC7280, GICv3 distributor @ 0x17a00000
+ *     - 8 CPUs, MPIDR = cluster<<8 : 0x000, 0x100, ... 0x700
+ *     - per-CPU redistributor frame at 0x17a60000 + n * 0x20000
+ *     - PMU/perf interrupt  PPI 7 -> GSIV 23 (0x17)
+ *     - vGIC maintenance irq PPI 9 -> GSIV 25 (0x19)
+ *     - DynamIQ efficiency classes: 4x little (0), 3x mid (1), 1x big (2)
+ */
+#define TACHYON_GICD_BASE	0x17a00000UL
+#define TACHYON_GICR_BASE	0x17a60000ULL
+#define TACHYON_GICR_STRIDE	0x20000ULL
+#define TACHYON_GIC_NUM_CPUS	8
+#define TACHYON_GIC_PERF_GSIV	23
+#define TACHYON_GIC_VGIC_IRQ	25
+#define TACHYON_GIC_VERSION_V3	3
+
+void *acpi_fill_madt(struct acpi_madt *madt, struct acpi_ctx *ctx)
+{
+	static const u8 efficiency[TACHYON_GIC_NUM_CPUS] = {
+		0, 0, 0, 0, 1, 1, 1, 2
+	};
+	struct acpi_madt_gicc *gicc;
+	struct acpi_madt_gicd *gicd;
+	int i;
+
+	(void)madt;
+
+	/* One GICC (CPU interface) sub-table per core */
+	for (i = 0; i < TACHYON_GIC_NUM_CPUS; i++) {
+		gicc = ctx->current;
+		acpi_write_madt_gicc(gicc,
+				     i,			/* CPU interface number / UID */
+				     TACHYON_GIC_PERF_GSIV,
+				     0,			/* phys_base (GICv3: not used) */
+				     0,			/* GICV base */
+				     0,			/* GICH base */
+				     TACHYON_GIC_VGIC_IRQ,
+				     TACHYON_GICR_BASE +
+					(u64)i * TACHYON_GICR_STRIDE,
+				     (u64)i << 8,	/* MPIDR: aff1 = core */
+				     efficiency[i]);
+		acpi_inc(ctx, gicc->length);
+	}
+
+	/* Single GICD (distributor) sub-table */
+	gicd = ctx->current;
+	acpi_write_madt_gicd(gicd, 0, TACHYON_GICD_BASE, TACHYON_GIC_VERSION_V3);
+	acpi_inc(ctx, gicd->length);
+
+	return ctx->current;
+}
+
+/*
  * IORT (IO Remapping Table) support — REQUIRED for Qualcomm Windows boot
  *
  * Describes the SMMU (System MMU) and GIC ITS topology so Windows can
@@ -334,6 +398,21 @@ void acpi_fill_fadt(struct acpi_fadt *fadt)
  */
 int acpi_fill_iort(struct acpi_ctx *ctx)
 {
+	/*
+	 * IORT DROPPED for Windows bring-up. The table advertised (a) a GIC
+	 * ITS group that exists in neither MADT nor silicon, and (b) the
+	 * apps_smmu (0x15000000) as an OS-manageable MMU-500. Under the QHEE
+	 * (Gunyah) hypervisor the SMMU globals are hyp-owned (the NS OS may
+	 * touch stage-1 context banks only); a generic Windows arm-smmu
+	 * driver writing SMMU_sCR0/stream-table is an XPU violation -> TZ
+	 * PS_HOLD reset before any kernel output. With no IORT every master
+	 * runs untranslated/1:1, which is the actual runtime state under the
+	 * hypervisor's bypass. Emitting zero nodes makes the generic writer
+	 * drop the table (it returns -ENOENT on an empty IORT).
+	 * Re-add a correct IORT (no ITS, real SMMU model/ownership) later.
+	 */
+	return 0;
+#if 0
 	u32 its_offset, smmu_offset, ufs_offset, usb_offset;
 
 	/*
@@ -533,6 +612,7 @@ int acpi_fill_iort(struct acpi_ctx *ctx)
 	}
 
 	return 0;
+#endif
 }
 
 /*
@@ -650,24 +730,25 @@ static int tachyon_write_gtdt(struct acpi_ctx *ctx, const struct acpi_writer *en
 	header->revision = acpi_get_table_revision(ACPITAB_GTDT);
 
 	/*
-	 * ARM Generic Timer interrupts (PPI - Private Peripheral Interrupts)
-	 * These match the device tree timer node interrupts:
-	 * - Secure EL1 timer: PPI 29
-	 * - Non-secure EL1 timer: PPI 30
-	 * - Virtual EL1 timer: PPI 27
-	 * - EL2 timer: PPI 26
+	 * ARM Generic Timer interrupts. ACPI GSIVs map 1:1 to GIC INTIDs.
+	 *   GSIV 29 secure EL1, 30 non-secure EL1, 27 virtual EL1, 26 EL2.
 	 *
-	 * Note: The extracted table had these as 0. We use the correct values.
+	 * Flags: bit0 clear = level-triggered, bit1 = polarity (set = active-low).
+	 * The SC7280 *Linux* DT marks these level-low (0x2), but the proven
+	 * Windows-on-ARM Kodiak GTDT ships flags = 0x0 (level, active-high) for
+	 * all four GSIVs. Windows is the consumer of this ACPI table, so match the
+	 * WoA value -- a wrong timer polarity mis-delivers the very timer IRQ the
+	 * NT kernel takes during early GIC/timer bring-up.
 	 */
 	gtdt->cnt_ctrl_base = 0xFFFFFFFFFFFFFFFF; /* Not used */
-	gtdt->sec_el1_gsiv = 29;  /* Secure EL1 timer */
-	gtdt->sec_el1_flags = GTDT_FLAG_INT_ACTIVE_LOW;
-	gtdt->el1_gsiv = 30;      /* Non-secure EL1 timer */
-	gtdt->el1_flags = GTDT_FLAG_INT_ACTIVE_LOW;
-	gtdt->virt_el1_gsiv = 27; /* Virtual EL1 timer */
-	gtdt->virt_el1_flags = GTDT_FLAG_INT_ACTIVE_LOW;
-	gtdt->el2_gsiv = 26;      /* EL2 timer */
-	gtdt->el2_flags = GTDT_FLAG_INT_ACTIVE_LOW;
+	gtdt->sec_el1_gsiv = 29;  /* Secure EL1 timer (0x1D) */
+	gtdt->sec_el1_flags = 0;
+	gtdt->el1_gsiv = 30;      /* Non-secure EL1 timer (0x1E) */
+	gtdt->el1_flags = 0;
+	gtdt->virt_el1_gsiv = 27; /* Virtual EL1 timer (0x1B) */
+	gtdt->virt_el1_flags = 0;
+	gtdt->el2_gsiv = 26;      /* Non-secure EL2 timer (0x1A) */
+	gtdt->el2_flags = 0;
 	gtdt->cnt_read_base = 0xFFFFFFFFFFFFFFFF;
 
 	header->checksum = table_compute_checksum(header, header->length);
@@ -693,33 +774,17 @@ ACPI_WRITER(5gtdt, "GTDT", tachyon_write_gtdt, 0);
 int acpi_fill_mcfg(struct acpi_ctx *ctx)
 {
 	/*
-	 * PCIe ECAM (Enhanced Configuration Access Mechanism)
-	 *
-	 * SC7280 has two PCIe root complexes:
-	 *   PCIe0 (pcie@1c00000): domain=0, config=0x60100000
-	 *   PCIe1 (pcie@1c08000): domain=1, config=0x40100000
-	 *
-	 * Both support full bus range (0-255) with 1MB ECAM per bus.
-	 * DSDT devices: PCI0._SEG=0, PCI1._SEG=1.  MCFG segments MUST match.
+	 * MCFG DROPPED for Windows bring-up. U-Boot never powers/clocks the
+	 * PCIe controllers (CONFIG_PCI unset, GCC_PCIE GDSCs stay collapsed),
+	 * so an ECAM/config-space read by Windows' early PCI enumeration
+	 * stalls the NoC -> TrustZone pulls PS_HOLD -> silent hard reset
+	 * before any kernel output. Returning -ENOENT makes the generic
+	 * writer cleanly skip the table (it must be -ENOENT specifically;
+	 * any other errno aborts all ACPI generation). The DSDT also forces
+	 * PCI0/PCI1 _STA=0 (PRP0/PRP1=Zero) so the bridges are never probed.
+	 * Re-add ECAM once a PCIe controller+clock driver brings the RCs up.
 	 */
-
-	/* PCIe0: segment 0, ECAM @ 0x60100000, bus 0-255 */
-	acpi_create_mcfg_mmconfig(ctx->current,
-		0x60100000,  /* ECAM base (pcie0 "config" reg) */
-		0,           /* PCI segment group number (matches PCI0._SEG) */
-		0,           /* Start bus number */
-		255);        /* End bus number */
-	acpi_inc(ctx, sizeof(struct acpi_mcfg_mmconfig));
-
-	/* PCIe1: segment 1, ECAM @ 0x40100000, bus 0-255 */
-	acpi_create_mcfg_mmconfig(ctx->current,
-		0x40100000,  /* ECAM base (pcie1 "config" reg) */
-		1,           /* PCI segment group number (matches PCI1._SEG) */
-		0,           /* Start bus number */
-		255);        /* End bus number */
-	acpi_inc(ctx, sizeof(struct acpi_mcfg_mmconfig));
-
-	return 0;
+	return -ENOENT;
 }
 
 /*
@@ -1156,6 +1221,17 @@ int acpi_fill_csrt(struct acpi_ctx *ctx)
 {
 	void *payload;
 
+	/*
+	 * CSRT DROPPED for Windows bring-up: a ~69 KB hand-transcribed
+	 * QCOMEDK2 vendor blob of unverified provenance, not consumed before
+	 * the kernel runs its own drivers. Removing it eliminates an unknown
+	 * descriptor (and dead weight) with zero risk to reaching kernel
+	 * entry. -ENOENT makes the generic writer cleanly skip the table.
+	 * (Body left in place but unreachable so the static helpers/payloads
+	 * stay referenced; re-enable by removing this return.)
+	 */
+	return -ENOENT;
+
 	qcom_csrt_write_group(ctx, QCOM_CSRT_GROUP_100B_LENGTH, 0x100b, 0);
 	qcom_csrt_write_descriptor(ctx, QCOM_CSRT_DESC_100B_LENGTH,
 				   0x0002, 0x0000, 0x00000001);
@@ -1178,7 +1254,8 @@ int acpi_fill_csrt(struct acpi_ctx *ctx)
  * BGRT (Boot Graphics Resource Table) support
  * Shows OEM logo during boot
  */
-static int tachyon_write_bgrt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
+static __maybe_unused int tachyon_write_bgrt(struct acpi_ctx *ctx,
+					     const struct acpi_writer *entry)
 {
 	struct acpi_table_header *header;
 	struct acpi_bgrt *bgrt;
@@ -1203,7 +1280,13 @@ static int tachyon_write_bgrt(struct acpi_ctx *ctx, const struct acpi_writer *en
 	return 0;
 }
 
-ACPI_WRITER(5bgrt, "BGRT", tachyon_write_bgrt, 0);
+/*
+ * BGRT DROPPED for Windows bring-up: it points at a NULL boot-image
+ * address (image_address is never set), a cosmetic logo table that at worst
+ * makes the OS graphics hand-off poke address 0. Unregister it for the
+ * minimal build. Re-add once a real boot logo buffer is populated.
+ */
+/* ACPI_WRITER(5bgrt, "BGRT", tachyon_write_bgrt, 0); */
 
 /*
  * DBG2 (Debug Port Table 2) support
@@ -1215,20 +1298,22 @@ static int tachyon_write_dbg2(struct acpi_ctx *ctx, const struct acpi_writer *en
 	struct acpi_gen_regaddr address;
 
 	/*
-	 * UART5 is a Qualcomm GENI serial engine at 0x994000 (MMIO).
-	 * Port subtype ARM_SBSA_GENERIC is the best fit for a non-standard
-	 * ARM debug UART.  The device path is the fully qualified ACPI
-	 * namespace path.
+	 * The debug UART is Qualcomm GENI serial engine QUP_0_SE_5 at 0x994000
+	 * (MMIO).  Port subtype ARM_SBSA_GENERIC is the best fit for a
+	 * non-standard ARM debug UART.  The device path MUST be the fully
+	 * qualified namespace path of a real DSDT device: this engine is the
+	 * object named \_SB.UARD (_HID "QCOM0A16", _STR "QUP_0_SE_5,DBG") in
+	 * dsdt.asl — NOT "UART5", which does not exist in the DSDT.
 	 */
 	memset(&address, '\0', sizeof(address));
 	address.space_id = ACPI_ADDRESS_SPACE_MEMORY;
 	address.bit_width = 32;
 	address.access_size = ACPI_ACCESS_SIZE_DWORD_ACCESS;
-	address.addrl = 0x994000;  /* UART5 base from qcm6490-tachyon-u-boot.dtsi */
+	address.addrl = 0x994000;  /* \_SB.UARD base, matches dsdt.asl UARD._CRS */
 
 	acpi_create_dbg2(dbg2, ACPI_DBG2_SERIAL_PORT,
 			 ACPI_DBG2_ARM_SBSA_GENERIC,
-			 &address, 0x1000, "\\_SB.UART5");
+			 &address, 0x1000, "\\_SB.UARD");
 
 	acpi_add_table(ctx, dbg2);
 	acpi_inc_align(ctx, dbg2->header.length);
@@ -1239,16 +1324,73 @@ static int tachyon_write_dbg2(struct acpi_ctx *ctx, const struct acpi_writer *en
 ACPI_WRITER(5dbg2, "DBG2", tachyon_write_dbg2, 0);
 
 /*
- * SPCR (Serial Port Console Redirection) support
+ * SPCR (Serial Port Console Redirection) — board override
  *
- * The generic ACPI code already registers an SPCR writer
- * (lib/acpi/acpi_table.c: ACPI_WRITER(5spcr, "SPCR", acpi_write_spcr, 0)).
- * It auto-discovers the serial device via driver model (gd->cur_serial_dev).
- * We do NOT create a second 5spcr writer — duplicate linker-list names
- * are not safe.  If the auto-discovered values don't match the target
- * hardware, fix the serial driver's .getinfo() / .getconfig() callbacks
- * or the device tree, not the SPCR table itself.
+ * The generic acpi_write_spcr() auto-discovers the serial device, but the
+ * Qualcomm GENI driver implements no .getinfo, so the generic table comes out
+ * malformed (interface_type = UNKNOWN/0xFF, address = 0) and never sets the
+ * interrupt / terminal-type fields at all — Windows then has no usable console
+ * descriptor.  The generic writer is __weak, so we override it (the existing
+ * ACPI_WRITER(5spcr) linker-list entry redirects to this strong symbol; no
+ * second writer / no duplicate table).
+ *
+ * Values are for the Tachyon debug console: \_SB.UARD (QUP_0_SE_5) = serial0
+ * (stdout-path "serial0:115200n8") from the Tachyon DTS — GENI debug UART @
+ * 0x00994000, interrupt GIC_SPI 606 (GSIV 606 + 32 = 638), 115200 8N1.
+ * Interface type 0x11 is the Qualcomm SDM845/GENI UART class that Windows'
+ * inbox GENI serial driver binds to; it matches the reference
+ * but for that board's UART @ 0xA90000 — we point at Tachyon's own console).
  */
+#define TACHYON_SPCR_GENI_IFACE		0x11	/* Qualcomm SDM845/GENI UART */
+#define TACHYON_UART5_BASE		0x00994000UL
+#define TACHYON_UART5_GSIV		638	/* GIC_SPI 606 + 32 */
+#define TACHYON_SPCR_INT_TYPE_GIC	0x08	/* ARMH GIC interrupt */
+#define TACHYON_SPCR_BAUD_115200	7
+#define TACHYON_SPCR_TERMINAL_ANSI	3
+
+int acpi_write_spcr(struct acpi_ctx *ctx, const struct acpi_writer *entry)
+{
+	struct acpi_spcr *spcr = ctx->current;
+	struct acpi_table_header *header = &spcr->header;
+
+	(void)entry;
+
+	memset(spcr, 0, sizeof(*spcr));
+
+	acpi_fill_header(header, "SPCR");
+	header->length = sizeof(struct acpi_spcr);
+	header->revision = 2;
+
+	spcr->interface_type = TACHYON_SPCR_GENI_IFACE;
+
+	spcr->serial_port.space_id    = ACPI_ADDRESS_SPACE_MEMORY;
+	spcr->serial_port.bit_width   = 32;
+	spcr->serial_port.bit_offset  = 0;
+	spcr->serial_port.access_size = ACPI_ACCESS_SIZE_DWORD_ACCESS;
+	spcr->serial_port.addrl       = TACHYON_UART5_BASE;
+	spcr->serial_port.addrh       = 0;
+
+	spcr->interrupt_type = TACHYON_SPCR_INT_TYPE_GIC;
+	spcr->pc_interrupt   = 0;
+	spcr->interrupt      = TACHYON_UART5_GSIV;
+
+	spcr->baud_rate     = TACHYON_SPCR_BAUD_115200;
+	spcr->parity        = 0;
+	spcr->stop_bits     = 1;
+	spcr->flow_control  = 0;
+	spcr->terminal_type = TACHYON_SPCR_TERMINAL_ANSI;
+
+	/* Not a PCI device */
+	spcr->pci_device_id = 0xffff;
+	spcr->pci_vendor_id = 0xffff;
+
+	header->checksum = table_compute_checksum((void *)spcr, header->length);
+
+	acpi_add_table(ctx, spcr);
+	acpi_inc(ctx, header->length);
+
+	return 0;
+}
 
 /*
  * FACS (Firmware ACPI Control Structure)

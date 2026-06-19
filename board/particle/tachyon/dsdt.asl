@@ -194,8 +194,8 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, "QCOM", "TACHYON", 0x00000001)
         Name (TCMA, 0xDEADBEEF)
         Name (TCML, 0xBEEFDEAD)
         Name (SOSI, 0xDEADBEEFFFFFFFFF)
-        Name (PRP0, One)            /* PCIe RC0 enabled */
-        Name (PRP1, One)            /* PCIe RC1 enabled */
+        Name (PRP0, Zero)           /* PCIe RC0 disabled — U-Boot leaves PCIe power-collapsed; an ECAM probe stalls the NoC -> TZ PS_HOLD reset */
+        Name (PRP1, Zero)           /* PCIe RC1 disabled — same */
         Name (SKUV, 0xFFFFFFFF)
         Name (SDDR, 0xFFFFFFFF)
         Name (UAON, 0xFFFFFFFF)

@@ -652,23 +652,23 @@ efi_status_t efi_gop_register(void)
 	gopobj->fb = map_sysmem(fb_base, fb_size);
 
 	/*
-	 * Re-mark the framebuffer as EFI_RESERVED_MEMORY_TYPE so the OS
-	 * does not reclaim it after ExitBootServices().  The display
-	 * hardware is still actively scanning out from this region.
-	 *
-	 * Without this, the FB ends up as EFI_BOOT_SERVICES_DATA (carved
-	 * by the LMB notifier), and Windows Setup / WinPE may reuse the
-	 * physical pages after ExitBootServices, causing visual corruption
-	 * or a blank screen.
+	 * Re-mark the framebuffer as EFI_LOADER_DATA so Windows-on-ARM's
+	 * winload maps it during early boot.  winload's on-demand mapper
+	 * (BlMmMapPhysicalAddress) only maps a physical page that is already
+	 * a member of its loader-descriptor DB; EfiMemoryMappedIO/Reserved
+	 * regions are ingested too late (after winload first touches the FB,
+	 * e.g. a dc cvac, which then faults), whereas EFI_LOADER_DATA regions
+	 * are merged into the DB at the earliest loader stage.  The FB is a
+	 * real DRAM lmb allocation, so LOADER_DATA is reclaim-safe (it is RAM,
+	 * and the OS re-inits the display via its own driver post-handoff).
 	 *
 	 * We carve the FB from whatever type it currently is
-	 * (overlap_conventional=false) and re-add it as reserved memory
-	 * with EFI_MEMORY_WC for framebuffer performance and to prevent
-	 * stale cache lines from causing a black/blank display after
-	 * ExitBootServices().
+	 * (overlap_conventional=false) and re-add it with EFI_MEMORY_WC for
+	 * framebuffer performance and to prevent stale cache lines from
+	 * causing a black/blank display after ExitBootServices().
 	 */
 	ret = efi_add_memory_map_attr(fb_base, fb_size,
-				      EFI_RESERVED_MEMORY_TYPE,
+				      EFI_LOADER_DATA,
 				      EFI_MEMORY_WC);
 	if (ret != EFI_SUCCESS)
 		log_warning("Failed to reserve FB memory map entry: %lx\n",
