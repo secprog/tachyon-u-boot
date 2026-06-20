@@ -154,7 +154,7 @@ static int qcom_snps_hsphy_power_on(struct phy *phy)
 	if (ret)
 		return ret;
 
-	udelay(150);
+	udelay(300);
 
 	ret = reset_deassert_bulk(&priv->resets);
 	if (ret)
