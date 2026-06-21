@@ -329,7 +329,7 @@ efi_status_t efi_init_obj_list(void)
 		if (ret != EFI_SUCCESS)
 			goto out;
 	}
-	if (IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)) {
+	if (IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT)) {
 		/*
 		 * Windows-on-ARM: winload writes the GENI UART at 0x994000 during
 		 * early post-EBS boot (pre-SetVirtualAddressMap), inherited as the
@@ -349,24 +349,14 @@ efi_status_t efi_init_obj_list(void)
 		 * retags this descriptor LoaderLoadedProgram->LoaderFirmwarePermanent
 		 * at handoff so winload keeps the early map but NT never reclaims it.
 		 *
-		 * Not gated on boot_os (efi_init_obj_list() runs once on the first
-		 * EFI op, possibly before boot_os=windows is set); harmless to Linux.
-		 *
-		 * win_serial=0 diagnostic gate: omit the map (paired with the SPCR +
-		 * DBG2 gate in acpi.c) for a no-serial bring-up test.
+		 * Compiled in only for CONFIG_TACHYON_WINDOWS_BOOT (a Linux-only
+		 * build dead-elides this block), so no runtime boot_os= gate is
+		 * needed.  win_serial=0 diagnostic gate: omit the map (paired with
+		 * the SPCR + DBG2 gate in acpi.c) for a no-serial bring-up test.
 		 */
 		void efi_geni_rt_register(void);	/* efi_runtime.c tracer */
-		const char *bo = env_get("boot_os");
-		bool win = bo && !strcmp(bo, "windows");
 
-		/*
-		 * Windows-on-ARM only (boot_os=windows), and unless win_serial=0
-		 * (no-serial bring-up test).  The Linux/default path adds nothing,
-		 * leaving the EFI map untouched.  The user sets boot_os=windows at
-		 * the prompt before `boot`, so efi_init_obj_list() (which runs once
-		 * on the first EFI op) sees it.
-		 */
-		if (win && env_get_yesno("win_serial") != 0) {
+		if (env_get_yesno("win_serial") != 0) {
 			u64 attr = EFI_MEMORY_UC;
 			efi_status_t r;
 

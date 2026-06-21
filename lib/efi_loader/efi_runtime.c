@@ -217,7 +217,7 @@ static efi_status_t efi_init_memory_attributes_table(void)
 
 	ret = efi_install_configuration_table(&efi_mem_attributes_table_guid,
 					      mat);
-	if (env_get("boot_os") && !strcmp(env_get("boot_os"), "windows"))
+	if (IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT))
 		printf("EFI-HANDOFF: Memory Attributes Table -> %u runtime region(s), ret=%lu\n",
 		       n, ret);
 	if (ret != EFI_SUCCESS)
@@ -355,7 +355,7 @@ void __efi_runtime efi_update_table_header_crc32(struct efi_table_hdr *table)
 			     table->headersize);
 }
 
-#if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
+#if IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT)
 /*
  * Windows-on-ARM runtime-service tracer.  ntoskrnl calls the EFI runtime
  * services AFTER SetVirtualAddressMap, where U-Boot's printf is unusable (it
@@ -410,6 +410,10 @@ void efi_geni_rt_register(void)
 	m.len = 0x4000;
 	list_add_tail(&m.link, &efi_runtime_mmio);
 }
+#else
+/* Linux-only build: the RT: tracer compiles to nothing. */
+static inline void efi_rt_puts(const char *s) { }
+void efi_geni_rt_register(void) { }
 #endif
 
 /**
@@ -1017,7 +1021,7 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 		  descriptor_version, virtmap);
 
 	/* Diagnostic marker over serial (Windows boot only). */
-	if (env_get("boot_os") && !strcmp(env_get("boot_os"), "windows"))
+	if (IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT))
 		printf("EFI-HANDOFF: SetVirtualAddressMap enter\n");
 
 	if (descriptor_version != EFI_MEMORY_DESCRIPTOR_VERSION ||
@@ -1108,8 +1112,7 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 			efi_relocate_runtime_table(new_offset);
 			efi_runtime_relocate(new_offset, map);
 			/* Diagnostic marker over serial (Windows boot only). */
-			if (env_get("boot_os") &&
-			    !strcmp(env_get("boot_os"), "windows"))
+			if (IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT))
 				printf("EFI-HANDOFF: SetVirtualAddressMap done\n");
 			ret = EFI_SUCCESS;
 			goto out;

@@ -319,17 +319,8 @@ static int tachyon_dpu_program_ctl(struct tachyon_dp_priv *priv)
 	if (ret)
 		return ret;
 
-	/*
-	 * DIAGNOSTIC: tachyon_dp_border_only=1 stages NO pipe (border-out only) so
-	 * the mixer outputs the (red) border across the whole frame.  Screen RED =>
-	 * LM->PP->INTF->DP datapath works and the bug is the SSPP pipe (fetch/SMMU
-	 * or staging); screen BLACK => the mixer output never reaches the INTF.
-	 */
-	if (tachyon_dp_env_bool("tachyon_dp_border_only"))
-		writel(DPU_CTL_LAYER_BORDER_OUT, ctl + DPU_CTL_LAYER_0);
-	else
-		writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
-		       ctl + DPU_CTL_LAYER_0);
+	writel(DPU_CTL_LAYER_BORDER_OUT | DPU_CTL_LAYER_DMA0_STAGE0,
+	       ctl + DPU_CTL_LAYER_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT2_0);
 	writel(0, ctl + DPU_CTL_LAYER_EXT3_0);

@@ -18,15 +18,15 @@
 #include <asm/gpio.h>
 #include <fdtdec.h>
 
-#define TACHYON_DP_DEFAULT_XRES		1920
-#define TACHYON_DP_DEFAULT_YRES		1080
 #define TACHYON_DP_MIN_XRES		640
 #define TACHYON_DP_MIN_YRES		480
 #define TACHYON_DP_MAX_XRES		3840
 #define TACHYON_DP_MAX_YRES		2160
+/* Most-compatible fallback when no EDID mode fits the trained link. */
+#define TACHYON_DP_FALLBACK_XRES	1280
+#define TACHYON_DP_FALLBACK_YRES	720
 #define TACHYON_DP_FB_ALIGN		SZ_1M
 #define TACHYON_DP_MAX_EDID_MODES	12
-#define TACHYON_DP_EDID_MODE_STR_SIZE	160
 #define TACHYON_DP_DDC_ADDR		0x50
 #define TACHYON_DP_DDC_SEGMENT_ADDR	0x30
 
@@ -73,7 +73,6 @@
 #define DP_AUX_CTRL_ENABLE		BIT(0)
 #define DP_AUX_CTRL_RESET		BIT(1)
 #define REG_DP_DP_HPD_INT_STATUS	0x04
-#define DP_DP_HPD_STATE_STATUS_MASK	0xe0000000
 #define DP_DP_HPD_STATE_STATUS_SHIFT	29
 #define DP_DP_HPD_STATE_STATUS_CONNECTED	(2 << DP_DP_HPD_STATE_STATUS_SHIFT)
 #define REG_DP_AUX_DATA			0x034
@@ -84,7 +83,6 @@
 #define REG_DP_AUX_TRANS_CTRL		0x038
 #define DP_AUX_TRANS_CTRL_I2C		BIT(8)
 #define DP_AUX_TRANS_CTRL_GO		BIT(9)
-#define DP_AUX_TRANS_CTRL_NO_SEND_ADDR	BIT(10)
 #define DP_AUX_TRANS_CTRL_NO_SEND_STOP	BIT(11)
 #define REG_DP_TIMEOUT_COUNT		0x03c
 #define REG_DP_AUX_LIMITS		0x040
@@ -92,7 +90,6 @@
 #define DP_AUX_STATUS_NACK		BIT(4)
 #define DP_AUX_STATUS_DEFER		BIT(5)
 #define DP_AUX_STATUS_TIMEOUT		BIT(6)
-#define DP_AUX_STATUS_ERROR		BIT(7)
 #define DP_AUX_STATUS_ERR_MASK		GENMASK(7, 4)
 #define REG_DP_PHY_AUX_INTERRUPT_CLEAR	0x04c
 #define REG_DP_PHY_AUX_INTERRUPT_STATUS	0x0bc
@@ -131,8 +128,6 @@
  */
 #define DP_MAINLINK_CTRL_FLUSH_MODE	(3 << 23)
 #define REG_DP_STATE_CTRL		0x004
-#define DP_STATE_CTRL_LINK_TRAINING_PATTERN1 BIT(0)
-#define DP_STATE_CTRL_LINK_TRAINING_PATTERN2 BIT(1)
 #define DP_STATE_CTRL_SEND_VIDEO	BIT(7)
 #define REG_DP_CONFIGURATION_CTRL	0x008
 #define DP_CONFIGURATION_CTRL_SYNC_ASYNC_CLK BIT(0)
@@ -160,28 +155,8 @@
 #define DP_MAINLINK_READY_LINK_TRAINING_SHIFT 3
 #define REG_DP_TU			0x04c
 
-/* DP Audio clock regeneration registers (SC7280 / QCM6490 DP controller) */
-#define REG_DP_AUDIO_MAUD		0x054
-#define REG_DP_AUDIO_NAUD		0x058
-#define REG_DP_AUDIO_CFG		0x050
-#define DP_AUDIO_CFG_ENABLE		BIT(0)
-#define DP_AUDIO_CFG_CHANNEL_COUNT_SHIFT 1
-#define REG_DP_AUDIO_CTRL		0x05c
-#define DP_AUDIO_CTRL_SAMPLE_PRESENT	BIT(0)
-#define DP_AUDIO_CTRL_NPC_EN		BIT(1)
-
-/* DP Audio InfoFrame transmit registers */
-#define REG_DP_AUDIO_INFOFRAME_HEADER	0x060
-#define REG_DP_AUDIO_INFOFRAME_DATA(n)	(0x064 + (n) * 4)
-#define DP_AUDIO_INFOFRAME_SEND		BIT(0)
-#define DP_AUDIO_INFOFRAME_SENT		BIT(1)
-
-/* Audio InfoFrame HB0: type=0x04 (Audio), version=1 */
-#define DP_AUDIO_INFOFRAME_TYPE_CODE	0x84
-
-/* DPCD registers for hotplug IRQ / Event Status Indicator */
+/* DPCD registers */
 #define DPCD_SINK_COUNT			0x00200
-#define DPCD_DEVICE_SERVICE_IRQ		0x00201
 #define DPCD_DOWNSTREAMPORT_PRESENT	0x00005
 #define DPCD_DOWN_STREAM_PORT_COUNT	0x00007
 #define DPCD_LANE0_1_STATUS		0x00202
@@ -189,73 +164,9 @@
 #define DPCD_LANE_ALIGN_STATUS		0x00204
 #define DPCD_SET_POWER			0x00600
 #define DP_SET_POWER_D0			0x01
-#define DPCD_SINK_COUNT_ESI		0x02002
-#define DPCD_DEV_SERVICE_IRQ_VECTOR_ESI0 0x02003
-#define DPCD_LANE0_1_STATUS_ESI		0x0200C
-#define DPCD_LANE2_3_STATUS_ESI		0x0200D
-#define DPCD_LANE_ALIGN_STATUS_ESI	0x0200E
-#define DPCD_SINK_STATUS_ESI		0x0200F
-
-#define DP_IRQ_REMOTE_CONTROL		BIT(0)
-#define DP_IRQ_HPD			BIT(1)
-#define DP_IRQ_TEST_REQUEST		BIT(2)
-#define DP_IRQ_AUTOMATED_TEST		BIT(3)
-#define DP_IRQ_CP_IRQ			BIT(4)
-#define DP_IRQ_SINK_SPECIFIC		BIT(6)
-
-#define DP_SINK_COUNT_LOW_MASK		0x3f
-#define DP_SINK_CP_READY		BIT(6)
-
-/* DPCD audio capability registers */
-#define DPCD_NUM_AUDIO_EPS		0x00022
-
-/* Multi-plane DPU register extensions */
-#define DPU_SSPP_DMA1_BASE		0x26000
-#define DPU_CTL_FLUSH_DMA1		BIT(12)
-#define DPU_CTL_LAYER_DMA1_STAGE1	(1 << 26)
-#define DPU_LM_BLEND_OP_MODE		0x008
-#define DPU_LM_BLEND_STAGE0_FG_ALPHA	0x00c
-#define DPU_LM_BLEND_STAGE0_BG_ALPHA	0x010
-#define DPU_LM_BLEND_STAGE1_FG_ALPHA	0x014
-#define DPU_LM_BLEND_STAGE1_BG_ALPHA	0x018
-#define DPU_LM_BLEND_OUT		0x01c
-#define DPU_LM_BLEND_STAGE0_EN		BIT(0)
-#define DPU_LM_BLEND_STAGE1_EN		BIT(1)
-#define DPU_FORMAT_ARGB8888		0x00023428
-#define DPU_UNPACK_ARGB8888		0x03020100
 
 #define MMSS_DP_TIMING_ENGINE_EN	0x010
-#define DP_TIMING_ENGINE_EN_EN		BIT(0)
-#define MMSS_DP_INTF_CONFIG		0x014
-#define MMSS_DP_INTF_HSYNC_CTL		0x018
-#define MMSS_DP_INTF_VSYNC_PERIOD_F0	0x01c
-#define MMSS_DP_INTF_VSYNC_PERIOD_F1	0x020
-#define MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F0 0x024
-#define MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F1 0x028
-#define MMSS_INTF_DISPLAY_V_START_F0	0x02c
-#define MMSS_INTF_DISPLAY_V_START_F1	0x030
-#define MMSS_DP_INTF_DISPLAY_V_END_F0	0x034
-#define MMSS_DP_INTF_DISPLAY_V_END_F1	0x038
-#define MMSS_DP_INTF_ACTIVE_V_START_F0	0x03c
-#define MMSS_DP_INTF_ACTIVE_V_START_F1	0x040
-#define MMSS_DP_INTF_ACTIVE_V_END_F0	0x044
-#define MMSS_DP_INTF_ACTIVE_V_END_F1	0x048
-#define MMSS_DP_INTF_DISPLAY_HCTL	0x04c
-#define MMSS_DP_INTF_ACTIVE_HCTL	0x050
-#define MMSS_DP_INTF_POLARITY_CTL	0x058
-/*
- * DP controller built-in Test Pattern Generator (BIST) — p0 region.  In Linux
- * (msm_dp_panel_tpg_enable) the p0 MMSS_DP_INTF_* timing engine + these BIST/TPG
- * registers are ONLY used to drive an internal checkered pattern, bypassing the
- * DPU entirely.  Normal DPU-sourced video never enables the p0 timing engine.
- */
-#define MMSS_DP_BIST_ENABLE		0x000
-#define DP_BIST_ENABLE_DPBIST_EN	BIT(0)
-#define MMSS_DP_TPG_MAIN_CONTROL	0x060
-#define DP_TPG_CHECKERED_RECT_PATTERN	0x100
-#define MMSS_DP_TPG_VIDEO_CONFIG	0x064
-#define DP_TPG_VIDEO_CONFIG_BPP_8BIT	0x01
-#define DP_TPG_VIDEO_CONFIG_RGB		0x04
+
 /*
  * DP_P0CLK_DSC_DTO (p0 region, abs 0xae9107c = p0 + 0x07c).  Controls MDP->DP
  * backpressure: OVERRIDE_ACK (bit1) = 0 enables backpressure so the DP TX pulls
@@ -427,8 +338,6 @@
  */
 #define DPU_INTF_FORMAT_XRGB8888	0x0000213f
 
-#define VBIF_XINL_QOS_RPT_CTRL		0xd00
-#define VBIF_XINL_QOS_LVL_PRIO_0	0xd20
 /* VBIF xin (AXI master) init registers — XBL/Linux program these; U-Boot must too. */
 #define VBIF_OUT_AXI_AMEMTYPE_CONF0	0x160	/* xins 0-7,  3-bit memtype each */
 #define VBIF_OUT_AXI_AMEMTYPE_CONF1	0x164	/* xins 8-13 */
@@ -509,7 +418,6 @@
  * *_B naming. A set bit powers/enables that block, except PSR_PWRDN.
  */
 #define QMP_DP_PHY_PD_CTL_PWRDN_B	BIT(0)
-#define QMP_DP_PHY_PD_CTL_PSR_PWRDN	BIT(1)
 #define QMP_DP_PHY_PD_CTL_AUX_PWRDN_B	BIT(2)
 #define QMP_DP_PHY_PD_CTL_LANE_0_1_PWRDN_B BIT(3)
 #define QMP_DP_PHY_PD_CTL_LANE_2_3_PWRDN_B BIT(4)
@@ -520,13 +428,11 @@
 #define QMP_DP_PHY_PD_CTL_4LANE_ON	0x7d
 #define QMP_DP_PHY_STATUS_TSYNC_DONE	BIT(0)
 #define QMP_DP_PHY_STATUS_PHY_READY	BIT(1)
-#define QMP_DP_PHY_STATUS_C_READY	BIT(2)
 
 /* QMP COM control registers — from Linux phy-qcom-qmp-dp-com-v3.h model */
 #define QMP_V3_DP_COM_SW_RESET		0x004
 #define QMP_V3_DP_COM_POWER_DOWN_CTRL	0x008
 #define QMP_V3_DP_COM_SWI_CTRL		0x00c
-#define QMP_V3_DP_COM_TYPEC_PWRDN_CTRL	0x014
 #define QMP_V3_DP_COM_RESET_OVRD_CTRL	0x01c
 
 #define TACHYON_DP_AUX_DEBOUNCE_TRIES	20
@@ -698,7 +604,6 @@ void tachyon_dp_dump_dpu_state(struct tachyon_dp_priv *priv);
 struct display_timing;
 u32 tachyon_dp_htotal(const struct display_timing *t);
 u32 tachyon_dp_vtotal(const struct display_timing *t);
-bool tachyon_dp_env_bool(const char *name);
 
 /* AUX module (qcom_tachyon_dp_aux.c) entry points called by the parent. */
 void tachyon_dp_aux_hw_init(struct tachyon_dp_priv *priv);
@@ -716,8 +621,6 @@ int tachyon_dp_edid_read_block(struct tachyon_dp_priv *priv, u8 block,
  * the parent .c (also used by the future CTRL/LINK code) but are un-static'd so
  * the panel mode-build / DPCD-caps path can reach them.
  */
-u32 tachyon_dp_env_u32(const char *name, u32 fallback);
-bool tachyon_dp_env_has_u32(const char *name);
 void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv);
 void tachyon_dp_log_typec_resolved(struct tachyon_dp_priv *priv);
 
@@ -737,7 +640,6 @@ struct timing_entry;
 bool tachyon_dp_valid_resolution(u32 width, u32 height);
 bool tachyon_dp_mode_fits_link(struct tachyon_dp_priv *priv,
 			       const struct display_timing *timing);
-void tachyon_dp_env_mode(u32 *width, u32 *height);
 void tachyon_dp_timing_entry(struct timing_entry *entry, u32 value);
 void tachyon_dp_fill_timing(struct display_timing *timing,
 			    u32 pixelclock, u32 hactive, u32 hfp,
@@ -751,7 +653,6 @@ bool tachyon_dp_known_timing(u32 width, u32 height,
 			     struct display_timing *timing);
 int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv);
 void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv);
-void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv);
 void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 			    u32 *width, u32 *height);
 bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,

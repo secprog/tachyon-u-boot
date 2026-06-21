@@ -27,23 +27,8 @@ void tachyon_dp_reset_link_policy(struct tachyon_dp_priv *priv)
 	priv->max_lanes = min_t(u8, priv->graph_lanes ?: 1,
 				tachyon_dp_pin_assignment_lanes(priv));
 
-	/*
-	 * Optional hard override for bring-up: tachyon_dp_force_lanes caps the
-	 * trained lane count (1-4) regardless of pin/sink, so a flaky high lane
-	 * can be ruled out without a rebuild.
-	 */
-	if (tachyon_dp_env_has_u32("tachyon_dp_force_lanes")) {
-		u8 fl = tachyon_dp_env_u32("tachyon_dp_force_lanes",
-					   priv->max_lanes);
-
-		if (fl >= 1 && fl <= 4)
-			priv->max_lanes = min_t(u8, priv->max_lanes, fl);
-	}
-
 	priv->lanes = min_t(u8, priv->caps.lanes ?: 1, priv->max_lanes);
-	priv->max_rate = min(priv->caps.max_rate,
-			     tachyon_dp_env_u32("tachyon_dp_max_rate",
-						DP_LINK_RATE_HBR2));
+	priv->max_rate = min_t(u32, priv->caps.max_rate, DP_LINK_RATE_HBR2);
 	priv->rate = priv->max_rate;
 }
 

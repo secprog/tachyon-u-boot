@@ -113,6 +113,7 @@ config CLK_QCOM_SC7280
 
 config CLK_QCOM_SC7280_LPASS_AUDIOCC
 	bool "Qualcomm SC7280 LPASS Audio Clock Controller"
+	default n
 	select CLK_QCOM
 	help
 	  Say Y here to enable support for the LPASS audio clock controller

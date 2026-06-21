@@ -1,5 +1,45 @@
 if ARCH_SNAPDRAGON
 
+config TACHYON_WINDOWS_BOOT
+	bool "Windows-on-ARM boot support (Particle Tachyon)"
+	default n
+	# Windows boots ONLY via ACPI (never device tree), so the Windows build
+	# needs the ACPI table generator + the bloblist it writes into, the IRQ
+	# uclass that ARM ACPIGEN depends on (irq_get_acpi / acpi_i2c), and the
+	# cache-aligned EFI BlockIo bounce buffer the USB3/NTFS chainload path
+	# requires.  EFI_LOADER is shared with the Linux `bootefi bootmgr` path
+	# (also kept unconditionally in the defconfig).
+	select EFI_LOADER
+	select EFI_LOADER_BOUNCE_BUFFER
+	select ACPI
+	select GENERATE_ACPI_TABLE
+	select BLOBLIST
+	select BLOBLIST_ALLOC
+	select BLOBLIST_TABLES
+	select IRQ
+	help
+	  Compile in the Windows-on-ARM boot enablement for the Particle
+	  Tachyon (QCM6490): the winload ACTLR/loader-descriptor/UART patches
+	  in the EFI loader, the GENI UART EFI-map entry, secure-carveout
+	  cacheability typing, the EFI runtime-service tracer, the
+	  "tachyon qhee" abort-record decoder command, and (via the selects
+	  above) the ACPI/bloblist table-generation stack winload needs.  Leave
+	  disabled for a clean Linux-only build -- none of this code is compiled
+	  in then.  The winload patches self-validate (they only touch a
+	  winload-shaped EFI image), so no runtime boot_os= selection is needed.
+
+# Bloblist sizing for the Windows ACPI tables (the generic ACPI writer emits
+# into the post-relocation bloblist).  The Tachyon DSDT alone is ~89 KiB and the
+# CSRT ~69 KiB, so the RELOC bloblist is 512 KiB.  The PRE-relocation bloblist
+# comes from the tiny early-malloc pool (SYS_MALLOC_F_LEN=0x20000) so it MUST
+# stay small -- 0x80000 there OOMs board_init_f before relocation.  Decoupled:
+# small pre-reloc, large reloc.
+config BLOBLIST_SIZE
+	default 0x2000 if TACHYON_WINDOWS_BOOT
+
+config BLOBLIST_SIZE_RELOC
+	default 0x80000 if TACHYON_WINDOWS_BOOT
+
 config SYS_SOC
 	default "snapdragon"
 

@@ -124,16 +124,6 @@ config QCOM_TACHYON_DP
 	select VIDEO_BPP32
 	select QCOM_MDSS_BUS if DM && OF_REAL
 
-config CMD_TACHYON_DP
-	bool "Manual Particle Tachyon DisplayPort command"
-	depends on VIDEO && ARCH_SNAPDRAGON
-	select QCOM_TACHYON_DP
-	help
-	  Enable the "tachyon dp" command for manually probing the Tachyon
-	  DisplayPort path from the U-Boot shell. This builds the Tachyon DP
-	  driver for diagnostics without requiring automatic DP video probing
-	  through CONFIG_VIDEO_QCOM_TACHYON_DP.
-
 config BACKLIGHT_GPIO
 	bool "Generic GPIO based Backlight Driver"
 	depends on BACKLIGHT

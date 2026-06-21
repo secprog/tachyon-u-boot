@@ -456,15 +456,10 @@ int tachyon_dp_link_train(struct tachyon_dp_priv *priv)
 	 * Training before the sink's main-link receiver is ready fails clock
 	 * recovery (lane status 00) at every rate; HPD is the reliable
 	 * "receiver ready" signal and removes the boot-time intermittency.
-	 * Disable with tachyon_dp_no_hpd_wait; tune via tachyon_dp_hpd_wait_ms.
 	 */
-	if (!tachyon_dp_env_bool("tachyon_dp_no_hpd_wait")) {
-		uint hpd_ms = tachyon_dp_env_u32("tachyon_dp_hpd_wait_ms", 8000);
-
-		log_debug("DP link train: PMIC HPD %s before training\n",
-			    tachyon_dp_wait_pmic_hpd(priv, hpd_ms) ?
-				    "asserted" : "wait timed out, training anyway");
-	}
+	log_debug("DP link train: PMIC HPD %s before training\n",
+		    tachyon_dp_wait_pmic_hpd(priv, 8000) ?
+			    "asserted" : "wait timed out, training anyway");
 
 #if TACHYON_DP_FORCE_TRAIN_RBR_X4
 	/*
@@ -1574,81 +1569,12 @@ static void tachyon_dp_program_transfer_unit(struct tachyon_dp_priv *priv)
 		    tut.boundary_moderation_en);
 }
 
-static void tachyon_dp_program_p0_timing(struct tachyon_dp_priv *priv)
-{
-	const struct display_timing *t = &priv->timing;
-	u32 htotal = tachyon_dp_htotal(t);
-	u32 vtotal = tachyon_dp_vtotal(t);
-	u32 hsync_start = t->hactive.typ + t->hfront_porch.typ;
-	u32 hsync_end = hsync_start + t->hsync_len.typ;
-	u32 vsync_start = t->vactive.typ + t->vfront_porch.typ;
-	u32 display_v_start, display_v_end;
-	u32 hsync_start_x, hsync_end_x;
-	u32 hsync_ctl, display_hctl;
-	bool tpg = tachyon_dp_env_bool("tachyon_dp_tpg");
-
-	if (!priv->p0)
-		return;
-
-	/*
-	 * The p0 MMSS_DP_INTF_* timing engine is the DP controller's built-in
-	 * Test Pattern Generator path (Linux msm_dp_panel_tpg_enable).  For
-	 * normal DPU-sourced video the DP controller slaves off the DPU INTF and
-	 * Linux NEVER enables this engine; enabling it without a BIST pixel
-	 * source (the old behaviour) made the DP TX run an empty internal timing
-	 * engine instead of the DPU stream -> trained link but sink "No Signal".
-	 * Default: leave it off (DPU INTF drives).  Set tachyon_dp_tpg=1 to emit
-	 * the internal checkered pattern (proves DP/PHY/dock/monitor end to end).
-	 */
-	if (!tpg)
-		return;
-
-	display_v_start = ((vtotal - vsync_start) * htotal) +
-			  (htotal - hsync_start);
-	display_v_end = ((vtotal - (vsync_start - t->vactive.typ)) *
-			 htotal) - 1;
-	display_v_end -= hsync_start - t->hactive.typ;
-	hsync_start_x = htotal - hsync_start;
-	hsync_end_x = htotal - (hsync_start - t->hactive.typ) - 1;
-	hsync_ctl = (htotal << 16) | (hsync_end - hsync_start);
-	display_hctl = (hsync_end_x << 16) | hsync_start_x;
-
-	writel(hsync_ctl, priv->p0 + MMSS_DP_INTF_HSYNC_CTL);
-	writel(vtotal * htotal, priv->p0 + MMSS_DP_INTF_VSYNC_PERIOD_F0);
-	writel(t->vsync_len.typ * htotal,
-	       priv->p0 + MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F0);
-	writel(0, priv->p0 + MMSS_DP_INTF_VSYNC_PERIOD_F1);
-	writel(0, priv->p0 + MMSS_DP_INTF_VSYNC_PULSE_WIDTH_F1);
-	writel(display_hctl, priv->p0 + MMSS_DP_INTF_DISPLAY_HCTL);
-	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_HCTL);
-	writel(display_v_start, priv->p0 + MMSS_INTF_DISPLAY_V_START_F0);
-	writel(display_v_end, priv->p0 + MMSS_DP_INTF_DISPLAY_V_END_F0);
-	writel(0, priv->p0 + MMSS_INTF_DISPLAY_V_START_F1);
-	writel(0, priv->p0 + MMSS_DP_INTF_DISPLAY_V_END_F1);
-	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_START_F0);
-	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_END_F0);
-	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_START_F1);
-	writel(0, priv->p0 + MMSS_DP_INTF_ACTIVE_V_END_F1);
-	writel(0, priv->p0 + MMSS_DP_INTF_POLARITY_CTL);
-	writel(readl(priv->p0 + MMSS_DP_INTF_CONFIG),
-	       priv->p0 + MMSS_DP_INTF_CONFIG);
-	/* BIST pixel source (checkered) -> then arm the p0 timing engine. */
-	writel(DP_TPG_CHECKERED_RECT_PATTERN,
-	       priv->p0 + MMSS_DP_TPG_MAIN_CONTROL);
-	writel(DP_TPG_VIDEO_CONFIG_BPP_8BIT | DP_TPG_VIDEO_CONFIG_RGB,
-	       priv->p0 + MMSS_DP_TPG_VIDEO_CONFIG);
-	writel(DP_BIST_ENABLE_DPBIST_EN, priv->p0 + MMSS_DP_BIST_ENABLE);
-	writel(DP_TIMING_ENGINE_EN_EN, priv->p0 + MMSS_DP_TIMING_ENGINE_EN);
-	log_debug("DP TPG checkered pattern ON (p0 timing engine + BIST)\n");
-}
-
 void tachyon_dp_program_video_timing(struct tachyon_dp_priv *priv)
 {
 	tachyon_dp_program_pixel_clock(priv);
 	tachyon_dp_program_msa_timing(priv);
 	tachyon_dp_program_msa_clock(priv);
 	tachyon_dp_program_transfer_unit(priv);
-	tachyon_dp_program_p0_timing(priv);
 }
 
 void tachyon_dp_controller_quiesce(struct tachyon_dp_priv *priv)

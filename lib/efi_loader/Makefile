@@ -15,7 +15,7 @@ CFLAGS_efi_boottime.o += \
 # These are the apps that are built
 apps-$(CONFIG_RISCV) += boothart
 apps-$(CONFIG_BOOTEFI_HELLO_COMPILE) += helloworld
-apps-y += goptest
+apps-$(CONFIG_BOOTEFI_GOPTEST_COMPILE) += goptest
 apps-$(CONFIG_GENERATE_SMBIOS_TABLE) += smbiosdump
 apps-$(CONFIG_EFI_LOAD_FILE2_INITRD) += initrddump
 ifeq ($(CONFIG_GENERATE_ACPI_TABLE),)

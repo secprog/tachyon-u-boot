@@ -10,7 +10,6 @@
 #include <dm.h>
 #include <log.h>
 #include <edid.h>
-#include <env.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include "qcom_tachyon_dp.h"
@@ -21,32 +20,6 @@ bool tachyon_dp_valid_resolution(u32 width, u32 height)
 	       height >= TACHYON_DP_MIN_YRES &&
 	       width <= TACHYON_DP_MAX_XRES &&
 	       height <= TACHYON_DP_MAX_YRES;
-}
-
-static bool tachyon_dp_edid_mode_supported(u32 width, u32 height)
-{
-	const char *modes = env_get("tachyon_dp_edid_modes");
-	char token[16];
-	int len;
-
-	if (!modes || !*modes)
-		return true;
-
-	len = snprintf(token, sizeof(token), "%ux%u", width, height);
-	if (len <= 0 || len >= sizeof(token))
-		return false;
-
-	while (*modes) {
-		while (*modes == ' ')
-			modes++;
-		if (!strncmp(modes, token, len) &&
-		    (modes[len] == '\0' || modes[len] == ' '))
-			return true;
-		while (*modes && *modes != ' ')
-			modes++;
-	}
-
-	return false;
 }
 
 bool tachyon_dp_mode_fits_link(struct tachyon_dp_priv *priv,
@@ -64,50 +37,6 @@ bool tachyon_dp_mode_fits_link(struct tachyon_dp_priv *priv,
 	payload_kbps = (u64)priv->max_rate * priv->max_lanes * 8;
 
 	return required_kbps <= payload_kbps;
-}
-
-void tachyon_dp_env_mode(u32 *width, u32 *height)
-{
-	u32 pref_width = tachyon_dp_env_u32("tachyon_dp_pref_xres",
-					    TACHYON_DP_DEFAULT_XRES);
-	u32 pref_height = tachyon_dp_env_u32("tachyon_dp_pref_yres",
-					     TACHYON_DP_DEFAULT_YRES);
-	bool have_saved = tachyon_dp_env_has_u32("tachyon_dp_xres") &&
-			  tachyon_dp_env_has_u32("tachyon_dp_yres");
-
-	if (!tachyon_dp_valid_resolution(pref_width, pref_height)) {
-		pref_width = TACHYON_DP_DEFAULT_XRES;
-		pref_height = TACHYON_DP_DEFAULT_YRES;
-	}
-
-	if (have_saved) {
-		*width = tachyon_dp_env_u32("tachyon_dp_xres", pref_width);
-		*height = tachyon_dp_env_u32("tachyon_dp_yres", pref_height);
-	} else {
-		*width = pref_width;
-		*height = pref_height;
-	}
-
-	/*
-	 * Allow forcing a resolution the EDID parse didn't surface (e.g. a CEA
-	 * 720p/1080p mode carried in an extension block we don't fully decode).
-	 * With tachyon_dp_force_mode=1 we honor tachyon_dp_xres/yres as long as
-	 * it's a sane resolution and fall back to a built-in timing for it.
-	 */
-	if (have_saved && tachyon_dp_env_bool("tachyon_dp_force_mode") &&
-	    tachyon_dp_valid_resolution(*width, *height)) {
-		log_debug("Forcing DP resolution %ux%u (tachyon_dp_force_mode)\n",
-			    *width, *height);
-		return;
-	}
-
-	if (!tachyon_dp_valid_resolution(*width, *height) ||
-	    !tachyon_dp_edid_mode_supported(*width, *height)) {
-		log_warning("Invalid DP resolution %ux%u; using %ux%u\n",
-			    *width, *height, pref_width, pref_height);
-		*width = pref_width;
-		*height = pref_height;
-	}
 }
 
 void tachyon_dp_timing_entry(struct timing_entry *entry, u32 value)
@@ -1053,15 +982,6 @@ static void tachyon_dp_parse_cea_modes(struct tachyon_dp_priv *priv,
 void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 {
 	int in, out = 0;
-	bool known_only = false;
-	const char *policy = env_get("tachyon_dp_timing_policy");
-
-	/*
-	 * "known_only" policy: require every mode to be in the known-timing
-	 * table.  Safer for embedded devices that must not guess timings.
-	 */
-	if (policy && !strcmp(policy, "known_only"))
-		known_only = true;
 
 	for (in = 0; in < priv->mode_count; in++) {
 		struct display_timing timing;
@@ -1073,8 +993,7 @@ void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 						    &timing)) {
 				priv->modes[in].timing = timing;
 				priv->modes[in].has_timing = true;
-			} else if (!known_only &&
-				   tachyon_dp_cvt_timing(
+			} else if (tachyon_dp_cvt_timing(
 					   priv->modes[in].width,
 					   priv->modes[in].height,
 					   60, &timing)) {
@@ -1110,76 +1029,39 @@ void tachyon_dp_filter_edid_modes(struct tachyon_dp_priv *priv)
 	priv->mode_count = out;
 }
 
-static int tachyon_dp_preferred_mode_index(struct tachyon_dp_priv *priv)
+/*
+ * Pick the "best" usable mode: the largest by pixel area that has a usable
+ * timing and fits the trained link.  tachyon_dp_filter_edid_modes() has already
+ * dropped modes with no timing or that exceed the link budget, but re-check
+ * defensively.  Refresh rate breaks ties (there is at most one entry per
+ * resolution, so this rarely matters).  Returns -1 when no mode is usable.
+ */
+static int tachyon_dp_best_mode_index(struct tachyon_dp_priv *priv)
 {
-	int i;
+	int i, best = -1;
+	u64 best_area = 0;
+	u32 best_refresh = 0;
 
-	if (!priv->mode_count)
-		return -1;
+	for (i = 0; i < priv->mode_count; i++) {
+		u64 area;
+		u32 refresh;
 
-	/*
-	 * For first-light bring-up on a fallback RBR x2 link, prefer a
-	 * conservative CEA mode even if larger EDID modes still fit on paper.
-	 */
-	if (priv->max_rate <= DP_LINK_RATE_RBR && priv->max_lanes <= 2) {
-		for (i = 0; i < priv->mode_count; i++) {
-			if (priv->modes[i].width == 1280 &&
-			    priv->modes[i].height == 720 &&
-			    priv->modes[i].has_timing &&
-			    tachyon_dp_mode_fits_link(priv,
-						      &priv->modes[i].timing))
-				return i;
+		if (!priv->modes[i].has_timing ||
+		    !tachyon_dp_mode_fits_link(priv, &priv->modes[i].timing))
+			continue;
+
+		area = (u64)priv->modes[i].width * priv->modes[i].height;
+		refresh = tachyon_dp_mode_refresh(&priv->modes[i].timing);
+
+		if (area > best_area ||
+		    (area == best_area && refresh > best_refresh)) {
+			best = i;
+			best_area = area;
+			best_refresh = refresh;
 		}
 	}
 
-	return 0;
-}
-
-void tachyon_dp_publish_edid_modes(struct tachyon_dp_priv *priv)
-{
-	char out[TACHYON_DP_EDID_MODE_STR_SIZE] = {};
-	int pos = 0;
-	int i, pref;
-
-	if (!priv->mode_count) {
-		env_set("tachyon_dp_edid_modes", NULL);
-		env_set("tachyon_dp_pref_xres", NULL);
-		env_set("tachyon_dp_pref_yres", NULL);
-		env_set("tachyon_dp_pref_pclk", NULL);
-		return;
-	}
-
-	for (i = 0; i < priv->mode_count; i++) {
-		int ret = snprintf(out + pos, sizeof(out) - pos, "%s%ux%u",
-				   pos ? " " : "", priv->modes[i].width,
-				   priv->modes[i].height);
-
-		if (ret < 0 || ret >= sizeof(out) - pos)
-			break;
-		pos += ret;
-	}
-
-	pref = tachyon_dp_preferred_mode_index(priv);
-	if (pref < 0)
-		pref = 0;
-
-	env_set("tachyon_dp_edid_modes", out);
-	env_set_ulong("tachyon_dp_pref_xres", priv->modes[pref].width);
-	env_set_ulong("tachyon_dp_pref_yres", priv->modes[pref].height);
-	env_set_ulong("tachyon_dp_policy_lanes", priv->max_lanes);
-	env_set_ulong("tachyon_dp_policy_rate", priv->max_rate);
-	if (priv->modes[pref].has_timing)
-		env_set_ulong("tachyon_dp_pref_pclk",
-			      priv->modes[pref].timing.pixelclock.typ);
-	else
-		env_set("tachyon_dp_pref_pclk", NULL);
-
-	log_info("DP EDID modes: %s preferred=%ux%u@%uHz pclk=%u\n",
-		 out, priv->modes[pref].width, priv->modes[pref].height,
-		 priv->modes[pref].has_timing ?
-		 tachyon_dp_mode_refresh(&priv->modes[pref].timing) : 0,
-		 priv->modes[pref].has_timing ?
-		 priv->modes[pref].timing.pixelclock.typ : 0);
+	return best;
 }
 
 int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
@@ -1194,7 +1076,6 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 	ret = tachyon_dp_edid_read_block(priv, 0, edid_buf);
 	if (ret) {
 		priv->mode_count = 0;
-		tachyon_dp_publish_edid_modes(priv);
 		return ret;
 	}
 	log_debug("DP EDID blk0: %02x %02x %02x %02x %02x %02x %02x %02x | ext_flag=%u csum_ok=%u hdr_ok=%u\n",
@@ -1209,7 +1090,6 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 	if (!tachyon_dp_edid_header_ok(edid_buf) ||
 	    !tachyon_dp_edid_checksum_ok(edid_buf)) {
 		priv->mode_count = 0;
-		tachyon_dp_publish_edid_modes(priv);
 		return -EINVAL;
 	}
 
@@ -1237,120 +1117,39 @@ int tachyon_dp_read_edid_modes(struct tachyon_dp_priv *priv)
 			    priv->modes[i].has_timing);
 
 	tachyon_dp_filter_edid_modes(priv);
-	tachyon_dp_publish_edid_modes(priv);
 
 	log_debug("DP EDID post-filter: %d modes\n", priv->mode_count);
 
 	return priv->mode_count ? 0 : -ENOENT;
 }
 
-static void tachyon_dp_publish_selected_timing(struct tachyon_dp_priv *priv)
-{
-	const struct display_timing *t = &priv->timing;
-	char timing[96];
-
-	snprintf(timing, sizeof(timing), "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
-		 t->pixelclock.typ, t->hactive.typ, t->hfront_porch.typ,
-		 t->hsync_len.typ, t->hback_porch.typ, t->vactive.typ,
-		 t->vfront_porch.typ, t->vsync_len.typ, t->vback_porch.typ,
-		 t->flags);
-	env_set("tachyon_dp_selected_timing", timing);
-}
-
-/*
- * SC7280/QCM6490 DP timing-engine quirk: the MDP INTF + DP controller require
- * the active region in the bottom-right corner of the frame for correct DP
- * packet/audio transfer.  does this by
- * folding the front porch into the back porch and zeroing the front porch.
- * HTOTAL/VTOTAL and the pixel clock are unchanged, so refresh rate and sync
- * widths are preserved; only the porch distribution shifts.  Apply it once to
- * priv->timing so the MSA, the DPU INTF, and the DP p0 timing all agree.
- */
-static void tachyon_dp_apply_dp_porch_adjust(struct tachyon_dp_priv *priv)
-{
-	struct display_timing *t = &priv->timing;
-
-	/*
-	 * Linux drives this hardware with the STANDARD CEA porch distribution
-	 * (front porch intact).  Folding the front porch into the back porch
-	 * (active region bottom-right) makes the MSA declare hsync_start right
-	 * after active (hfp=0) -> the DP->HDMI dock regenerates NON-CEA HDMI
-	 * timing the monitor rejects ("No Signal"), and the same non-standard
-	 * timing feeds the DP controller's own BIST (so even TPG was blank).
-	 * Default: leave the porches as the mode defines them (== Linux).  Set
-	 * tachyon_dp_porch_adjust=1 to restore the old bottom-right fold.
-	 */
-	if (!tachyon_dp_env_bool("tachyon_dp_porch_adjust"))
-		return;
-
-	tachyon_dp_timing_entry(&t->hback_porch,
-				t->hback_porch.typ + t->hfront_porch.typ);
-	tachyon_dp_timing_entry(&t->hfront_porch, 0);
-	tachyon_dp_timing_entry(&t->vback_porch,
-				t->vback_porch.typ + t->vfront_porch.typ);
-	tachyon_dp_timing_entry(&t->vfront_porch, 0);
-}
-
 void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 			    u32 *width, u32 *height)
 {
-	int i, selected = -1;
-
-	bool force_mode = tachyon_dp_env_has_u32("tachyon_dp_xres") &&
-			  tachyon_dp_env_has_u32("tachyon_dp_yres") &&
-			  tachyon_dp_env_bool("tachyon_dp_force_mode");
-
-	tachyon_dp_env_mode(width, height);
+	int selected = tachyon_dp_best_mode_index(priv);
 
 	/*
-	 * TESTING: the dock's DP->HDMI converter rejects the sink's native
-	 * 1360x768 (a non-CEA VESA PC mode), showing "No Signal" even with a
-	 * valid trained link.  The board env that would pick a mode does not
-	 * persist across reboot, so force a clean CEA 1920x1080 here unless the
-	 * user has explicitly forced a different mode via tachyon_dp_force_mode.
+	 * Drive the best resolution the sink's EDID advertised that also fits
+	 * the trained link (largest by pixel area).  tachyon_dp_filter_edid_modes()
+	 * has already dropped anything without a usable timing or that exceeds
+	 * the link budget, so the best surviving mode is what we program.  If the
+	 * sink gave us nothing usable (no EDID / nothing fits), fall back to the
+	 * most compatible 1280x720.
 	 */
-	if (!force_mode) {
-		*width = 1920;
-		*height = 1080;
-		force_mode = true;
-		log_debug("DP TEST: forcing 1920x1080 (ignoring non-CEA native mode)\n");
-	}
-
-	for (i = 0; i < priv->mode_count; i++) {
-		if (priv->modes[i].width == *width &&
-		    priv->modes[i].height == *height) {
-			selected = i;
-			break;
-		}
-	}
-
-	/*
-	 * Only fall back to the sink's first EDID mode when we are NOT being told
-	 * to force a specific resolution.  Otherwise honor the forced width/height
-	 * and let the known/fallback timing path below resolve its timing.
-	 */
-	if (selected < 0 && priv->mode_count && !force_mode) {
-		selected = 0;
-		*width = priv->modes[0].width;
-		*height = priv->modes[0].height;
-	}
-
-	if (selected >= 0 && priv->modes[selected].has_timing) {
+	if (selected >= 0) {
+		*width = priv->modes[selected].width;
+		*height = priv->modes[selected].height;
 		priv->timing = priv->modes[selected].timing;
-	} else if (tachyon_dp_known_timing(*width, *height, &priv->timing)) {
-		log_debug("Using built-in timing for DP mode %ux%u\n",
-			    *width, *height);
 	} else {
-		log_warning("No timing for DP mode %ux%u; using 1080p60 porch/pixel-clock fallback\n",
+		*width = TACHYON_DP_FALLBACK_XRES;
+		*height = TACHYON_DP_FALLBACK_YRES;
+		log_warning("DP: no EDID mode fits the link; falling back to %ux%u\n",
 			    *width, *height);
-		tachyon_dp_default_timing(&priv->timing);
-		tachyon_dp_timing_entry(&priv->timing.hactive, *width);
-		tachyon_dp_timing_entry(&priv->timing.vactive, *height);
+		if (!tachyon_dp_known_timing(*width, *height, &priv->timing))
+			tachyon_dp_default_timing(&priv->timing);
 	}
 
-	tachyon_dp_apply_dp_porch_adjust(priv);
-	tachyon_dp_publish_selected_timing(priv);
-	log_debug("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u (DP bottom-right adjusted)\n",
+	log_debug("DP selected mode %ux%u pclk=%u hfp=%u hsw=%u hbp=%u vfp=%u vsw=%u vbp=%u\n",
 		 *width, *height, priv->timing.pixelclock.typ,
 		 priv->timing.hfront_porch.typ, priv->timing.hsync_len.typ,
 		 priv->timing.hback_porch.typ, priv->timing.vfront_porch.typ,
@@ -1358,9 +1157,9 @@ void tachyon_dp_select_mode(struct tachyon_dp_priv *priv,
 }
 
 /*
- * Resolve timing for a specific mode index without consulting environment
- * variables.  Used by GOP SetMode() so the caller-chosen mode is honored
- * rather than being overridden by tachyon_dp_xres/tachyon_dp_yres.
+ * Resolve timing for a specific mode index.  Used by GOP SetMode() so the
+ * caller-chosen mode is honored rather than being overridden by the
+ * auto-selected best mode.
  *
  * Returns true if timing was resolved, false if the index is out of range.
  */
@@ -1377,14 +1176,12 @@ bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 
 	if (priv->modes[mode_index].has_timing) {
 		priv->timing = priv->modes[mode_index].timing;
-		tachyon_dp_apply_dp_porch_adjust(priv);
 		return true;
 	}
 
 	if (tachyon_dp_known_timing(width, height, &priv->timing)) {
 		log_debug("Using built-in timing for DP mode %ux%u\n",
 			    width, height);
-		tachyon_dp_apply_dp_porch_adjust(priv);
 		return true;
 	}
 
@@ -1393,7 +1190,6 @@ bool tachyon_dp_resolve_mode_timing(struct tachyon_dp_priv *priv,
 	tachyon_dp_default_timing(&priv->timing);
 	tachyon_dp_timing_entry(&priv->timing.hactive, width);
 	tachyon_dp_timing_entry(&priv->timing.vactive, height);
-	tachyon_dp_apply_dp_porch_adjust(priv);
 	return true;
 }
 

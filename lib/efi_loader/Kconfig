@@ -586,6 +586,20 @@ config BOOTEFI_TESTAPP_COMPILE
 	  No additional space will be required in the resulting U-Boot binary
 	  when this option is enabled.
 
+config BOOTEFI_GOPTEST_COMPILE
+	bool "Compile the goptest EFI graphics-output test app"
+	default y
+	help
+	  This compiles the goptest EFI application (lib/efi_loader/goptest.c)
+	  into goptest.efi. It exercises the EFI_GRAPHICS_OUTPUT_PROTOCOL
+	  (mode info, QueryMode, Blt patterns, readback verification and a
+	  rotating 3D cube) and is useful for bringing up and validating GOP
+	  on a new platform. Run it with "load mmc 1 ${kernel_addr_r}
+	  goptest.efi" followed by "bootefi".
+
+	  No additional space will be required in the resulting U-Boot binary
+	  when this option is enabled.
+
 endif
 
 source "lib/efi/Kconfig"

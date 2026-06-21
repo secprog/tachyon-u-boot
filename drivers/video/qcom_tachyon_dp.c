@@ -18,7 +18,6 @@
 #include <dm/read.h>
 #include <dm/ofnode.h>
 #include <cpu_func.h>
-#include <env.h>
 #include <fdtdec.h>
 #include <generic-phy.h>
 #include <linux/bitops.h>
@@ -240,38 +239,6 @@ void tachyon_dp_log_typec_resolved(struct tachyon_dp_priv *priv)
 			    priv->pin_assignment, pin_lanes, priv->graph_lanes);
 }
 
-u32 tachyon_dp_env_u32(const char *name, u32 fallback)
-{
-	const char *val = env_get(name);
-	char *end;
-	ulong parsed;
-
-	if (!val || !*val)
-		return fallback;
-
-	parsed = simple_strtoul(val, &end, 0);
-	if (end == val)
-		return fallback;
-
-	return parsed;
-}
-
-bool tachyon_dp_env_has_u32(const char *name)
-{
-	const char *val = env_get(name);
-
-	return val && *val;
-}
-
-bool tachyon_dp_env_bool(const char *name)
-{
-	const char *val = env_get(name);
-
-	return val && (!strcmp(val, "1") ||
-		       !strcmp(val, "true") ||
-		       !strcmp(val, "yes"));
-}
-
 static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv);
 
 static int tachyon_dp_read_altmode(struct tachyon_dp_priv *priv)
@@ -421,23 +388,14 @@ static int tachyon_dp_request_sbu_mux(struct tachyon_dp_priv *priv)
 
 static void tachyon_dp_program_sbu_mux(struct tachyon_dp_priv *priv)
 {
-	bool invert_select = tachyon_dp_env_bool("tachyon_dp_invert_sbu_select");
-	bool invert_enable = tachyon_dp_env_bool("tachyon_dp_invert_sbu_enable");
 	int select;
 	int enable;
 
-	log_debug("SBU mux program start orientation=%u pin=%u invert_select=%d invert_enable=%d\n",
-		    priv->orientation, priv->pin_assignment,
-		    invert_select ? 1 : 0,
-		    invert_enable ? 1 : 0);
+	log_debug("SBU mux program start orientation=%u pin=%u\n",
+		    priv->orientation, priv->pin_assignment);
 
 	select = priv->orientation == TACHYON_DP_ORIENTATION_REVERSE;
-	if (invert_select)
-		select = !select;
-
 	enable = 1;
-	if (invert_enable)
-		enable = 0;
 
 	if (dm_gpio_is_valid(&priv->sbu_select))
 		dm_gpio_set_value(&priv->sbu_select, select);
@@ -542,8 +500,6 @@ static int tachyon_dp_find_phy(struct udevice *dev, struct tachyon_dp_priv *priv
 static int tachyon_dp_apply_pmic_typec_state(struct tachyon_dp_priv *priv,
 		                 const struct qcom_pmic_glink_altmode_state *state)
 {
-	bool force_aux = tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd");
-
 	if (!state || !state->notify_seen)
 		return -EAGAIN;
 
@@ -575,14 +531,14 @@ static int tachyon_dp_apply_pmic_typec_state(struct tachyon_dp_priv *priv,
 		else if (priv->hpd_state == TACHYON_DP_HPD_UNKNOWN)
 			priv->hpd_state = TACHYON_DP_HPD_DISCONNECTED;
 
-		priv->aux_xfers_enabled = state->hpd || force_aux;
+		priv->aux_xfers_enabled = state->hpd;
 		break;
 	case QPG_TYPEC_STATE_USB:
 		priv->hpd_state = TACHYON_DP_HPD_DISCONNECTED;
 		priv->aux_xfers_enabled = false;
 		break;
 	default:
-		priv->aux_xfers_enabled = force_aux;
+		priv->aux_xfers_enabled = false;
 		break;
 	}
 
@@ -623,32 +579,6 @@ bool tachyon_dp_wait_pmic_hpd(struct tachyon_dp_priv *priv,
 	} while (get_timer(start) < timeout_ms);
 
 	return false;
-}
-
-/* Fill the framebuffer with vertical colour bars (XRGB8888). */
-static void tachyon_dp_fill_test_pattern(struct video_uc_plat *plat,
-					 struct video_priv *uc_priv)
-{
-	static const u32 bars[8] = {
-		0x00ffffff, 0x00ffff00, 0x0000ffff, 0x0000ff00,
-		0x00ff00ff, 0x00ff0000, 0x000000ff, 0x00303030,
-	};
-	u32 *fb = (u32 *)plat->base;
-	u32 w = uc_priv->xsize, h = uc_priv->ysize;
-	u32 stride = uc_priv->line_length / 4;
-	u32 x, y;
-
-	if (!fb || !w || !h)
-		return;
-
-	for (y = 0; y < h; y++) {
-		u32 *line = fb + (u64)y * stride;
-
-		for (x = 0; x < w; x++)
-			line[x] = bars[(x * 8) / w];
-	}
-	flush_dcache_range((ulong)plat->base,
-			   (ulong)plat->base + (ulong)stride * 4 * h);
 }
 
 /*
@@ -783,19 +713,10 @@ static int tachyon_dp_program_mainlink(struct tachyon_dp_priv *priv)
 	 * tachyon_dpu_program_ctl (issued with the engine off) is consumed at this
 	 * first vsync.
 	 */
-	if (priv->dpu && !tachyon_dp_env_bool("tachyon_dp_tpg")) {
+	if (priv->dpu) {
 		writel(1, priv->dpu + DPU_INTF_0_BASE +
 			  DPU_INTF_TIMING_ENGINE_EN);
 		log_debug("DP INTF timing engine ON (after SEND_VIDEO)\n");
-	} else if (priv->dpu) {
-		/*
-		 * TPG mode: leave the DPU INTF timing engine OFF so the DP
-		 * controller's internal p0 BIST is the sole pixel/timing source
-		 * (no DPU vs p0 timing-engine conflict).  TPG shares the same DP
-		 * main link + MSA + TU as normal video, so this isolates the
-		 * DPU pixel path from the DP stream.
-		 */
-		log_debug("DP TPG mode: DPU INTF timing engine left OFF\n");
 	}
 
 	{
@@ -926,8 +847,7 @@ static int tachyon_dp_wait_sink(struct tachyon_dp_priv *priv)
 			continue;
 		}
 
-		if (priv->hpd_state == TACHYON_DP_HPD_DISCONNECTED &&
-		    !tachyon_dp_env_bool("tachyon_dp_force_aux_without_hpd")) {
+		if (priv->hpd_state == TACHYON_DP_HPD_DISCONNECTED) {
 			log_debug("DP wait sink try %d/%d: no HPD yet, skipping DPCD read\n",
 				 i + 1, TACHYON_DP_AUX_DEBOUNCE_TRIES);
 			udelay(20000);
@@ -1038,7 +958,6 @@ static int tachyon_dp_probe(struct udevice *dev)
 	u32 width, height;
 	int ret, altmode_ret;
 	bool has_sbu_mux;
-	bool forced_typec = false;
 
 	log_debug("DP probe start\n");
 
@@ -1136,14 +1055,10 @@ static int tachyon_dp_probe(struct udevice *dev)
 		 * dock had settled by then).  PAN_EN is armed, so poll for the
 		 * ADSP DP notify (mux=3 / dp_seen) and exit the instant it
 		 * arrives; the long window just lets a cold dock settle.  A warm
-		 * boot (dock already in DP) never reaches here.  Disable with
-		 * tachyon_dp_no_auto_dfp=1; tune the window with
-		 * tachyon_dp_auto_dfp_ms.
+		 * boot (dock already in DP) never reaches here.
 		 */
-		if (!tachyon_dp_env_bool("tachyon_dp_no_auto_dfp")) {
-			int dfp = qcom_pmic_glink_request_dfp(
-				tachyon_dp_env_u32("tachyon_dp_auto_dfp_ms",
-						   20000));
+		{
+			int dfp = qcom_pmic_glink_request_dfp(20000);
 
 			log_debug("DP auto-DFP ret=%d; re-reading altmode\n",
 				    dfp);
@@ -1172,128 +1087,40 @@ static int tachyon_dp_probe(struct udevice *dev)
 	log_debug("DP SBU mux usable=%d\n", has_sbu_mux ? 1 : 0);
 
 	if (!priv->typec_valid) {
-		const struct qcom_pmic_glink_altmode_state *state;
-
-		state = qcom_pmic_glink_altmode_get_state();
-
-		log_debug("DP Type-C Alt Mode not active before AUX; continuing with PMIC state=%u svid=%04x orient_raw=%u mux=%u dpam=%02x hpd=%u\n",
-			    state ? state->typec_state : 0,
-			    state ? state->svid : 0,
-			    state ? state->orientation_raw : 0xff,
-			    state ? state->mux : 0xff,
-			    state ? state->dpam_raw : 0xff,
-			    state ? state->hpd : 0);
-
 		/*
-		 * Diagnostic fallback:
-		 * Linux proves this connector ultimately works through
-		 * aux_hpd_bridge. Do not abort before AUX. Pick a forced
-		 * orientation for testing.
+		 * The dock never entered DP Alt Mode (no ADSP alt-mode notify
+		 * with a valid orientation/pin), so there is no DP sink to drive.
+		 * Release the PHY/SBU/clocks and abort cleanly.
 		 */
-		priv->typec_source = TACHYON_DP_TYPEC_SOURCE_ALTMODE;
-		priv->typec_valid = true;
-		forced_typec = true;
-
-		if (tachyon_dp_env_bool("tachyon_dp_force_reverse"))
-			priv->orientation = TACHYON_DP_ORIENTATION_REVERSE;
-		else
-			priv->orientation = TACHYON_DP_ORIENTATION_NORMAL;
-
-		/*
-		 * Forced/diagnostic path: there was no ADSP alt-mode notify, so
-		 * the negotiated Type-C pin is unknown. The Tachyon's target
-		 * sinks are USB-C docks/hubs, which negotiate pin D = 2-lane DP +
-		 * USB3 (combo MODE=0x03) — so default to pin D. Override with
-		 * tachyon_dp_force_pin only for experiments (C=2 / E=4 are 4-lane
-		 * DP-only MODE=0x02; F=5 is the reversed 2-lane combo). The pin
-		 * choice drives both the link lane budget (reset_link_policy) and
-		 * the QMP combo split (tachyon_dp_qmp_phy_mode).
-		 */
-		{
-			u8 forced_pin = tachyon_dp_env_u32("tachyon_dp_force_pin",
-							   3);
-
-			if (!tachyon_dp_valid_pin_assignment(forced_pin)) {
-				log_warning("DP invalid tachyon_dp_force_pin=%u; using pin D (3)\n",
-					    forced_pin);
-				forced_pin = 3;
-			}
-			priv->pin_assignment = forced_pin;
-		}
-		log_debug("DP forced Type-C: orientation=%u pin=%u pin_lanes=%u (override: tachyon_dp_force_pin / _reverse / _lanes / _max_rate)\n",
-			    priv->orientation, priv->pin_assignment,
-			    tachyon_dp_pin_assignment_lanes(priv));
-		tachyon_dp_log_typec_resolved(priv);
+		log_warning("DP: Type-C Alt Mode never entered DP - aborting cleanly\n");
+		ret = -ENODEV;
+		goto err_quiesce;
 	}
 
 	/*
-	 * Resolve the (orientation, pin) actually used and read the sink's DPCD
-	 * link caps.  Each attempt first brings the DP PHY to PHY_READY
-	 * (DP_STATUS) and forces AUX on for that orientation — without a locked
-	 * PLL, AUX reads fail with DP_INTR_TIMEOUT and DP_STATUS=00.
-	 *
-	 * With a real ADSP alt-mode notify we already know orientation+pin, so
-	 * there is a single candidate.  On the forced/diagnostic path the hub
-	 * only reveals its pin once it has entered DP, so instead of forcing one
-	 * mode we SWEEP the viable 2-lane dock assignments — pin D (normal) then
-	 * pin F (D reversed), both 2-lane DP+USB3 / combo MODE=0x03 — and keep
-	 * whichever the sink answers DPCD on.  AUX timing out (-110) just means
-	 * "no sink on this orientation"; move to the next candidate.  An explicit
-	 * tachyon_dp_force_pin / tachyon_dp_force_reverse pins a single attempt
-	 * (use pin C=2 / E=4 there for a 4-lane DP-only sink).
+	 * Bring the DP PHY to PHY_READY (DP_STATUS) for the negotiated
+	 * orientation and read the sink's DPCD link caps.  Without a locked PLL,
+	 * AUX reads fail with DP_INTR_TIMEOUT and DP_STATUS=00.  The ADSP
+	 * alt-mode notify already resolved orientation+pin, so this is a single
+	 * attempt.
 	 */
-	{
-		struct { enum tachyon_dp_orientation orient; u8 pin; } cand[4];
-		bool explicit_pin =
-			tachyon_dp_env_has_u32("tachyon_dp_force_pin") ||
-			tachyon_dp_env_bool("tachyon_dp_force_reverse");
-		int ncand = 0, ci;
+	priv->rate = DP_LINK_RATE_HBR;
+	priv->lanes = 2;
 
-		if (!forced_typec || explicit_pin) {
-			cand[ncand].orient = priv->orientation;
-			cand[ncand].pin = priv->pin_assignment;
-			ncand++;
-		} else {
-			cand[ncand].orient = TACHYON_DP_ORIENTATION_NORMAL;
-			cand[ncand].pin = 3;	/* pin D: 2-lane DP + USB3 */
-			ncand++;
-			cand[ncand].orient = TACHYON_DP_ORIENTATION_REVERSE;
-			cand[ncand].pin = 3;	/* pin F: same, reversed */
-			ncand++;
-		}
+	log_debug("DP probe: orientation=%u pin=%u pin_lanes=%u\n",
+		    priv->orientation, priv->pin_assignment,
+		    tachyon_dp_pin_assignment_lanes(priv));
 
-		ret = -EIO;
-		for (ci = 0; ci < ncand; ci++) {
-			priv->orientation = cand[ci].orient;
-			priv->pin_assignment = cand[ci].pin;
-			priv->rate = DP_LINK_RATE_HBR;
-			priv->lanes = 2;
+	tachyon_dp_program_sbu_mux(priv);
+	tachyon_dp_prepare_aux_for_orientation(priv, priv->orientation);
 
-			log_debug("DP probe %d/%d: orientation=%u pin=%u pin_lanes=%u\n",
-				    ci + 1, ncand, priv->orientation,
-				    priv->pin_assignment,
-				    tachyon_dp_pin_assignment_lanes(priv));
+	ret = tachyon_dp_qmp_program_dp_phy(priv);
+	log_debug("DP probe PHY bring-up ret=%d DP_STATUS=%02x\n",
+		    ret, tachyon_dp_qmp_status_low(priv));
 
-			tachyon_dp_program_sbu_mux(priv);
-			tachyon_dp_prepare_aux_for_orientation(priv,
-							       priv->orientation);
-
-			ret = tachyon_dp_qmp_program_dp_phy(priv);
-			log_debug("DP probe PHY bring-up ret=%d DP_STATUS=%02x\n",
-				    ret, tachyon_dp_qmp_status_low(priv));
-
-			ret = tachyon_dp_read_dpcd_caps(priv);
-			log_debug("DP probe DPCD ret=%d caps.lanes=%u caps.max_rate=%u\n",
-				    ret, priv->caps.lanes, priv->caps.max_rate);
-
-			if (!ret && priv->caps.lanes && priv->caps.max_rate) {
-				log_debug("DP probe LOCKED orientation=%u pin=%u after %d/%d\n",
-					    priv->orientation,
-					    priv->pin_assignment, ci + 1, ncand);
-				break;
-			}
-		}
-	}
+	ret = tachyon_dp_read_dpcd_caps(priv);
+	log_debug("DP probe DPCD ret=%d caps.lanes=%u caps.max_rate=%u\n",
+		    ret, priv->caps.lanes, priv->caps.max_rate);
 	if (ret || !priv->caps.lanes || !priv->caps.max_rate) {
 		priv->caps.lanes = priv->caps.lanes ? priv->caps.lanes : 2;
 		priv->caps.max_rate = priv->caps.max_rate ?
@@ -1349,7 +1176,6 @@ static int tachyon_dp_probe(struct udevice *dev)
 	priv->max_rate  = priv->rate;
 	priv->max_lanes = priv->lanes;
 	tachyon_dp_filter_edid_modes(priv);
-	tachyon_dp_publish_edid_modes(priv);
 	tachyon_dp_select_mode(priv, &width, &height);
 
 	uc_priv->xsize = width;
@@ -1389,24 +1215,17 @@ static int tachyon_dp_probe(struct udevice *dev)
 
 	video_set_flush_dcache(dev, true);
 	/*
-	 * Initialise the framebuffer the DPU scans out.  Default to a clean
-	 * black background so the real U-Boot console renders on it: with
+	 * Initialise the framebuffer the DPU scans out with a clean black
+	 * background so the real U-Boot console renders on it: with
 	 * CONFIG_NO_FB_CLEAR=y the video uclass does NOT clear this freshly
 	 * lmb-allocated buffer, after which video_post_probe draws the logo on
-	 * the dock.  Set the env var
-	 * "tachyon_dp_test_pattern" to instead paint vertical colour bars — a
-	 * fetch-vs-no-fetch diagnostic: if the dock shows bars the DPU is
-	 * genuinely fetching the framebuffer.
+	 * the dock.
 	 */
-	if (tachyon_dp_env_bool("tachyon_dp_test_pattern")) {
-		tachyon_dp_fill_test_pattern(plat, uc_priv);
-	} else {
-		memset((void *)plat->base, 0,
-		       (size_t)uc_priv->line_length * uc_priv->ysize);
-		flush_dcache_range((ulong)plat->base,
-				   (ulong)plat->base +
-				   (ulong)uc_priv->line_length * uc_priv->ysize);
-	}
+	memset((void *)plat->base, 0,
+	       (size_t)uc_priv->line_length * uc_priv->ysize);
+	flush_dcache_range((ulong)plat->base,
+			   (ulong)plat->base +
+			   (ulong)uc_priv->line_length * uc_priv->ysize);
 
 	ret = tachyon_dpu_program_scanout(priv, plat, uc_priv);
 	if (ret)
@@ -1467,9 +1286,8 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 				    ret);
 	}
 
-	tachyon_dp_env_mode(&width, &height);
-	mode_changed = width != priv->timing.hactive.typ ||
-		       height != priv->timing.vactive.typ;
+	/* No timing programmed yet means DP still needs to be brought up. */
+	mode_changed = priv->timing.hactive.typ == 0;
 	if (!mode_changed && !alt_changed)
 		return 0;
 
@@ -1487,7 +1305,6 @@ static int tachyon_dp_video_sync(struct udevice *dev)
 	priv->max_rate  = priv->rate;
 	priv->max_lanes = priv->lanes;
 	tachyon_dp_filter_edid_modes(priv);
-	tachyon_dp_publish_edid_modes(priv);
 	tachyon_dp_select_mode(priv, &width, &height);
 
 	uc_priv->xsize = width;
@@ -1551,8 +1368,8 @@ static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
 	height = priv->modes[mode_number].height;
 
 	/*
-	 * SetMode() must respect the caller-chosen mode index, not
-	 * tachyon_dp_env_mode().  Resolve timing directly from the
+	 * SetMode() must respect the caller-chosen mode index, not the
+	 * auto-selected best mode.  Resolve timing directly from the
 	 * requested mode, then train link + reprogram DPU/DP.
 	 */
 	if (!tachyon_dp_resolve_mode_timing(priv, mode_number))
@@ -1569,7 +1386,6 @@ static int tachyon_dp_set_mode(struct udevice *dev, u32 mode_number)
 	priv->max_rate  = priv->rate;
 	priv->max_lanes = priv->lanes;
 	tachyon_dp_filter_edid_modes(priv);
-	tachyon_dp_publish_edid_modes(priv);
 
 	/*
 	 * After link fallback, the originally requested mode may no longer

@@ -2246,7 +2246,7 @@ static void efi_exit_caches(void)
 #endif
 }
 
-#if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
+#if IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT)
 /*
  * Qualcomm SBL RAM-dump arming cookie.
  *
@@ -2702,7 +2702,7 @@ static efi_status_t EFIAPI efi_exit_boot_services(efi_handle_t image_handle,
 	if (!systab.boottime)
 		goto out;
 
-#if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
+#if IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT)
 	/*
 	 * Patch winload's trapped EL1 ACTLR_EL1 reads BEFORE it runs its
 	 * post-EBS processor setup (the Gunyah-trap freeze window). The caller
@@ -2793,20 +2793,15 @@ static efi_status_t EFIAPI efi_exit_boot_services(efi_handle_t image_handle,
 	schedule();
 
 	/*
-	 * Windows-on-ARM diagnostic markers over serial -- ONLY on a
-	 * boot_os=windows boot.  A Linux/normal EFI boot prints nothing here.
+	 * Windows-on-ARM diagnostic markers over serial -- compiled in only
+	 * for CONFIG_TACHYON_WINDOWS_BOOT (a Linux-only build prints nothing).
 	 */
-	if (IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)) {
-		const char *bo = env_get("boot_os");
+	if (IS_ENABLED(CONFIG_TACHYON_WINDOWS_BOOT)) {
+		unsigned long el;
 
-		if (bo && !strcmp(bo, "windows")) {
-			unsigned long el;
-
-			printf("EFI-HANDOFF: ExitBootServices complete\n");
-			asm volatile("mrs %0, CurrentEL" : "=r"(el));
-			printf("EFI-HANDOFF: AP CurrentEL = EL%lu\n",
-			       (el >> 2) & 3);
-		}
+		printf("EFI-HANDOFF: ExitBootServices complete\n");
+		asm volatile("mrs %0, CurrentEL" : "=r"(el));
+		printf("EFI-HANDOFF: AP CurrentEL = EL%lu\n", (el >> 2) & 3);
 	}
 out:
 	if (IS_ENABLED(CONFIG_EFI_TCG2_PROTOCOL))
