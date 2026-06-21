@@ -366,6 +366,14 @@ static const struct udevice_id qcom_gpio_ids[] = {
 	{ .compatible = "qcom,pm6125-gpio" },
 	{ .compatible = "qcom,pm8150-gpio" },
 	{ .compatible = "qcom,pm8550-gpio", .data = QCOM_PMIC_QUIRK_READONLY },
+	/*
+	 * pm7325 hosts the volume-up button (gpio6) on Tachyon. Treat it as
+	 * read-only: the pin is already configured as input + bias-pull-up by
+	 * the firmware, and reconfiguring direction here would clear the pull
+	 * (REG_DIG_PULL_NO_PU) and could leave the button floating. We only
+	 * ever read its status, so the read-only path is sufficient.
+	 */
+	{ .compatible = "qcom,pm7325-gpio", .data = QCOM_PMIC_QUIRK_READONLY },
 	{ }
 };
 
