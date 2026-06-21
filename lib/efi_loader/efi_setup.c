@@ -9,6 +9,7 @@
 
 #include <efi_loader.h>
 #include <efi_variable.h>
+#include <env.h>
 #include <log.h>
 #include <stdio.h>
 #include <asm-generic/unaligned.h>
@@ -330,37 +331,62 @@ efi_status_t efi_init_obj_list(void)
 	}
 	if (IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)) {
 		/*
-		 * Windows-on-ARM: winload reads the SPCR/DBG2 ACPI tables, finds
-		 * the GENI QUP serial console at 0x994000, and writes to it during
-		 * early boot (pre-SetVirtualAddressMap). winload installs its own
-		 * page tables and its on-demand mapper (BlMmMapPhysicalAddress)
-		 * only maps a physical page if that page is already a member of
-		 * winload's loader-descriptor DB; otherwise the map silently fails
-		 * and the console write data-aborts (HW-confirmed: ESR=0x96000045
-		 * WRITE, FAR=0x99480c = UART + TX_WATERMARK_REG 0x80c).
+		 * Windows-on-ARM: winload writes the GENI UART at 0x994000 during
+		 * early post-EBS boot (pre-SetVirtualAddressMap), inherited as the
+		 * U-Boot console handoff -- it does this regardless of SPCR/DBG2.
+		 * winload's on-demand mapper only maps a page that is in its early
+		 * loader-descriptor DB, and ONLY EfiLoaderCode/Data get that early
+		 * merge -- so 0x994000 MUST be added here as EFI_LOADER_DATA or
+		 * winload's console write faults and it freezes BEFORE SVAM.
 		 *
-		 * The DB-membership gate accepts any class except EFI_PAL_CODE, so
-		 * the EFI type itself is not the issue -- timing is. EfiMemoryMappedIO
-		 * / EfiReservedMemoryType regions are only ingested late (by winload's
-		 * OslpProcessFirmwareMemoryMap), AFTER the console is first written,
-		 * so they are not in the DB yet and the write faults. EFI_LOADER_DATA
-		 * regions are merged into the DB at the earliest loader stage, before
-		 * the console write, so winload identity-maps the UART itself. Use
-		 * EFI_MEMORY_UC (not RUNTIME -- RUNTIME would request a high-VA remap
-		 * at SVAM instead of the identity mapping the early write needs).
+		 * HW-PROVEN by elimination (2026-06-21): typing this page MMIO, or
+		 * moving the SPCR console to a different UART (Radxa uses 0xA90000),
+		 * or dropping the map entirely (win_serial=0) ALL hang winload
+		 * pre-SVAM -- only LOADER_DATA reaches the NT kernel.  But LoaderData
+		 * is reclaimable, so ntoskrnl later DC-ZVA-zeroes 0x994000; the QHEE
+		 * stage-2 maps it Device -> abort -> PSHOLD reset.  The escape is NOT
+		 * here: it is the br-x20 trampoline in efi_boottime.c (mdfix), which
+		 * retags this descriptor LoaderLoadedProgram->LoaderFirmwarePermanent
+		 * at handoff so winload keeps the early map but NT never reclaims it.
 		 *
-		 * Done unconditionally (not gated on boot_os): efi_init_obj_list()
-		 * runs once on the first EFI op, which may be an early autoboot
-		 * before the user sets boot_os=windows, so a gate here can be
-		 * silently skipped. Adding the region is harmless to Linux, which
-		 * maps the UART itself.
+		 * Not gated on boot_os (efi_init_obj_list() runs once on the first
+		 * EFI op, possibly before boot_os=windows is set); harmless to Linux.
+		 *
+		 * win_serial=0 diagnostic gate: omit the map (paired with the SPCR +
+		 * DBG2 gate in acpi.c) for a no-serial bring-up test.
 		 */
-		efi_status_t r = efi_add_memory_map_attr(0x994000, 0x4000,
-							 EFI_LOADER_DATA,
-							 EFI_MEMORY_UC);
+		void efi_geni_rt_register(void);	/* efi_runtime.c tracer */
+		const char *bo = env_get("boot_os");
+		bool win = bo && !strcmp(bo, "windows");
 
-		printf("EFI-HANDOFF: console UART 0x994000+0x4000 -> EFI map (LOADER_DATA/UC) ret=%lu\n",
-		       (unsigned long)r);
+		/*
+		 * Windows-on-ARM only (boot_os=windows), and unless win_serial=0
+		 * (no-serial bring-up test).  The Linux/default path adds nothing,
+		 * leaving the EFI map untouched.  The user sets boot_os=windows at
+		 * the prompt before `boot`, so efi_init_obj_list() (which runs once
+		 * on the first EFI op) sees it.
+		 */
+		if (win && env_get_yesno("win_serial") != 0) {
+			u64 attr = EFI_MEMORY_UC;
+			efi_status_t r;
+
+			/*
+			 * `setenv win_rttrace 1` marks the UART EFI_MEMORY_RUNTIME
+			 * and registers it for SVAM relocation so the EFI runtime
+			 * services can print over it (efi_rt_puts) AFTER ntoskrnl
+			 * takes over.  RISK: RUNTIME may affect winload's early map;
+			 * opt-in only, default keeps the proven LOADER_DATA/UC map.
+			 */
+			if (env_get_yesno("win_rttrace") == 1) {
+				attr |= EFI_MEMORY_RUNTIME;
+				efi_geni_rt_register();
+			}
+			r = efi_add_memory_map_attr(0x994000, 0x4000,
+						    EFI_LOADER_DATA, attr);
+			printf("EFI-HANDOFF: console UART 0x994000+0x4000 -> EFI map (LOADER_DATA%s) ret=%lu\n",
+			       (attr & EFI_MEMORY_RUNTIME) ? "/RT-trace" : "/UC",
+			       (unsigned long)r);
+		}
 	}
 	if (IS_ENABLED(CONFIG_SMBIOS)) {
 		ret = efi_smbios_register();

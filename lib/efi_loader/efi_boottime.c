@@ -24,6 +24,7 @@
 #include <usb.h>
 #include <watchdog.h>
 #include <asm/global_data.h>
+#include <asm/io.h>
 #include <asm/setjmp.h>
 #include <linux/libfdt_env.h>
 
@@ -2246,6 +2247,62 @@ static void efi_exit_caches(void)
 }
 
 #if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
+/*
+ * Qualcomm SBL RAM-dump arming cookie.
+ *
+ * On this Secure-Boot-OFF device the RAM-dump *policy* is already ALLOWED:
+ * qsee_is_memory_dump_allowed() (SecCfgLib/SecCfg.c) returns TRUE whenever
+ * auth is disabled, so the SBL "Ramdump not allowed" / PBL-EDL deny branches
+ * are unreachable. What is missing on a winload crash is the *arming*: the XBL
+ * only diverts into the XBLRamDump collector when TCSR_BOOT_MISC_DETECT has bit
+ * 0x10 (full DDR) or 0x20 (minidump) set. A clean reset -- and winload's
+ * post-EBS reset -- leaves it clear, so boot_dload_entry() returns FALSE and the
+ * SBL runs ramdump_load_cancel ("RamDump - Image Loaded (0 Bytes)"), which is
+ * the dump-not-armed path, NOT a policy denial.
+ *
+ * Address/bits verified against the on-device xbl.elf (BOOT.MXF.1.0-LAHAINA,
+ * SocKodiakLAA): boot_dload_entry builds 0x01fd3000 (mov #0x3000; movk #0x1fd,
+ * lsl#16) and tests (val & 0x30). Kodiak HW agrees: TCSR_TCSR_REGS_REG_BASE =
+ * CORE_TOP_CSR_BASE(0x01f00000) + 0xc0000, BOOT_MISC_DETECT = +0x13000.
+ */
+#define TCSR_BOOT_MISC_DETECT	0x01fd3000UL
+#define SBL_DLOAD_FULLDUMP_BIT	0x10
+#define SBL_DLOAD_MINIDUMP_BIT	0x20
+
+/**
+ * efi_qcom_arm_crashdump_cookie() - arm the SBL RAM-dump cookie before winload
+ *
+ * Set the TCSR_BOOT_MISC_DETECT cookie immediately before handing off to
+ * winload so that if winload crashes/resets, the XBL re-enters, sees the cookie,
+ * and runs XBLRamDump -> Sahara memory-debug (pull the full DDR dump, incl. the
+ * AOSS reset-FSM / PMIC PON / GCC reset-status regions that reveal *why* winload
+ * reset) over EDL. Gated on boot_os=windows AND opt-in env crashdump_arm:
+ *   setenv crashdump_arm 1      -> full DDR dump  (bit 0x10)
+ *   setenv crashdump_arm mini   -> minidump       (bit 0x20)
+ *
+ * Caveat: relies on the winload reset being WARM (the always-on TCSR cookie and
+ * DDR are preserved). If the reset cold-powers the board, the cookie/DDR are
+ * lost; use forced PBL EDL instead. boot_dload_entry() clears the cookie after
+ * reading, so this is one-shot per arming.
+ */
+static void efi_qcom_arm_crashdump_cookie(void)
+{
+	const char *boot_os = env_get("boot_os");
+	const char *arm = env_get("crashdump_arm");
+	u32 bit, before, after;
+
+	if (!boot_os || strcmp(boot_os, "windows") || !arm)
+		return;
+
+	bit = !strcmp(arm, "mini") ? SBL_DLOAD_MINIDUMP_BIT
+				   : SBL_DLOAD_FULLDUMP_BIT;
+	before = readl(TCSR_BOOT_MISC_DETECT);
+	writel(before | bit, TCSR_BOOT_MISC_DETECT);
+	after = readl(TCSR_BOOT_MISC_DETECT);
+	printf("EFI-HANDOFF: armed SBL crashdump cookie @%#lx %#x->%#x (bit %#x)\n",
+	       TCSR_BOOT_MISC_DETECT, before, after, bit);
+}
+
 /**
  * efi_qcom_winload_actlr_errata() - neutralize winload's EL1 ACTLR_EL1 reads
  * @image_handle:	handle of the image calling ExitBootServices (= winload)
@@ -2521,6 +2578,92 @@ static void efi_qcom_winload_actlr_errata(efi_handle_t image_handle)
 			printf(" (not hooked)\n");
 		}
 	}
+
+	/*
+	 * Windows-on-ARM loader-descriptor fix.  ntoskrnl reclaims + DC-ZVA-zeroes
+	 * the UART page (BasePage 0x994), which winload tags MemoryType 4
+	 * (LoaderLoadedProgram); but the QHEE HLOS stage-2 maps 0x994000 as Device,
+	 * so that aligned zeroing store alignment-faults (HW-decoded ramdump:
+	 * ESR_EL2=0x92000061 EC=0x24 DFSC=0x21 WnR=1, IPA 0x994000) -> SoC reset.
+	 * The EFI map cannot be both early-in-winload's-DB AND non-reclaimable:
+	 * only EfiLoaderCode/Data are early-DB and both translate to the reclaimed
+	 * MemoryType 4 (winload classifier @0x1801d0f60 -> 0xd0000002).  So at the
+	 * SAME winload->kernel "br x20" we hook for the ACTLR errata, run a tiny
+	 * prologue (_mdfix.s) FIRST -- while x0 is still LOADER_PARAMETER_BLOCK --
+	 * that walks MemoryDescriptorListHead ([x0+0x20]) and retags the 0x994
+	 * descriptor's MemoryType 4 -> 6 (LoaderFirmwarePermanent) so ntoskrnl
+	 * leaves it mapped and unreclaimed.  It then branches into the existing
+	 * kactlr blob (x0/x20 preserved).  A per-node canonical-kernel-VA check
+	 * makes a wrong list-head offset bail safely instead of bricking.
+	 */
+	{
+		/*
+		 * Walk LPB->MemoryDescriptorListHead ([x0+0x20]) and find the precise
+		 * 0x994000 UART descriptor (BasePage == 0x994), then rewrite its
+		 * MemoryType 4 (LoaderLoadedProgram, reclaimable) -> 6
+		 * (LoaderFirmwarePermanent) so ntoskrnl keeps it mapped and never
+		 * reclaims/DC-ZVA-zeroes the Device UART page (HW ramdump: ESR
+		 * 0x92000061 DFSC=0x21 WnR=1 IPA 0x994000 -> reset).
+		 *
+		 * CRITICAL: the Win11 24H2 ARM64 MEMORY_ALLOCATION_DESCRIPTOR is 0x30
+		 * bytes with an EXTRA pointer field at +0x10 -- so MemoryType is at
+		 * node+0x18, BasePage at node+0x20, PageCount at node+0x28 (NOT the
+		 * classic +0x10/+0x18/+0x20).  Proven by page-table-walking a ramdump:
+		 * the 0x994 descriptor is node VA ..c87a0030 = {+0x18 MemoryType=4,
+		 * +0x20 BasePage=0x994, +0x28 PageCount=4}.  The earlier offsets read
+		 * garbage and a range match hit ~88 nodes, writing 6 into the +0x10
+		 * pointer field -> corrupted the loader memory list.  Exact-base match
+		 * is unique; the MemoryType<0x40 guard prevents touching a non-descriptor.
+		 * Per-node canonical-kernel-VA guard + 0x800 cap bail safely.  Records
+		 * at kt2+0x94 for verification.  Chains in FRONT of the kactlr blob
+		 * (which stays intact); never overwrites it.
+		 */
+		static const u32 mdfix_h[] = {
+			0xaa0003e9, 0x10000491, 0xf9000220, 0x9100812b, 0xf940016a,
+			0xf900062a, 0xd280000c, 0xf9000e3f, 0xf900122a, 0xeb0b015f,
+			0x54000320, 0xd368fd4f, 0xd29fff10, 0xf2a01ff0, 0xeb1001ff,
+			0x54000283, 0x9100058c, 0xf120019f, 0x54000228, 0xf940114d,
+			0xf12651bf, 0x54000181, 0xb940194f, 0x710101ff, 0x54000122,
+			0xf900162d, 0xb900322f, 0xf9001e2a, 0x528000ce, 0xb900194e,
+			0xd280002e, 0xf9000e2e, 0x14000003, 0xf940014a, 0x17ffffe6,
+			0xf9000a2c, 0xd503201f, /* idx 36: nop -> b kt */
+			0, 0, 0, 0, 0, 0, 0, 0, /* scratch @kt2+0x94 (8 quads) */
+			0, 0, 0, 0, 0, 0, 0, 0,
+		};
+		const int bkt_idx = 36;
+		const unsigned long kt = base + 0x2a1400;  /* the kactlr blob */
+		const unsigned long kt2 = base + 0x2a1280; /* free .trans gap before it */
+		u32 *brk = (u32 *)(base + 0x109c);
+		u32 *slot2 = (u32 *)kt2;
+		u32 bkt = 0x14000000 |
+			  (((kt - (base + 0x109c)) >> 2) & 0x03ffffff);
+		int n = sizeof(mdfix_h) / sizeof(mdfix_h[0]);
+		bool free2 = true;
+		int i;
+
+		for (i = 0; i < n; i++)
+			if (slot2[i]) { free2 = false; break; }
+
+		/* Only chain if the kactlr hook is already in place and slot free. */
+		if (*brk == bkt && free2) {
+			for (i = 0; i < n; i++)
+				slot2[i] = mdfix_h[i];
+			/* placeholder nop (Ldone) -> b <kactlr blob> (kactlr UNTOUCHED) */
+			slot2[bkt_idx] = 0x14000000 |
+				(((kt - (kt2 + bkt_idx * 4)) >> 2) & 0x03ffffff);
+			/* redirect winload's br x20: run mdfix first, then kactlr */
+			*brk = 0x14000000 |
+				(((kt2 - (base + 0x109c)) >> 2) & 0x03ffffff);
+			flush_dcache_range(kt2, kt2 + sizeof(mdfix_h));
+			flush_dcache_range(base + 0x1000, base + 0x1100);
+			invalidate_icache_all();
+			printf("EFI-HANDOFF: mdfix(v2) hooked @%lx scratch@%lx\n",
+			       kt2, kt2 + 0x94);
+		} else {
+			printf("EFI-HANDOFF: mdfix NOT hooked (brk=%08x free2=%d)\n",
+			       *brk, free2);
+		}
+	}
 }
 #endif
 
@@ -2566,6 +2709,8 @@ static efi_status_t EFIAPI efi_exit_boot_services(efi_handle_t image_handle,
 	 * (@image_handle) is winload itself.
 	 */
 	efi_qcom_winload_actlr_errata(image_handle);
+	/* Arm the SBL RAM-dump cookie so a winload crash is captured (opt-in). */
+	efi_qcom_arm_crashdump_cookie();
 #endif
 
 	/* Notify EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES event group. */
@@ -2648,27 +2793,21 @@ static efi_status_t EFIAPI efi_exit_boot_services(efi_handle_t image_handle,
 	schedule();
 
 	/*
-	 * Diagnostic marker over serial (captured before any winload->kernel
-	 * PSHOLD reset): ExitBootServices completed. Only reached on the full
-	 * success path, and only during an EFI/Windows boot -- a normal U-Boot
-	 * boot never runs this. Remove once Windows boots.
+	 * Windows-on-ARM diagnostic markers over serial -- ONLY on a
+	 * boot_os=windows boot.  A Linux/normal EFI boot prints nothing here.
 	 */
-	printf("EFI-HANDOFF: ExitBootServices complete\n");
-#if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
-	{
-		/*
-		 * Verify whether an EL2 hypervisor (Gunyah/QHEE) is resident: if
-		 * the AP runs at EL1, EL2 is owned by a hypervisor; at EL2 there is
-		 * nothing above us but TrustZone (bare-metal, no Gunyah). This
-		 * decides whether the GIC is hyp-virtualized (kernel byte-patch
-		 * fix) or owned directly by the OS (U-Boot-side fix).
-		 */
-		unsigned long el;
+	if (IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)) {
+		const char *bo = env_get("boot_os");
 
-		asm volatile("mrs %0, CurrentEL" : "=r"(el));
-		printf("EFI-HANDOFF: AP CurrentEL = EL%lu\n", (el >> 2) & 3);
+		if (bo && !strcmp(bo, "windows")) {
+			unsigned long el;
+
+			printf("EFI-HANDOFF: ExitBootServices complete\n");
+			asm volatile("mrs %0, CurrentEL" : "=r"(el));
+			printf("EFI-HANDOFF: AP CurrentEL = EL%lu\n",
+			       (el >> 2) & 3);
+		}
 	}
-#endif
 out:
 	if (IS_ENABLED(CONFIG_EFI_TCG2_PROTOCOL))
 	{

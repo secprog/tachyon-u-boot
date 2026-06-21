@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <rtc.h>
 #include <asm/global_data.h>
+#include <asm/io.h>
 #include <u-boot/crc.h>
 #include <asm/sections.h>
 
@@ -216,8 +217,9 @@ static efi_status_t efi_init_memory_attributes_table(void)
 
 	ret = efi_install_configuration_table(&efi_mem_attributes_table_guid,
 					      mat);
-	printf("EFI-HANDOFF: Memory Attributes Table -> %u runtime region(s), ret=%lu\n",
-	       n, ret);
+	if (env_get("boot_os") && !strcmp(env_get("boot_os"), "windows"))
+		printf("EFI-HANDOFF: Memory Attributes Table -> %u runtime region(s), ret=%lu\n",
+		       n, ret);
 	if (ret != EFI_SUCCESS)
 		efi_free_pool(mat);
 
@@ -352,6 +354,63 @@ void __efi_runtime efi_update_table_header_crc32(struct efi_table_hdr *table)
 	table->crc32 = crc32(0, (const unsigned char *)table,
 			     table->headersize);
 }
+
+#if IS_ENABLED(CONFIG_ARCH_SNAPDRAGON)
+/*
+ * Windows-on-ARM runtime-service tracer.  ntoskrnl calls the EFI runtime
+ * services AFTER SetVirtualAddressMap, where U-Boot's printf is unusable (it
+ * lives outside the relocated runtime section, so calling it faults under
+ * ntoskrnl's MMU).  This self-contained __efi_runtime GENI-UART writer lets
+ * each runtime service announce itself over the SPCR console (GENI @0x994000)
+ * so the LAST line before a hang shows which service ntoskrnl was in.
+ * efi_geni_uart holds the physical base until SetVirtualAddressMap relocates
+ * it (registered on the runtime-mmio list) to the OS virtual address.  Bounded
+ * polls so a wedged GENI cannot hang the service.  Registered only for
+ * boot_os=windows.
+ */
+void __efi_runtime_data *efi_geni_uart;
+
+static void __efi_runtime efi_rt_putc(char c)
+{
+	void __iomem *b = efi_geni_uart;
+	u32 i;
+
+	if (!b)
+		return;
+	for (i = 0; i < 50000 && (readl(b + 0x40) & 0x1); i++)
+		;			/* GENI_STATUS M_GENI_CMD_ACTIVE */
+	writel(1, b + 0x270);		/* UART_TX_TRANS_LEN = 1 */
+	writel(0x8000000, b + 0x600);	/* M_CMD0 = UART_START_TX */
+	writel((u8)c, b + 0x700);	/* TX_FIFOn */
+	for (i = 0; i < 50000 && !(readl(b + 0x610) & 0x1); i++)
+		;			/* M_IRQ_STATUS M_CMD_DONE */
+	writel(0x1, b + 0x618);		/* M_IRQ_CLEAR */
+}
+
+void __efi_runtime efi_rt_puts(const char *s)
+{
+	if (s)
+		while (*s)
+			efi_rt_putc(*s++);
+}
+
+/*
+ * Register the GENI console for runtime relocation.  The UART page is already
+ * in the EFI map (efi_setup.c, as EfiLoaderData|RUNTIME for Windows), so we
+ * only add it to the runtime-mmio list -- SetVirtualAddressMap then rebinds
+ * efi_geni_uart to its OS virtual address.
+ */
+void efi_geni_rt_register(void)
+{
+	static struct efi_runtime_mmio_list m;
+
+	efi_geni_uart = (void *)(uintptr_t)CONFIG_DEBUG_UART_BASE;
+	m.ptr = (void **)&efi_geni_uart;
+	m.paddr = CONFIG_DEBUG_UART_BASE;
+	m.len = 0x4000;
+	list_add_tail(&m.link, &efi_runtime_mmio);
+}
+#endif
 
 /**
  * efi_reset_system_boottime() - reset system at boot time
@@ -577,6 +636,7 @@ void __weak __efi_runtime EFIAPI efi_reset_system(
 			efi_status_t reset_status,
 			unsigned long data_size, void *reset_data)
 {
+	efi_rt_puts("RT: ResetSystem\n");
 	return;
 }
 
@@ -608,6 +668,7 @@ efi_status_t __weak __efi_runtime EFIAPI efi_get_time(
 			struct efi_time *time,
 			struct efi_time_cap *capabilities)
 {
+	efi_rt_puts("RT: GetTime\n");
 	return EFI_UNSUPPORTED;
 }
 
@@ -626,6 +687,7 @@ efi_status_t __weak __efi_runtime EFIAPI efi_get_time(
  */
 efi_status_t __weak __efi_runtime EFIAPI efi_set_time(struct efi_time *time)
 {
+	efi_rt_puts("RT: SetTime\n");
 	return EFI_UNSUPPORTED;
 }
 
@@ -954,8 +1016,9 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 	EFI_ENTRY("%zx %zx %x %p", memory_map_size, descriptor_size,
 		  descriptor_version, virtmap);
 
-	/* Diagnostic marker over serial: entered SetVirtualAddressMap. */
-	printf("EFI-HANDOFF: SetVirtualAddressMap enter\n");
+	/* Diagnostic marker over serial (Windows boot only). */
+	if (env_get("boot_os") && !strcmp(env_get("boot_os"), "windows"))
+		printf("EFI-HANDOFF: SetVirtualAddressMap enter\n");
 
 	if (descriptor_version != EFI_MEMORY_DESCRIPTOR_VERSION ||
 	    descriptor_size < sizeof(struct efi_mem_desc))
@@ -1044,8 +1107,10 @@ static efi_status_t EFIAPI efi_set_virtual_address_map(
 
 			efi_relocate_runtime_table(new_offset);
 			efi_runtime_relocate(new_offset, map);
-			/* Diagnostic marker over serial: SVAM relocation done. */
-			printf("EFI-HANDOFF: SetVirtualAddressMap done\n");
+			/* Diagnostic marker over serial (Windows boot only). */
+			if (env_get("boot_os") &&
+			    !strcmp(env_get("boot_os"), "windows"))
+				printf("EFI-HANDOFF: SetVirtualAddressMap done\n");
 			ret = EFI_SUCCESS;
 			goto out;
 		}
@@ -1118,6 +1183,7 @@ efi_status_t efi_add_runtime_mmio(void *mmio_ptr, u64 len)
  */
 static efi_status_t __efi_runtime EFIAPI efi_unimplemented(void)
 {
+	efi_rt_puts("RT: <unimplemented svc>\n");
 	return EFI_UNSUPPORTED;
 }
 

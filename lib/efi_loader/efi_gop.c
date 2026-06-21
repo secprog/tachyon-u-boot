@@ -9,6 +9,7 @@
 
 #include <dm.h>
 #include <efi_loader.h>
+#include <env.h>
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
@@ -561,6 +562,22 @@ efi_status_t efi_gop_register(void)
 	struct video_priv *priv;
 	struct video_uc_plat *plat;
 	struct video_ops *vops;
+
+	/*
+	 * Windows-on-ARM diagnostic gate: `setenv win_no_gop 1` suppresses the
+	 * EFI Graphics Output Protocol (and the framebuffer memory-map re-typing)
+	 * entirely, so winload boots into an environment with NO GOP and no FB
+	 * descriptor.  U-Boot otherwise leaves DP + a live scanning-out
+	 * framebuffer up across ExitBootServices (the DP driver has no .remove)
+	 * and exposes a GOP -- both unusual at OS handoff.  If suppressing the
+	 * GOP lets winload reach SetVirtualAddressMap, the GOP/framebuffer is the
+	 * post-EBS/pre-SVAM blocker; if it still hangs, video is exonerated.
+	 * Toggle from the U-Boot prompt without reflashing.
+	 */
+	if (env_get_yesno("win_no_gop") == 1) {
+		printf("EFI-HANDOFF: win_no_gop=1 -> GOP/framebuffer NOT registered\n");
+		return EFI_SUCCESS;
+	}
 
 	/* We only support a single video output device for now */
 	if (uclass_first_device_err(UCLASS_VIDEO, &vdev)) {

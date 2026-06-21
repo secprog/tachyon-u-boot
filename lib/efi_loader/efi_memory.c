@@ -8,6 +8,7 @@
 #define LOG_CATEGORY LOGC_EFI
 
 #include <efi_loader.h>
+#include <env.h>
 #include <init.h>
 #include <lmb.h>
 #include <log.h>
@@ -926,7 +927,21 @@ int efi_map_update_notify(phys_addr_t addr, phys_size_t size,
 		type = EFI_CONVENTIONAL_MEMORY;
 	}
 
-	status = efi_add_memory_map_pg(efi_addr, pages, type, false, 0);
+	/*
+	 * Windows-on-ARM only (boot_os=windows): secure/XPU/hypervisor-protected
+	 * no-map carveouts are typed non-cacheable + execute-never so winload's
+	 * NT page tables don't speculatively cache-fill a QHEE stage-2-protected
+	 * page (HPFAR_EL2 fault in early NT init).  On the default/Linux path we
+	 * keep stock behaviour (attribute 0 -> EFI_MEMORY_WB) so nothing changes.
+	 */
+	{
+		const char *bo = env_get("boot_os");
+		bool win = bo && !strcmp(bo, "windows");
+
+		status = efi_add_memory_map_pg(efi_addr, pages, type, false,
+					       (win && (flags & LMB_NOMAP)) ?
+					       (EFI_MEMORY_UC | EFI_MEMORY_XP) : 0);
+	}
 	if (status != EFI_SUCCESS) {
 		log_err("LMB Map notify failure %lu\n",
 			status & ~EFI_ERROR_MASK);

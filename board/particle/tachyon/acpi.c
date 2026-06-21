@@ -16,6 +16,7 @@
  */
 
 #include <cpu.h>
+#include <env.h>
 #include <log.h>
 #include <tables_csum.h>
 #include <string.h>
@@ -715,6 +716,27 @@ ACPI_WRITER(5pptt, "PPTT", tachyon_write_pptt, 0);
  * GTDT (Generic Timer Description Table) support
  * ARM Generic Timer interrupts for Windows
  */
+
+/* ACPI GTDT "GT Block" platform timer (one memory-mapped timer + one frame). */
+struct gtdt_gt_block {
+	u8 type;		/* 0 = GT Block */
+	u16 length;		/* 0x3C */
+	u8 reserved;
+	u64 cntctlbase;		/* GT Block CntCTLBase */
+	u32 timer_count;	/* number of GT Block timer frames */
+	u32 timer_offset;	/* offset from block start to frame 0 */
+	/* GT Block Timer frame 0 */
+	u8 frame_number;
+	u8 reserved2[3];
+	u64 cntbase;		/* CntBaseN */
+	u64 cntel0base;		/* CntEL0BaseN */
+	u32 phys_gsiv;
+	u32 phys_flags;
+	u32 virt_gsiv;
+	u32 virt_flags;
+	u32 common_flags;
+} __packed;
+
 static int tachyon_write_gtdt(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 {
 	struct acpi_table_header *header;
@@ -751,10 +773,39 @@ static int tachyon_write_gtdt(struct acpi_ctx *ctx, const struct acpi_writer *en
 	gtdt->el2_flags = 0;
 	gtdt->cnt_read_base = 0xFFFFFFFFFFFFFFFF;
 
+	/*
+	 * Append one "GT Block" (memory-mapped generic timer) to match the proven
+	 * Kodiak (SC7280) Windows GTDT, which we otherwise omit.  Block @
+	 * 0x17C20000, one frame @ 0x17C21000 (EL0 @ 0x17C22000), physical-timer
+	 * GSIV 0x28, virtual-timer GSIV 0x26, AlwaysOn.  Windows' Qualcomm HAL
+	 * consults this during early timer bring-up -- exactly where the NT kernel
+	 * currently faults -- rather than relying solely on the CP15 sysreg timer.
+	 */
+	gtdt->plat_timer_count = 1;
+	gtdt->plat_timer_offset = sizeof(struct acpi_gtdt);
+	{
+		struct gtdt_gt_block *gb =
+			(void *)((u8 *)gtdt + sizeof(struct acpi_gtdt));
+
+		memset(gb, 0, sizeof(*gb));
+		gb->type = 0;			/* GT Block */
+		gb->length = sizeof(*gb);	/* 0x3C */
+		gb->cntctlbase = 0x17C20000;
+		gb->timer_count = 1;
+		gb->timer_offset = 0x14;	/* to frame 0 */
+		gb->frame_number = 0;
+		gb->cntbase = 0x17C21000;
+		gb->cntel0base = 0x17C22000;
+		gb->phys_gsiv = 0x28;
+		gb->virt_gsiv = 0x26;
+		gb->common_flags = 0x02;	/* AlwaysOn */
+	}
+	header->length = sizeof(struct acpi_gtdt) + sizeof(struct gtdt_gt_block);
+
 	header->checksum = table_compute_checksum(header, header->length);
 
 	acpi_add_table(ctx, gtdt);
-	acpi_inc(ctx, sizeof(struct acpi_gtdt));
+	acpi_inc(ctx, header->length);
 
 	return 0;
 }
@@ -1298,12 +1349,23 @@ static int tachyon_write_dbg2(struct acpi_ctx *ctx, const struct acpi_writer *en
 	struct acpi_gen_regaddr address;
 
 	/*
+	 * win_serial=0 (basic-boot test): omit DBG2 so winload finds no debug
+	 * UART to map -> no 0x994000 LoaderData mapping -> no ntoskrnl DC-ZVA
+	 * alignment fault.  Paired with the same gate in efi_setup.c + SPCR.
+	 */
+	if (env_get_yesno("win_serial") == 0)
+		return 0;
+
+	/*
 	 * The debug UART is Qualcomm GENI serial engine QUP_0_SE_5 at 0x994000
 	 * (MMIO).  Port subtype ARM_SBSA_GENERIC is the best fit for a
 	 * non-standard ARM debug UART.  The device path MUST be the fully
-	 * qualified namespace path of a real DSDT device: this engine is the
-	 * object named \_SB.UARD (_HID "QCOM0A16", _STR "QUP_0_SE_5,DBG") in
-	 * dsdt.asl — NOT "UART5", which does not exist in the DSDT.
+	 * qualified namespace path of a real DSDT device: \_SB.UARD in dsdt.asl.
+	 *
+	 * ntoskrnl maps this Device-nGnRnE.  The QUP window is presented to the
+	 * OS as EfiMemoryMappedIO (efi_setup.c), so this access matches the QHEE
+	 * HLOS stage-2 Device mapping and does NOT alignment-fault.  (Earlier we
+	 * wrongly suppressed DBG2/SPCR; the fix is Device typing, not omission.)
 	 */
 	memset(&address, '\0', sizeof(address));
 	address.space_id = ACPI_ADDRESS_SPACE_MEMORY;
@@ -1334,15 +1396,18 @@ ACPI_WRITER(5dbg2, "DBG2", tachyon_write_dbg2, 0);
  * ACPI_WRITER(5spcr) linker-list entry redirects to this strong symbol; no
  * second writer / no duplicate table).
  *
- * Values are for the Tachyon debug console: \_SB.UARD (QUP_0_SE_5) = serial0
- * (stdout-path "serial0:115200n8") from the Tachyon DTS — GENI debug UART @
- * 0x00994000, interrupt GIC_SPI 606 (GSIV 606 + 32 = 638), 115200 8N1.
- * Interface type 0x11 is the Qualcomm SDM845/GENI UART class that Windows'
- * inbox GENI serial driver binds to; it matches the reference
- * but for that board's UART @ 0xA90000 — we point at Tachyon's own console).
+ * Console = \_SB.UARD (QUP_0_SE_5) = serial0 @ 0x00994000, GSIV 638, 115200 8N1.
+ * Interface type 0x11 is the Qualcomm SDM845/GENI UART class Windows' inbox
+ * driver binds to.
+ *
+ * NOTE (HW-proven 2026-06-21): the SPCR console MUST stay on 0x994000.
+ * Pointing it at Radxa's QUP1_SE4 @ 0xA90000 hung winload pre-SVAM (that SE
+ * is not powered/early-mapped on Tachyon), and so did dropping serial.  The
+ * 0x994000 reclaim fault is fixed in efi_boottime.c (mdfix retag), not by
+ * moving the console.
  */
 #define TACHYON_SPCR_GENI_IFACE		0x11	/* Qualcomm SDM845/GENI UART */
-#define TACHYON_UART5_BASE		0x00994000UL
+#define TACHYON_UART5_BASE		0x00994000UL	/* QUP0_SE5 — SPCR console + DBG2 */
 #define TACHYON_UART5_GSIV		638	/* GIC_SPI 606 + 32 */
 #define TACHYON_SPCR_INT_TYPE_GIC	0x08	/* ARMH GIC interrupt */
 #define TACHYON_SPCR_BAUD_115200	7
@@ -1354,6 +1419,13 @@ int acpi_write_spcr(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 	struct acpi_table_header *header = &spcr->header;
 
 	(void)entry;
+
+	/*
+	 * win_serial=0 (basic-boot test): omit SPCR so winload has no console
+	 * UART to early-map.  See efi_setup.c gate + tachyon_write_dbg2().
+	 */
+	if (env_get_yesno("win_serial") == 0)
+		return 0;
 
 	memset(spcr, 0, sizeof(*spcr));
 
@@ -1367,7 +1439,7 @@ int acpi_write_spcr(struct acpi_ctx *ctx, const struct acpi_writer *entry)
 	spcr->serial_port.bit_width   = 32;
 	spcr->serial_port.bit_offset  = 0;
 	spcr->serial_port.access_size = ACPI_ACCESS_SIZE_DWORD_ACCESS;
-	spcr->serial_port.addrl       = TACHYON_UART5_BASE;
+	spcr->serial_port.addrl       = TACHYON_UART5_BASE;  /* 0x994000 — winload needs this page early (HW-proven) */
 	spcr->serial_port.addrh       = 0;
 
 	spcr->interrupt_type = TACHYON_SPCR_INT_TYPE_GIC;
